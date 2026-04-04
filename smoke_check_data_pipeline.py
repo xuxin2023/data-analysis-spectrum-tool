@@ -1014,6 +1014,153 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def run_single_compare_base_spectrum_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-compare-base-spectrum-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode="时间段内 PSD 对比",
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+
+        single_ygas_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        single_dat_payload = app.prepare_multi_spectral_compare_payload(
+            [dat_path],
+            col_b,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode="时间段内 PSD 对比",
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy("时间段内 PSD 对比"),
+            plot_style=app.resolve_plot_style("时间段内 PSD 对比"),
+            plot_layout=app.resolve_plot_layout("时间段内 PSD 对比"),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+        )
+    finally:
+        root.destroy()
+
+    if len(single_ygas_payload["series_results"]) != 1 or len(single_dat_payload["series_results"]) != 1:
+        raise ValueError("Single-type payload did not produce exactly one spectrum series per side.")
+
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+    )
+    dual_dat = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "dat" and str(item["column"]) == col_b
+    )
+    single_ygas = single_ygas_payload["series_results"][0]
+    single_dat = single_dat_payload["series_results"][0]
+
+    checks = [
+        (
+            "ygas_base_freq_equal",
+            np.array_equal(single_ygas["freq"], dual_ygas["freq"]),
+            {"single_points": len(single_ygas["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "ygas_base_density_allclose",
+            np.allclose(single_ygas["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_ygas["density"][:5].tolist(), "compare_first5": dual_ygas["density"][:5].tolist()},
+        ),
+        (
+            "dat_base_freq_equal",
+            np.array_equal(single_dat["freq"], dual_dat["freq"]),
+            {"single_points": len(single_dat["freq"]), "compare_points": len(dual_dat["freq"])},
+        ),
+        (
+            "dat_base_density_allclose",
+            np.allclose(single_dat["density"], dual_dat["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_dat["density"][:5].tolist(), "compare_first5": dual_dat["density"][:5].tolist()},
+        ),
+        (
+            "shared_base_builder",
+            single_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and single_dat["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_dat["details"].get("base_spectrum_builder") == "shared_profile_based",
+            {
+                "single_ygas_builder": single_ygas["details"].get("base_spectrum_builder"),
+                "dual_ygas_builder": dual_ygas["details"].get("base_spectrum_builder"),
+                "single_dat_builder": single_dat["details"].get("base_spectrum_builder"),
+                "dual_dat_builder": dual_dat["details"].get("base_spectrum_builder"),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_compare_base_spectrum_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"time_range={start_dt} ~ {end_dt}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     example_log = r"C:\Users\A\Desktop\SAMPLE202603270700-202603270730.log"
     return argparse.ArgumentParser(
@@ -1050,6 +1197,7 @@ def main() -> int:
             "target-cospectrum-implementations",
             "cross-display-semantics-check",
             "device-group-spectral-check",
+            "single-compare-base-spectrum-check",
         ],
         default=None,
         help="single=单文件检查，dual=双设备检查，legacy-target/target-group=组驱动目标谱图自检，target-cospectrum-diagnose=目标协谱候选排查",
@@ -1102,6 +1250,8 @@ def main() -> int:
             return run_cross_display_semantics_check_mode(args)
         if mode == "device-group-spectral-check":
             return run_device_group_spectral_check_mode(args)
+        if mode == "single-compare-base-spectrum-check":
+            return run_single_compare_base_spectrum_check_mode(args)
         return run_legacy_target_mode(args)
     except Exception as exc:
         print(f"[ERROR] {exc}")

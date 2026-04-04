@@ -504,6 +504,215 @@ def merge_parsed_results_for_device_group(
     return merged_parsed, metadata
 
 
+def resolve_profile_aware_fs(
+    parsed: ParsedDataResult,
+    ui_fs: float,
+    *,
+    timestamp_frame: pd.DataFrame | None = None,
+) -> tuple[float, str]:
+    manual_override = not math.isclose(float(ui_fs), DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
+    if manual_override:
+        return float(ui_fs), "ui_override"
+
+    profile_name = str(parsed.profile_name or "")
+    if profile_name.startswith("YGAS_MODE1") or profile_name == "YGAS_MERGED":
+        return float(DEFAULT_FS), "ygas_profile_default"
+
+    estimated = None
+    if timestamp_frame is not None and TIMESTAMP_COL in timestamp_frame.columns:
+        estimated = estimate_fs_from_timestamp(timestamp_frame, TIMESTAMP_COL)
+    if estimated is None:
+        estimated = estimate_fs_from_timestamp(parsed.dataframe, parsed.timestamp_col)
+    if estimated is not None:
+        return float(estimated), "timestamp_estimate"
+    return float(ui_fs), "ui_default_fallback"
+
+
+def prepare_base_spectrum_series(
+    parsed: ParsedDataResult,
+    value_column: str,
+    start_dt: pd.Timestamp | None = None,
+    end_dt: pd.Timestamp | None = None,
+    *,
+    require_timestamp: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if value_column not in parsed.dataframe.columns:
+        raise ValueError(f"目标列不存在: {value_column}")
+
+    original_count = int(len(parsed.dataframe))
+    source_row_count = int(parsed.source_row_count or original_count)
+    has_timestamp = bool(parsed.timestamp_col and parsed.timestamp_col in parsed.dataframe.columns)
+    if require_timestamp and not has_timestamp:
+        raise ValueError("未识别到时间列。")
+
+    if has_timestamp:
+        filtered = filter_by_time_range(parsed.dataframe, str(parsed.timestamp_col), start_dt, end_dt)
+        time_filtered_count = int(len(filtered))
+        source_frame = pd.DataFrame(
+            {
+                TIMESTAMP_COL: parse_mixed_timestamp_series(filtered[str(parsed.timestamp_col)]),
+                "value": pd.to_numeric(filtered[value_column], errors="coerce"),
+            }
+        )
+        source_frame = source_frame.dropna(subset=[TIMESTAMP_COL]).sort_values(TIMESTAMP_COL)
+        source_frame = source_frame.drop_duplicates(TIMESTAMP_COL, keep="first").reset_index(drop=True)
+        if source_frame.empty:
+            raise ValueError("时间窗内没有有效时间戳。")
+
+        source_start = pd.Timestamp(source_frame[TIMESTAMP_COL].min())
+        source_end = pd.Timestamp(source_frame[TIMESTAMP_COL].max())
+        raw_points = int(len(source_frame))
+        valid_mask = source_frame["value"].notna()
+        valid_count = int(valid_mask.sum())
+        non_null_ratio = float(valid_count / raw_points) if raw_points else 0.0
+        first_valid_start = pd.Timestamp(source_frame.loc[valid_mask, TIMESTAMP_COL].iloc[0]) if valid_count else None
+        last_valid_end = pd.Timestamp(source_frame.loc[valid_mask, TIMESTAMP_COL].iloc[-1]) if valid_count else None
+        leading_invalid_gap_s = (
+            float(max((first_valid_start - source_start).total_seconds(), 0.0))
+            if first_valid_start is not None
+            else None
+        )
+        trailing_invalid_gap_s = (
+            float(max((source_end - last_valid_end).total_seconds(), 0.0))
+            if last_valid_end is not None
+            else None
+        )
+
+        frame = source_frame.dropna(subset=["value"]).reset_index(drop=True)
+        if len(frame) < 2:
+            raise ValueError("时间窗内有效数据点不足。")
+        if float(frame["value"].std(ddof=0)) <= 1e-12:
+            raise ValueError("时间窗内数据波动过小。")
+        if int(frame["value"].nunique()) <= 1:
+            raise ValueError("时间窗内数据近似恒定。")
+
+        requested_start = pd.Timestamp(start_dt) if start_dt is not None else source_start
+        requested_end = pd.Timestamp(end_dt) if end_dt is not None else source_end
+        requested_duration = max((requested_end - requested_start).total_seconds(), 0.0)
+        actual_start = pd.Timestamp(frame[TIMESTAMP_COL].min())
+        actual_end = pd.Timestamp(frame[TIMESTAMP_COL].max())
+        actual_duration = max((actual_end - actual_start).total_seconds(), 0.0)
+        coverage_ratio = 1.0 if requested_duration <= 0 else min(actual_duration / requested_duration, 1.0)
+        return frame, {
+            "valid_points": int(len(frame)),
+            "source_start": source_start,
+            "source_end": source_end,
+            "actual_start": actual_start,
+            "actual_end": actual_end,
+            "first_valid_start": first_valid_start,
+            "last_valid_end": last_valid_end,
+            "leading_invalid_gap_s": leading_invalid_gap_s,
+            "trailing_invalid_gap_s": trailing_invalid_gap_s,
+            "non_null_ratio": non_null_ratio,
+            "requested_start": requested_start,
+            "requested_end": requested_end,
+            "requested_duration_s": float(requested_duration),
+            "actual_duration_s": float(actual_duration),
+            "coverage_ratio": float(coverage_ratio),
+            "original_count": original_count,
+            "time_filtered_count": time_filtered_count,
+            "source_row_count": source_row_count,
+            "timestamp_valid_count": int(parsed.timestamp_valid_count),
+            "timestamp_valid_ratio": float(parsed.timestamp_valid_ratio),
+            "timestamp_warning": parsed.timestamp_warning,
+            "has_timestamp": True,
+        }
+
+    numeric_series = pd.to_numeric(parsed.dataframe[value_column], errors="coerce")
+    time_filtered_count = int(len(numeric_series))
+    frame = pd.DataFrame({"value": numeric_series}).dropna().reset_index(drop=True)
+    if len(frame) < 2:
+        raise ValueError("有效数据点不足。")
+    if float(frame["value"].std(ddof=0)) <= 1e-12:
+        raise ValueError("数据波动过小。")
+    if int(frame["value"].nunique()) <= 1:
+        raise ValueError("数据近似恒定。")
+    return frame, {
+        "valid_points": int(len(frame)),
+        "source_start": None,
+        "source_end": None,
+        "actual_start": None,
+        "actual_end": None,
+        "first_valid_start": None,
+        "last_valid_end": None,
+        "leading_invalid_gap_s": None,
+        "trailing_invalid_gap_s": None,
+        "non_null_ratio": float(len(frame) / time_filtered_count) if time_filtered_count else 0.0,
+        "requested_start": pd.Timestamp(start_dt) if start_dt is not None else None,
+        "requested_end": pd.Timestamp(end_dt) if end_dt is not None else None,
+        "requested_duration_s": None,
+        "actual_duration_s": None,
+        "coverage_ratio": None,
+        "original_count": original_count,
+        "time_filtered_count": time_filtered_count,
+        "source_row_count": source_row_count,
+        "timestamp_valid_count": int(parsed.timestamp_valid_count),
+        "timestamp_valid_ratio": float(parsed.timestamp_valid_ratio),
+        "timestamp_warning": parsed.timestamp_warning,
+        "has_timestamp": False,
+    }
+
+
+def compute_base_spectrum_payload(
+    parsed: ParsedDataResult,
+    value_column: str,
+    *,
+    fs_ui: float,
+    requested_nsegment: int,
+    overlap_ratio: float,
+    start_dt: pd.Timestamp | None = None,
+    end_dt: pd.Timestamp | None = None,
+    require_timestamp: bool = False,
+) -> dict[str, Any]:
+    frame, series_meta = prepare_base_spectrum_series(
+        parsed,
+        value_column,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        require_timestamp=require_timestamp,
+    )
+    effective_fs, fs_source = resolve_profile_aware_fs(parsed, fs_ui, timestamp_frame=frame)
+    freq, density, details = compute_psd_from_array_with_params(
+        frame["value"].to_numpy(dtype=float),
+        float(effective_fs),
+        requested_nsegment,
+        overlap_ratio,
+    )
+    positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
+    freq_plot = np.asarray(freq[positive], dtype=float)
+    density_plot = np.asarray(density[positive], dtype=float)
+    if len(freq_plot) == 0:
+        raise ValueError("当前数据没有可用于绘图的有效谱值。")
+
+    details = dict(details)
+    details.update(
+        {
+            "base_spectrum_builder": "shared_profile_based",
+            "base_value_column": str(value_column),
+            "base_profile_name": str(parsed.profile_name),
+            "base_has_timestamp": bool(series_meta.get("has_timestamp")),
+            "base_requested_start": series_meta.get("requested_start"),
+            "base_requested_end": series_meta.get("requested_end"),
+            "base_actual_start": series_meta.get("actual_start"),
+            "base_actual_end": series_meta.get("actual_end"),
+            "base_coverage_ratio": series_meta.get("coverage_ratio"),
+            "base_valid_points": int(series_meta.get("valid_points", 0)),
+            "base_original_count": int(series_meta.get("original_count", 0)),
+            "base_time_filtered_count": int(series_meta.get("time_filtered_count", 0)),
+            "base_fs_source": fs_source,
+            "effective_fs": float(effective_fs),
+        }
+    )
+    return {
+        "freq": freq_plot,
+        "density": density_plot,
+        "details": details,
+        "series_frame": frame,
+        "series_meta": series_meta,
+        "effective_fs": float(effective_fs),
+    }
+
+
 def build_target_summary_columns(
     *,
     reference_column: str,
@@ -3982,72 +4191,16 @@ def build_target_window_series(
     start_dt: pd.Timestamp,
     end_dt: pd.Timestamp,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if parsed.timestamp_col is None or parsed.timestamp_col not in parsed.dataframe.columns:
-        raise ValueError("未识别到时间列。")
-    if value_column not in parsed.dataframe.columns:
-        raise ValueError(f"目标列不存在: {value_column}")
-
-    filtered = filter_by_time_range(parsed.dataframe, parsed.timestamp_col, start_dt, end_dt)
-    source_frame = pd.DataFrame(
-        {
-            TIMESTAMP_COL: parse_mixed_timestamp_series(filtered[parsed.timestamp_col]),
-            "value": pd.to_numeric(filtered[value_column], errors="coerce"),
-        }
+    frame, meta = prepare_base_spectrum_series(
+        parsed,
+        value_column,
+        start_dt=pd.Timestamp(start_dt),
+        end_dt=pd.Timestamp(end_dt),
+        require_timestamp=True,
     )
-    source_frame = source_frame.dropna(subset=[TIMESTAMP_COL]).sort_values(TIMESTAMP_COL)
-    source_frame = source_frame.drop_duplicates(TIMESTAMP_COL, keep="first").reset_index(drop=True)
-    if source_frame.empty:
-        raise ValueError("时间窗内没有有效时间戳。")
-
-    source_start = pd.Timestamp(source_frame[TIMESTAMP_COL].min())
-    source_end = pd.Timestamp(source_frame[TIMESTAMP_COL].max())
-    raw_points = int(len(source_frame))
-    valid_mask = source_frame["value"].notna()
-    valid_count = int(valid_mask.sum())
-    non_null_ratio = float(valid_count / raw_points) if raw_points else 0.0
-    first_valid_start = pd.Timestamp(source_frame.loc[valid_mask, TIMESTAMP_COL].iloc[0]) if valid_count else None
-    last_valid_end = pd.Timestamp(source_frame.loc[valid_mask, TIMESTAMP_COL].iloc[-1]) if valid_count else None
-    leading_invalid_gap_s = (
-        float(max((first_valid_start - source_start).total_seconds(), 0.0))
-        if first_valid_start is not None
-        else None
-    )
-    trailing_invalid_gap_s = (
-        float(max((source_end - last_valid_end).total_seconds(), 0.0))
-        if last_valid_end is not None
-        else None
-    )
-
-    frame = source_frame.dropna(subset=["value"]).reset_index(drop=True)
     if len(frame) < 16:
         raise ValueError("时间窗内有效数据点不足。")
-    if float(frame["value"].std(ddof=0)) <= 1e-12:
-        raise ValueError("时间窗内数据波动过小。")
-    if int(frame["value"].nunique()) <= 1:
-        raise ValueError("时间窗内数据近似恒定。")
-
-    requested_duration = max((pd.Timestamp(end_dt) - pd.Timestamp(start_dt)).total_seconds(), 0.0)
-    actual_start = pd.Timestamp(frame[TIMESTAMP_COL].min())
-    actual_end = pd.Timestamp(frame[TIMESTAMP_COL].max())
-    actual_duration = max((actual_end - actual_start).total_seconds(), 0.0)
-    coverage_ratio = 1.0 if requested_duration <= 0 else min(actual_duration / requested_duration, 1.0)
-    return frame, {
-        "valid_points": int(len(frame)),
-        "source_start": source_start,
-        "source_end": source_end,
-        "actual_start": actual_start,
-        "actual_end": actual_end,
-        "first_valid_start": first_valid_start,
-        "last_valid_end": last_valid_end,
-        "leading_invalid_gap_s": leading_invalid_gap_s,
-        "trailing_invalid_gap_s": trailing_invalid_gap_s,
-        "non_null_ratio": non_null_ratio,
-        "requested_start": pd.Timestamp(start_dt),
-        "requested_end": pd.Timestamp(end_dt),
-        "requested_duration_s": float(requested_duration),
-        "actual_duration_s": float(actual_duration),
-        "coverage_ratio": float(coverage_ratio),
-    }
+    return frame, meta
 
 
 def evaluate_target_group_quality_psd(

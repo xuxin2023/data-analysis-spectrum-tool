@@ -373,6 +373,7 @@ class FileViewerApp:
 
         self.current_folder: Path | None = None
         self.current_file: Path | None = None
+        self.current_file_parsed: ParsedFileResult | None = None
         self.raw_data: pd.DataFrame | None = None
         self.preview_data: pd.DataFrame | None = None
         self.current_comparison_frame: pd.DataFrame | None = None
@@ -1284,6 +1285,11 @@ class FileViewerApp:
             raise ValueError("开始时间不能晚于结束时间。")
         return start_dt, end_dt
 
+    def resolve_optional_time_range_inputs(self) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        if not self.time_start_var.get().strip() and not self.time_end_var.get().strip():
+            return None, None
+        return self.resolve_time_range_inputs()
+
     def guess_timestamp_column(self, df: pd.DataFrame) -> str | None:
         preferred_names = ("时间戳", "TIMESTAMP", "timestamp", "Timestamp", "time", "Time", "日期时间")
         for name in preferred_names:
@@ -2057,6 +2063,8 @@ class FileViewerApp:
         fs: float,
         requested_nsegment: int,
         overlap_ratio: float,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
         series_results: list[dict[str, Any]] = []
@@ -2074,22 +2082,17 @@ class FileViewerApp:
                 )
             try:
                 merged_parsed = group["merged_parsed"]
-                data = pd.to_numeric(merged_parsed.dataframe[target_column], errors="coerce").to_numpy(dtype=float)
-                effective_fs = self.resolve_compare_fs(merged_parsed, fs)
-                freq, density, details = self.compute_psd_from_array_with_params(
-                    data,
-                    effective_fs,
-                    requested_nsegment,
-                    overlap_ratio,
+                payload = core.compute_base_spectrum_payload(
+                    merged_parsed,
+                    target_column,
+                    fs_ui=fs,
+                    requested_nsegment=requested_nsegment,
+                    overlap_ratio=overlap_ratio,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    require_timestamp=False,
                 )
-                positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
-                freq = freq[positive]
-                density = density[positive]
-                if len(freq) == 0:
-                    skipped_files.append(f"{group['device_label']}(无有效谱值)")
-                    continue
-
-                details = dict(details)
+                details = dict(payload["details"])
                 details["device_id"] = str(group["device_id"])
                 details["device_label"] = str(group["device_label"])
                 details["device_source"] = str(group["device_source"])
@@ -2101,8 +2104,8 @@ class FileViewerApp:
                 series_results.append(
                     {
                         "label": str(group["device_label"]),
-                        "freq": freq,
-                        "density": density,
+                        "freq": np.asarray(payload["freq"], dtype=float),
+                        "density": np.asarray(payload["density"], dtype=float),
                         "details": details,
                         "device_id": str(group["device_id"]),
                         "file_count": int(group["file_count"]),
@@ -2128,6 +2131,8 @@ class FileViewerApp:
             ],
             "device_count": len(series_results),
             "file_count": len(selected_files),
+            "start_dt": start_dt,
+            "end_dt": end_dt,
         }
 
     def on_multi_spectral_compare_ready(self, payload: dict[str, Any]) -> None:
@@ -2488,35 +2493,38 @@ class FileViewerApp:
             if reporter is not None:
                 reporter("正在计算 PSD/CSD…")
             for pair in pairs:
-                series_a, meta_a = self.prepare_compare_series(parsed_a, pair["a_col"], start_dt, end_dt, "设备A")
-                series_b, meta_b = self.prepare_compare_series(parsed_b, pair["b_col"], start_dt, end_dt, "设备B")
-                txt_points = max(txt_points, meta_a["valid_count"])
-                dat_points = max(dat_points, meta_b["valid_count"])
-                fs_a = self.resolve_compare_fs(parsed_a, fs_ui)
-                fs_b = self.resolve_compare_fs(parsed_b, fs_ui)
-                fs_a_last = fs_a
-                fs_b_last = fs_b
-                for side, label, column, array, fs_value in (
-                    ("txt", label_a, pair["a_col"], series_a[meta_a["value_name"]].to_numpy(dtype=float), fs_a),
-                    ("dat", label_b, pair["b_col"], series_b[meta_b["value_name"]].to_numpy(dtype=float), fs_b),
+                for side, label, column, parsed in (
+                    ("txt", label_a, pair["a_col"], parsed_a),
+                    ("dat", label_b, pair["b_col"], parsed_b),
                 ):
                     key = (side, column)
                     if key in plotted_keys:
                         continue
                     plotted_keys.add(key)
-                    freq, density, details = self.compute_psd_from_array_with_params(array, fs_value, requested_nsegment, overlap_ratio)
-                    positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
-                    freq_plot = freq[positive]
-                    density_plot = density[positive]
-                    if len(freq_plot) == 0:
-                        continue
+                    psd_payload = core.compute_base_spectrum_payload(
+                        parsed,
+                        column,
+                        fs_ui=fs_ui,
+                        requested_nsegment=requested_nsegment,
+                        overlap_ratio=overlap_ratio,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        require_timestamp=True,
+                    )
+                    details = dict(psd_payload["details"])
+                    if side == "txt":
+                        txt_points = max(txt_points, int(psd_payload["series_meta"].get("valid_points", 0)))
+                        fs_a_last = float(psd_payload["effective_fs"])
+                    else:
+                        dat_points = max(dat_points, int(psd_payload["series_meta"].get("valid_points", 0)))
+                        fs_b_last = float(psd_payload["effective_fs"])
                     series_results.append(
                         {
                             "label": f"{label} - {column}",
                             "side": side,
                             "column": column,
-                            "freq": freq_plot,
-                            "density": density_plot,
+                            "freq": np.asarray(psd_payload["freq"], dtype=float),
+                            "density": np.asarray(psd_payload["density"], dtype=float),
                             "details": details,
                         }
                     )
@@ -4594,6 +4602,16 @@ class FileViewerApp:
             excluded_columns=self.excluded_analysis_cols,
         )
         self.current_used_mode1_template = result.used_mode1_template
+        parsed_profile = str(result.profile_name or detect_file_profile(path, read_preview_lines(path)))
+        timestamp_col = "时间戳" if "时间戳" in df.columns else self.guess_timestamp_column(df)
+        self.current_file_parsed = core.build_parsed_result_from_dataframe(
+            df.copy(),
+            parsed_profile,
+            timestamp_col,
+            source_row_count=len(df),
+            analyze_numeric_columns=False,
+            suggested_columns_override=list(self.column_data.keys()) if self.column_data else None,
+        )
 
         self.create_column_selector()
         self.update_table_view()
@@ -4877,6 +4895,27 @@ class FileViewerApp:
         fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
         return self.compute_psd_from_array_with_params(data, fs, requested_nsegment, overlap_ratio)
 
+    def compute_base_psd_payload(
+        self,
+        parsed: ParsedFileResult,
+        value_column: str,
+        *,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        require_timestamp: bool = False,
+    ) -> dict[str, Any]:
+        fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        return core.compute_base_spectrum_payload(
+            parsed,
+            value_column,
+            fs_ui=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            require_timestamp=require_timestamp,
+        )
+
     def get_analysis_params(self) -> tuple[float, int, float]:
         # Practical completion: FS defaulted to 10.0 and exposed in UI for usability.
         try:
@@ -4996,6 +5035,18 @@ class FileViewerApp:
 
     def spectral_analysis(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         col = self.selected_columns[0]
+        if self.current_data_source_kind == "file" and self.current_file_parsed is not None:
+            start_dt, end_dt = self.resolve_optional_time_range_inputs()
+            payload = self.compute_base_psd_payload(
+                self.current_file_parsed,
+                col,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                require_timestamp=False,
+            )
+            details = dict(payload["details"])
+            details["analysis_context"] = "single_file_base_spectrum"
+            return np.asarray(payload["freq"], dtype=float), np.asarray(payload["density"], dtype=float), details
         data = self.column_data[col]
         return self.compute_psd_from_array(data)
 
@@ -5075,13 +5126,8 @@ class FileViewerApp:
         return freq, values, details
 
     def resolve_compare_fs(self, parsed: ParsedFileResult, ui_fs: float) -> float:
-        manual_override = not math.isclose(ui_fs, DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
-        if manual_override:
-            return ui_fs
-        if parsed.profile_name.startswith("YGAS_MODE1"):
-            return DEFAULT_FS
-        estimated = estimate_fs_from_timestamp(parsed.dataframe, parsed.timestamp_col) if parsed.timestamp_col else None
-        return estimated or ui_fs
+        resolved, _source = core.resolve_profile_aware_fs(parsed, ui_fs)
+        return float(resolved)
 
     def compute_alignment_tolerance_seconds(self, timestamps_a: pd.Series, timestamps_b: pd.Series) -> float:
         intervals: list[float] = []
@@ -5854,6 +5900,7 @@ class FileViewerApp:
         self.current_comparison_metadata = comparison_metadata
         self.preview_data = comparison_frame
         self.current_data_source_kind = "comparison_preview"
+        self.current_file_parsed = None
         self.current_data_source_label = "对比汇总表预览"
         self.page_index = 0
         self.current_layout_label = "对比汇总表"
@@ -5895,6 +5942,7 @@ class FileViewerApp:
         self.raw_data = comparison_frame
         self.preview_data = None
         self.current_data_source_kind = "comparison_analysis"
+        self.current_file_parsed = None
         self.current_data_source_label = "对比汇总表"
         self.current_layout_label = "对比汇总表"
         self.current_used_mode1_template = False
@@ -6349,6 +6397,7 @@ class FileViewerApp:
     def on_target_spectrum_ready(self, payload: dict[str, Any]) -> None:
         target_metadata = dict(payload["target_metadata"])
         self.current_data_source_kind = "legacy_target_spectrum"
+        self.current_file_parsed = None
         self.current_data_source_label = str(target_metadata.get("mode_label", "目标谱图"))
         self.current_target_plot_metadata = target_metadata
         preview_frame = target_metadata.get("group_preview_frame")
@@ -6734,39 +6783,30 @@ class FileViewerApp:
         end_dt: pd.Timestamp | None,
         prefix: str,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
-        if parsed.timestamp_col is None or parsed.timestamp_col not in parsed.dataframe.columns:
-            raise ValueError("未识别时间列，无法进行双设备时间对齐。")
-        if value_column not in parsed.dataframe.columns:
-            raise ValueError(f"目标列不存在：{value_column}")
-
-        original_count = len(parsed.dataframe)
-        filtered = filter_by_time_range(parsed.dataframe, parsed.timestamp_col, start_dt, end_dt)
-        time_filtered_count = len(filtered)
-        if filtered.empty:
-            raise ValueError("时间段没有数据，请调整开始时间和结束时间。")
-
+        prepared, meta = core.prepare_base_spectrum_series(
+            parsed,
+            value_column,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            require_timestamp=True,
+        )
         value_name = f"{prefix}_{value_column}"
-        prepared = pd.DataFrame(
-            {
-                "时间戳": parse_mixed_timestamp_series(filtered[parsed.timestamp_col]),
-                value_name: pd.to_numeric(filtered[value_column], errors="coerce"),
-            }
-        ).dropna()
-        prepared = prepared.sort_values("时间戳").drop_duplicates("时间戳", keep="first")
-        if len(prepared) < 2:
-            raise ValueError("时间段内有效数据点不足，无法继续分析。")
+        prepared = prepared.rename(columns={"value": value_name})
 
         return prepared, {
             "value_name": value_name,
-            "original_count": original_count,
-            "time_filtered_count": time_filtered_count,
-            "valid_count": len(prepared),
-            "source_row_count": int(parsed.source_row_count or original_count),
-            "timestamp_valid_count": int(parsed.timestamp_valid_count),
-            "timestamp_valid_ratio": float(parsed.timestamp_valid_ratio),
-            "timestamp_warning": parsed.timestamp_warning,
-            "actual_start": pd.Timestamp(prepared["时间戳"].min()),
-            "actual_end": pd.Timestamp(prepared["时间戳"].max()),
+            "original_count": int(meta.get("original_count", len(parsed.dataframe))),
+            "time_filtered_count": int(meta.get("time_filtered_count", len(parsed.dataframe))),
+            "valid_count": int(meta.get("valid_points", len(prepared))),
+            "source_row_count": int(meta.get("source_row_count", parsed.source_row_count or len(parsed.dataframe))),
+            "timestamp_valid_count": int(meta.get("timestamp_valid_count", parsed.timestamp_valid_count)),
+            "timestamp_valid_ratio": float(meta.get("timestamp_valid_ratio", parsed.timestamp_valid_ratio)),
+            "timestamp_warning": meta.get("timestamp_warning", parsed.timestamp_warning),
+            "actual_start": meta.get("actual_start"),
+            "actual_end": meta.get("actual_end"),
+            "requested_start": meta.get("requested_start"),
+            "requested_end": meta.get("requested_end"),
+            "coverage_ratio": meta.get("coverage_ratio"),
         }
 
     def align_compare_frames(
@@ -6907,6 +6947,7 @@ class FileViewerApp:
 
         txt_series = [item for item in series_results if item["side"] == "txt"]
         dat_series = [item for item in series_results if item["side"] == "dat"]
+        first_details = dict(series_results[0].get("details", {}))
         valid_freq_points = int(sum(len(item["freq"]) for item in series_results))
         quality_warnings: list[str] = []
         if valid_freq_points < 10:
@@ -7054,6 +7095,9 @@ class FileViewerApp:
         extra_items = [
             f"当前要素映射={mapping_name}",
             f"当前谱类型=PSD",
+            f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
+            f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
+            f"设备B_base_fs_source={next((item['details'].get('base_fs_source') for item in dat_series if item.get('details')), None)}",
             f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
             f"实际命中设备B列={','.join(sorted({item['column'] for item in dat_series}))}",
             "对齐策略=时间窗裁切后独立PSD",
@@ -7194,6 +7238,20 @@ class FileViewerApp:
                 raise ValueError("当前所选列波动过小或为恒定列，无法生成有效谱图。")
             quality_items.append("当前谱类型=PSD")
             quality_items.append(f"有效频点数={len(freq)}")
+            if details.get("base_spectrum_builder") is not None:
+                quality_items.append(f"base_spectrum_builder={details.get('base_spectrum_builder')}")
+            if details.get("base_fs_source") is not None:
+                quality_items.append(f"base_fs_source={details.get('base_fs_source')}")
+            if details.get("base_requested_start") is not None or details.get("base_requested_end") is not None:
+                quality_items.append(
+                    f"base_requested_time_range={details.get('base_requested_start') or '自动'} ~ "
+                    f"{details.get('base_requested_end') or '自动'}"
+                )
+            if details.get("base_actual_start") is not None or details.get("base_actual_end") is not None:
+                quality_items.append(
+                    f"base_actual_time_range={details.get('base_actual_start') or '无'} ~ "
+                    f"{details.get('base_actual_end') or '无'}"
+                )
             if len(freq) < 10:
                 quality_items.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
             ax.set_xscale("log")
@@ -7450,6 +7508,7 @@ class FileViewerApp:
             f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | 合并={item['merge_strategy']}"
             for item in device_groups
         ]
+        time_range_text = f"{payload.get('start_dt') or '全文件'} ~ {payload.get('end_dt') or '全文件'}"
         self.update_diagnostic_info(
             layout="单设备模式" if device_count == 1 else "设备分组模式",
             analysis_label=target_column,
@@ -7463,6 +7522,9 @@ class FileViewerApp:
             extra_items=[
                 f"选中文件数={file_count}",
                 f"识别设备数={device_count}",
+                f"基础谱线时间范围={time_range_text}",
+                f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
+                f"base_fs_source={first_details.get('base_fs_source')}",
                 *group_items,
                 *self.build_reference_slope_diagnostic_items(is_psd=True),
             ],
@@ -7494,6 +7556,7 @@ class FileViewerApp:
 
         target_column = self.selected_columns[0]
         fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        start_dt, end_dt = self.resolve_optional_time_range_inputs()
         self.start_background_task(
             status_text=f"正在按设备分组准备图谱：{target_column}",
             worker=lambda reporter: self.prepare_multi_spectral_compare_payload(
@@ -7502,6 +7565,8 @@ class FileViewerApp:
                 fs,
                 requested_nsegment,
                 overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
                 reporter=reporter,
             ),
             on_success=self.on_multi_spectral_compare_ready,
