@@ -1,0 +1,7899 @@
+﻿from __future__ import annotations
+
+import json
+import math
+import queue
+import re
+import sys
+import threading
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+import numpy as np
+import pandas as pd
+import spectrum_core as core
+import tkinter as tk
+from matplotlib.figure import Figure
+from matplotlib import font_manager
+from tkinter import colorchooser, filedialog, font as tkfont, messagebox, ttk
+
+
+FigureCanvasTkAgg: Any | None = None
+NavigationToolbar2Tk: Any | None = None
+MATPLOTLIB_CJK_FONT: str | None = None
+
+
+ALLOWED_SUFFIXES = {".txt", ".log", ".csv", ".dat"}
+ROWS_PER_PAGE = 100
+DEFAULT_FS = core.DEFAULT_FS
+DEFAULT_NSEGMENT = core.DEFAULT_NSEGMENT
+DEFAULT_OVERLAP_RATIO = core.DEFAULT_OVERLAP_RATIO
+TEXT_LIKE_SUFFIXES = {".txt", ".log"}
+TIMESTAMP_PATTERN = core.TIMESTAMP_PATTERN
+NUMERIC_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+HEADER_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_ .-]{0,63}$")
+HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
+SERIES_COLORS = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+]
+LEGACY_TARGET_COLOR_PAIRS = [
+    {"ygas": "#1f77b4", "dat": "#ff7f0e"},
+    {"ygas": "#d62728", "dat": "#2ca02c"},
+    {"ygas": "#9467bd", "dat": "#8c564b"},
+    {"ygas": "#17becf", "dat": "#e377c2"},
+    {"ygas": "#7f7f7f", "dat": "#bcbd22"},
+    {"ygas": "#393b79", "dat": "#637939"},
+    {"ygas": "#843c39", "dat": "#3182bd"},
+    {"ygas": "#5254a3", "dat": "#31a354"},
+]
+CROSS_SPECTRUM_MAGNITUDE = core.CROSS_SPECTRUM_MAGNITUDE
+CROSS_SPECTRUM_REAL = core.CROSS_SPECTRUM_REAL
+CROSS_SPECTRUM_IMAG = core.CROSS_SPECTRUM_IMAG
+CROSS_SPECTRUM_OPTIONS = list(core.CROSS_SPECTRUM_OPTIONS)
+LEGACY_TARGET_SPECTRUM_MODE_CHOICES = list(core.LEGACY_TARGET_SPECTRUM_MODE_CHOICES)
+REFERENCE_SLOPE_MODE_AUTO = "自动"
+REFERENCE_SLOPE_MODE_MINUS_2_3 = "仅 -2/3"
+REFERENCE_SLOPE_MODE_MINUS_4_3 = "仅 -4/3"
+REFERENCE_SLOPE_MODE_BOTH = "两条都显示"
+REFERENCE_SLOPE_MODE_NONE = "不显示"
+REFERENCE_SLOPE_MODE_OPTIONS = [
+    REFERENCE_SLOPE_MODE_AUTO,
+    REFERENCE_SLOPE_MODE_MINUS_2_3,
+    REFERENCE_SLOPE_MODE_MINUS_4_3,
+    REFERENCE_SLOPE_MODE_BOTH,
+    REFERENCE_SLOPE_MODE_NONE,
+]
+REFERENCE_SLOPE_LIBRARY: dict[str, dict[str, float | str]] = {
+    REFERENCE_SLOPE_MODE_MINUS_2_3: {
+        "slope": -2 / 3,
+        "label": "Reference slope (-2/3)",
+        "short_label": "(-2/3)",
+        "color": "#d65f5f",
+    },
+    REFERENCE_SLOPE_MODE_MINUS_4_3: {
+        "slope": -4 / 3,
+        "label": "Reference slope (-4/3)",
+        "short_label": "(-4/3)",
+        "color": "#4c78a8",
+    },
+}
+LEGACY_TARGET_COLOR_MODE_BY_DEVICE = "按设备两色"
+LEGACY_TARGET_COLOR_MODE_BY_GROUP = "按组配对着色"
+LEGACY_TARGET_COLOR_MODE_CHOICES = [LEGACY_TARGET_COLOR_MODE_BY_DEVICE, LEGACY_TARGET_COLOR_MODE_BY_GROUP]
+LEGACY_TARGET_DEVICE_COLORS = {"ygas": "#1f77b4", "dat": "#ff7f0e"}
+LEGACY_TARGET_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
+LEGACY_TARGET_LINESTYLES = ["-", "--", "-.", ":"]
+MODE1_COLUMN_TEMPLATE = list(core.MODE1_COLUMN_TEMPLATE)
+ELEMENT_PRESETS: dict[str, dict[str, list[str]]] = dict(core.ELEMENT_PRESETS)
+
+
+def get_resource_path(*parts: str) -> Path:
+    if hasattr(sys, "_MEIPASS"):
+        base_dir = Path(getattr(sys, "_MEIPASS"))
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return base_dir.joinpath(*parts)
+
+
+def apply_window_icon(window: tk.Misc) -> tk.PhotoImage | None:
+    icon_image: tk.PhotoImage | None = None
+    icon_ico = get_resource_path("assets", "app_icon.ico")
+    icon_png = get_resource_path("assets", "app_icon.png")
+    if icon_ico.exists():
+        try:
+            window.iconbitmap(default=str(icon_ico))
+        except tk.TclError:
+            pass
+    if icon_png.exists():
+        try:
+            icon_image = tk.PhotoImage(file=str(icon_png))
+            window.iconphoto(True, icon_image)
+        except tk.TclError:
+            icon_image = None
+    return icon_image
+
+
+def configure_matplotlib_fonts() -> None:
+    global MATPLOTLIB_CJK_FONT
+    candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+        "SimSun",
+        "Noto Sans CJK SC",
+        "Arial Unicode MS",
+    ]
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    MATPLOTLIB_CJK_FONT = None
+    for name in candidates:
+        if name in available:
+            matplotlib.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+            MATPLOTLIB_CJK_FONT = name
+            break
+    if MATPLOTLIB_CJK_FONT is None:
+        matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+configure_matplotlib_fonts()
+
+
+def build_legacy_target_plot_title(target_element: str) -> str:
+    chinese_prefix = "\u65f6\u95f4\u5e8f\u5217\u8c31\u5206\u6790"
+    english_prefix = "Time Series Spectrum"
+    prefix = chinese_prefix if MATPLOTLIB_CJK_FONT else english_prefix
+    return f"{prefix} - {target_element}"
+
+
+def sanitize_filename(text: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\r\n\t]+', "_", text.strip())
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    return cleaned.strip("._") or "column"
+
+
+def float_to_fraction_str(value: float) -> str:
+    fraction = Fraction(value).limit_denominator(24)
+    if fraction.denominator == 1:
+        return str(fraction.numerator)
+    return f"{fraction.numerator}/{fraction.denominator}"
+
+
+def normalize_reference_slope_mode(reference_mode: str | None) -> str:
+    mode = str(reference_mode or "").strip() or REFERENCE_SLOPE_MODE_AUTO
+    if mode not in REFERENCE_SLOPE_MODE_OPTIONS:
+        return REFERENCE_SLOPE_MODE_AUTO
+    return mode
+
+
+def resolve_reference_slope_specs(
+    reference_mode: str | None,
+    *,
+    is_psd: bool,
+    spectrum_type: str | None = None,
+) -> list[dict[str, float | str]]:
+    mode = normalize_reference_slope_mode(reference_mode)
+    if mode == REFERENCE_SLOPE_MODE_AUTO:
+        if is_psd:
+            keys = [REFERENCE_SLOPE_MODE_MINUS_2_3]
+        elif spectrum_type in {CROSS_SPECTRUM_MAGNITUDE, CROSS_SPECTRUM_REAL}:
+            keys = [REFERENCE_SLOPE_MODE_MINUS_4_3]
+        else:
+            keys = []
+    elif mode == REFERENCE_SLOPE_MODE_BOTH:
+        keys = [REFERENCE_SLOPE_MODE_MINUS_2_3, REFERENCE_SLOPE_MODE_MINUS_4_3]
+    elif mode == REFERENCE_SLOPE_MODE_NONE:
+        keys = []
+    else:
+        keys = [mode]
+    return [dict(REFERENCE_SLOPE_LIBRARY[key]) for key in keys]
+
+
+def format_reference_slope_selection(specs: list[dict[str, float | str]]) -> str:
+    labels = [str(spec.get("short_label", "")).strip() for spec in specs if str(spec.get("short_label", "")).strip()]
+    return "none" if not labels else ",".join(labels)
+
+
+def parse_float(raw: str, default: float) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_int(raw: str, default: int) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_generated_column_names(count: int) -> list[str]:
+    return core.build_generated_column_names(count)
+
+
+def build_mode1_column_names(count: int) -> list[str]:
+    if count == len(MODE1_COLUMN_TEMPLATE):
+        return list(MODE1_COLUMN_TEMPLATE)
+    return build_generated_column_names(count)
+
+
+def parse_mixed_timestamp_series(series: pd.Series) -> pd.Series:
+    return core.parse_mixed_timestamp_series(series)
+
+
+def build_timestamp_parse_stats(source: pd.Series, parsed: pd.Series) -> dict[str, Any]:
+    return core.build_timestamp_parse_stats(source, parsed)
+
+
+def looks_like_timestamp_series(series: pd.Series) -> bool:
+    return core.looks_like_timestamp_series(series)
+
+
+def looks_like_incremental_index(series: pd.Series) -> bool:
+    return core.looks_like_incremental_index(series)
+
+
+def detect_mode1_layout(df: pd.DataFrame) -> dict[str, Any]:
+    excluded_cols = {"时间戳", "状态字符", "状态寄存器", "校验和"}
+    if len(df.columns) == len(MODE1_COLUMN_TEMPLATE) and looks_like_timestamp_series(df.iloc[:, 0]):
+        return {
+            "matched": True,
+            "variant": "mode1-15",
+            "display_columns": list(MODE1_COLUMN_TEMPLATE),
+            "excluded_cols": excluded_cols,
+        }
+
+    if len(df.columns) == len(MODE1_COLUMN_TEMPLATE) + 1:
+        first_col = df.iloc[:, 0]
+        second_col = df.iloc[:, 1]
+        if looks_like_incremental_index(first_col) and looks_like_timestamp_series(second_col):
+            return {
+                "matched": True,
+                "variant": "mode1-16-with-index",
+                "display_columns": ["索引列", *MODE1_COLUMN_TEMPLATE],
+                "excluded_cols": {"索引列", *excluded_cols},
+            }
+
+    return {
+        "matched": False,
+        "variant": None,
+        "display_columns": build_generated_column_names(len(df.columns)),
+        "excluded_cols": set(),
+    }
+
+
+def detect_file_profile(path: Path, preview_lines: list[str]) -> str:
+    return core.detect_file_profile(path, preview_lines)
+
+
+def filter_by_time_range(
+    df: pd.DataFrame,
+    timestamp_col: str,
+    start_dt: pd.Timestamp | None,
+    end_dt: pd.Timestamp | None,
+) -> pd.DataFrame:
+    return core.filter_by_time_range(df, timestamp_col, start_dt, end_dt)
+
+
+def estimate_fs_from_timestamp(df: pd.DataFrame, timestamp_col: str) -> float | None:
+    return core.estimate_fs_from_timestamp(df, timestamp_col)
+
+
+@dataclass
+class LoaderResult:
+    dataframe: pd.DataFrame
+    columns: list[str]
+    available_columns: list[str] | None = None
+    suggested_columns: list[str] | None = None
+    used_mode1_template: bool = False
+    mode1_layout: dict[str, Any] | None = None
+    profile_name: str | None = None
+    excluded_columns: set[str] | None = None
+
+
+@dataclass
+class ParsedFileResult:
+    dataframe: pd.DataFrame
+    profile_name: str
+    timestamp_col: str | None
+    suggested_columns: list[str]
+    available_columns: list[str]
+    source_row_count: int = 0
+    timestamp_valid_count: int = 0
+    timestamp_valid_ratio: float = 0.0
+    timestamp_warning: str | None = None
+
+
+def read_preview_lines(path: Path, max_lines: int = 8) -> list[str]:
+    return core.read_preview_lines(path, max_lines=max_lines)
+
+
+class AsyncFileLoader:
+    def __init__(self, file_path: str, delimiter: str, start_row: int, header_row: int | None) -> None:
+        self.file_path = file_path
+        self.delimiter = delimiter
+        self.start_row = start_row
+        self.header_row = header_row
+
+    def load(self) -> LoaderResult:
+        # Confirmed from v4: the EXE used pandas.read_csv with sep/skiprows/header/engine/on_bad_lines/dtype.
+        df = pd.read_csv(
+            self.file_path,
+            sep=self.delimiter,
+            skiprows=self.start_row,
+            header=self.header_row,
+            engine="python",
+            on_bad_lines="skip",
+            dtype=str,
+        )
+
+        # Practical completion: header=None 时生成更适合高频 txt 数据的显示列名。
+        used_mode1_template = False
+        mode1_layout: dict[str, Any] | None = None
+        if self.header_row is None:
+            if Path(self.file_path).suffix.lower() in TEXT_LIKE_SUFFIXES:
+                mode1_layout = detect_mode1_layout(df)
+                df.columns = mode1_layout["display_columns"]
+                used_mode1_template = bool(mode1_layout["matched"])
+            else:
+                df.columns = build_generated_column_names(len(df.columns))
+        else:
+            # Practical completion: normalize display/selection keys to strings for Tk widgets.
+            df.columns = [str(col) for col in df.columns]
+        return LoaderResult(
+            dataframe=df,
+            columns=list(df.columns),
+            available_columns=list(df.columns),
+            suggested_columns=None,
+            used_mode1_template=used_mode1_template,
+            mode1_layout=mode1_layout,
+            profile_name=None,
+            excluded_columns=set(mode1_layout.get("excluded_cols", set())) if mode1_layout is not None else set(),
+        )
+
+
+class FileViewerApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("数据分析")
+        self.root.geometry("1400x900")
+        self.window_icon_image = apply_window_icon(self.root)
+
+        self.current_folder: Path | None = None
+        self.current_file: Path | None = None
+        self.raw_data: pd.DataFrame | None = None
+        self.preview_data: pd.DataFrame | None = None
+        self.current_comparison_frame: pd.DataFrame | None = None
+        self.current_comparison_metadata: dict[str, Any] = {}
+        self.current_target_plot_metadata: dict[str, Any] = {}
+        self.current_data_source_kind = "file"
+        self.current_data_source_label = "当前文件"
+        self.column_data: dict[str, np.ndarray] = {}
+        self.non_numeric_cols: set[str] = set()
+        self.unsuitable_spectrum_cols: set[str] = set()
+        self.excluded_analysis_cols: set[str] = set()
+        self.column_vars: dict[str, tk.BooleanVar] = {}
+        self.saved_selections: dict[str, list[str]] = {}
+        self.file_paths: list[Path] = []
+        self.loading_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.active_load_token = 0
+        self.check_queue_after_id: str | None = None
+        self.task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.active_task_token = 0
+        self.check_task_after_id: str | None = None
+        self.reload_after_id: str | None = None
+        self.auto_analysis_after_id: str | None = None
+        self.loading_in_progress = False
+        self.background_task_in_progress = False
+        self.page_index = 0
+        self.current_plot_kind: str | None = None
+        self.current_plot_columns: list[str] = []
+        self.current_result_freq: np.ndarray | None = None
+        self.current_result_values: np.ndarray | None = None
+        self.current_result_frame: pd.DataFrame | None = None
+        self.current_target_group_preview_frame: pd.DataFrame | None = None
+        self.current_aligned_frame: pd.DataFrame | None = None
+        self.current_lazy_aligned_frames: list[pd.DataFrame] = []
+        self.current_aligned_metadata: dict[str, Any] = {}
+        self.current_compare_files: list[str] = []
+        self.current_plot_style_label = ""
+        self.current_plot_layout_label = ""
+        self.separate_plot_entries: list[dict[str, Any]] = []
+        self.separate_plot_windows: list[tk.Toplevel] = []
+        self.auto_prepare_payload: dict[str, Any] | None = None
+        self.auto_dat_options: dict[str, Path] = {}
+        self.target_group_forceable_map: dict[str, bool] = {}
+        self.pending_target_group_override_keys: set[str] = set()
+        self.no_header_prompt_state: dict[str, str] = {}
+        self.saved_read_settings: dict[str, dict[str, str | bool]] = {}
+        self.target_parsed_file_cache: dict[tuple[Any, ...], ParsedFileResult] = {}
+        self.last_param_error_message: str | None = None
+        self.suspend_setting_reload = False
+        self.current_used_mode1_template = False
+        self.current_layout_label = "未加载"
+
+        self.delimiter_var = tk.StringVar(value="逗号 (,)")
+        self.custom_delimiter_var = tk.StringVar(value="")
+        self.start_row_var = tk.StringVar(value="0")
+        self.header_row_var = tk.StringVar(value="0")
+        self.no_header_var = tk.BooleanVar(value=False)
+        self.fs_var = tk.StringVar(value=str(DEFAULT_FS))
+        self.nsegment_var = tk.StringVar(value=str(DEFAULT_NSEGMENT))
+        self.overlap_ratio_var = tk.StringVar(value=str(DEFAULT_OVERLAP_RATIO))
+        self.cross_spectrum_type_var = tk.StringVar(value=CROSS_SPECTRUM_MAGNITUDE)
+        self.reference_slope_mode_var = tk.StringVar(value=REFERENCE_SLOPE_MODE_AUTO)
+        self.compare_mode_var = tk.StringVar(value="时间序列对比")
+        self.mapping_mode_var = tk.StringVar(value="预设映射")
+        self.element_preset_var = tk.StringVar(value="CO2")
+        self.compare_scope_var = tk.StringVar(value="单对单")
+        self.alignment_strategy_var = tk.StringVar(value="最近邻 + 容差")
+        self.plot_style_var = tk.StringVar(value="自动")
+        self.plot_layout_var = tk.StringVar(value="叠加同图")
+        self.use_separate_zoom_windows_var = tk.BooleanVar(value=False)
+        self.scheme_name_var = tk.StringVar(value="默认方案")
+        self.time_range_strategy_var = tk.StringVar(value="使用 txt+dat 共同时间范围")
+        self.time_start_var = tk.StringVar(value="")
+        self.time_end_var = tk.StringVar(value="")
+        self.match_tolerance_var = tk.StringVar(value="0.2")
+        self.device_a_column_var = tk.StringVar(value="")
+        self.device_b_column_var = tk.StringVar(value="")
+        self.compare_file_info_var = tk.StringVar(value="自动准备：请先选择包含 txt/log 和 dat 的文件夹")
+        self.txt_merge_summary_var = tk.StringVar(value="txt 合并摘要：等待选择 txt/log 文件")
+        self.dat_summary_var = tk.StringVar(value="dat 摘要：等待选择 dat 文件")
+        self.folder_prepare_summary_var = tk.StringVar(value="自动准备摘要：等待选择文件夹")
+        self.selected_dat_var = tk.StringVar(value="")
+        self.legacy_target_use_analysis_params_var = tk.BooleanVar(value=False)
+        self.legacy_target_spectrum_mode_var = tk.StringVar(value=core.LEGACY_TARGET_SPECTRUM_MODE_PSD)
+        self.legacy_target_color_mode_var = tk.StringVar(value=LEGACY_TARGET_COLOR_MODE_BY_DEVICE)
+        self.target_cross_ygas_color_var = tk.StringVar(value="")
+        self.target_cross_dat_color_var = tk.StringVar(value="")
+        self.target_group_qc_summary_var = tk.StringVar(value="目标谱图组质控：等待生成目标谱图")
+        self.preserve_selection_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="就绪")
+        self.page_info_var = tk.StringVar(value="0 / 0")
+        self.diagnostic_var = tk.StringVar(value="绘图诊断信息：等待加载文件")
+        self.plot_title_var = tk.StringVar(value="图形结果")
+
+        self.figure = Figure(figsize=(6, 4), dpi=100)
+        self.canvas: FigureCanvasTkAgg | None = None
+        self.plot_toolbar: NavigationToolbar2Tk | None = None
+        self.plot_container: ttk.Frame | None = None
+        self.plot_toolbar_frame: ttk.Frame | None = None
+        self.right_notebook: ttk.Notebook | None = None
+        self.table_tab: ttk.Frame | None = None
+        self.plot_tab: ttk.Frame | None = None
+        self.left_workflow_notebook: ttk.Notebook | None = None
+        self.single_analysis_tab: ttk.Frame | None = None
+        self.dual_compare_tab: ttk.Frame | None = None
+        self.advanced_param_tab: ttk.Frame | None = None
+        self.table_font = tkfont.nametofont("TkDefaultFont")
+
+        self._build_ui()
+        self._bind_events()
+        self._update_delimiter_state()
+        self.render_plot_message("请选择文件夹，程序会自动识别文件并准备目标谱图。")
+
+    def _build_ui(self) -> None:
+        main_pane = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+
+        left_panel = ttk.Frame(main_pane, width=360)
+        right_panel = ttk.Frame(main_pane)
+        main_pane.add(left_panel, weight=0)
+        main_pane.add(right_panel, weight=1)
+
+        self._build_left_panel(left_panel)
+        self._build_right_panel(right_panel)
+
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w")
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _build_left_panel(self, parent: ttk.Frame) -> None:
+        left_scroll_container = ttk.Frame(parent)
+        left_scroll_container.pack(fill=tk.BOTH, expand=True)
+
+        self.left_panel_canvas = tk.Canvas(left_scroll_container, highlightthickness=0)
+        self.left_panel_scrollbar = ttk.Scrollbar(
+            left_scroll_container,
+            orient=tk.VERTICAL,
+            command=self.left_panel_canvas.yview,
+        )
+        self.left_panel_inner = ttk.Frame(self.left_panel_canvas)
+        self.left_panel_inner.bind(
+            "<Configure>",
+            lambda _event: self.left_panel_canvas.configure(scrollregion=self.left_panel_canvas.bbox("all")),
+        )
+        self.left_panel_window = self.left_panel_canvas.create_window((0, 0), window=self.left_panel_inner, anchor="nw")
+        self.left_panel_canvas.bind(
+            "<Configure>",
+            lambda event: self.left_panel_canvas.itemconfigure(self.left_panel_window, width=event.width),
+        )
+        self.left_panel_canvas.configure(yscrollcommand=self.left_panel_scrollbar.set)
+        self.left_panel_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.left_panel_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        parent = self.left_panel_inner
+
+        source_button_frame = ttk.Frame(parent)
+        source_button_frame.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        folder_button = ttk.Button(source_button_frame, text="选择文件夹", command=self.async_open_directory)
+        folder_button.pack(fill=tk.X, expand=True)
+
+        ttk.Label(
+            parent,
+            text="使用方式：选择文件夹 → 自动识别文件 → 选择要素 → 生成目标谱图",
+            foreground="#666666",
+            wraplength=320,
+            justify="left",
+        ).pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        file_list_frame = ttk.LabelFrame(parent, text="文件列表", height=160)
+        file_list_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        file_list_frame.pack_propagate(False)
+
+        self.file_listbox = tk.Listbox(file_list_frame, exportselection=False, selectmode=tk.EXTENDED)
+        file_scrollbar = ttk.Scrollbar(file_list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=file_scrollbar.set)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        file_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.left_workflow_notebook = ttk.Notebook(parent)
+        self.left_workflow_notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        self.single_analysis_tab = ttk.Frame(self.left_workflow_notebook)
+        self.dual_compare_tab = ttk.Frame(self.left_workflow_notebook)
+        self.advanced_param_tab = ttk.Frame(self.left_workflow_notebook)
+        self.left_workflow_notebook.add(self.dual_compare_tab, text="主路径")
+        self.left_workflow_notebook.add(self.single_analysis_tab, text="汇总表分析")
+        self.left_workflow_notebook.add(self.advanced_param_tab, text="高级功能")
+        self.left_workflow_notebook.select(self.dual_compare_tab)
+
+        single_parent = self.single_analysis_tab
+        dual_parent = self.dual_compare_tab
+        advanced_parent = self.advanced_param_tab
+
+        quick_start_frame = ttk.LabelFrame(dual_parent, text="目标谱图主路径")
+        quick_start_frame.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(quick_start_frame, text="目标要素").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.quick_target_element_combo = ttk.Combobox(
+            quick_start_frame,
+            textvariable=self.element_preset_var,
+            state="readonly",
+            values=["CO2", "H2O", "温度", "压力"],
+        )
+        self.quick_target_element_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(quick_start_frame, text="自动选择 dat").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.selected_dat_combo = ttk.Combobox(
+            quick_start_frame,
+            textvariable=self.selected_dat_var,
+            state="readonly",
+            values=[],
+        )
+        self.selected_dat_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(
+            quick_start_frame,
+            textvariable=self.compare_file_info_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            quick_start_frame,
+            textvariable=self.txt_merge_summary_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            quick_start_frame,
+            textvariable=self.dat_summary_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            quick_start_frame,
+            textvariable=self.folder_prepare_summary_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+
+        ttk.Label(quick_start_frame, text="谱类型").grid(row=6, column=0, sticky="w", padx=6, pady=4)
+        self.legacy_target_spectrum_mode_combo = ttk.Combobox(
+            quick_start_frame,
+            textvariable=self.legacy_target_spectrum_mode_var,
+            state="readonly",
+            values=LEGACY_TARGET_SPECTRUM_MODE_CHOICES,
+        )
+        self.legacy_target_spectrum_mode_combo.grid(row=6, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(quick_start_frame, text="颜色模式").grid(row=7, column=0, sticky="w", padx=6, pady=4)
+        self.legacy_target_color_mode_combo = ttk.Combobox(
+            quick_start_frame,
+            textvariable=self.legacy_target_color_mode_var,
+            state="readonly",
+            values=LEGACY_TARGET_COLOR_MODE_CHOICES,
+        )
+        self.legacy_target_color_mode_combo.grid(row=7, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(quick_start_frame, text="ygas 颜色").grid(row=8, column=0, sticky="w", padx=6, pady=4)
+        ygas_color_frame = ttk.Frame(quick_start_frame)
+        ygas_color_frame.grid(row=8, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Entry(ygas_color_frame, textvariable=self.target_cross_ygas_color_var, width=12).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            ygas_color_frame,
+            text="选择",
+            command=lambda: self.choose_target_cross_color("cross_ygas"),
+            width=5,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(quick_start_frame, text="dat 颜色").grid(row=9, column=0, sticky="w", padx=6, pady=4)
+        dat_color_frame = ttk.Frame(quick_start_frame)
+        dat_color_frame.grid(row=9, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Entry(dat_color_frame, textvariable=self.target_cross_dat_color_var, width=12).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            dat_color_frame,
+            text="选择",
+            command=lambda: self.choose_target_cross_color("cross_dat"),
+            width=5,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Checkbutton(
+            quick_start_frame,
+            text="沿用当前分析参数（默认关闭）",
+            variable=self.legacy_target_use_analysis_params_var,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(
+            quick_start_frame,
+            text="默认按目标谱图预设自动解析 NSEGMENT，避免历史方案里的 256 覆盖当前链路。",
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).grid(row=11, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+
+        quick_button_frame = ttk.Frame(quick_start_frame)
+        quick_button_frame.grid(row=12, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.btn_generate_target_main = ttk.Button(
+            quick_button_frame,
+            text="生成目标谱图",
+            command=self.generate_legacy_compatible_target_plot,
+        )
+        self.btn_generate_target_main.pack(fill=tk.X, pady=(0, 4))
+        self.btn_save_main = ttk.Button(quick_button_frame, text="导出图片", command=self.save_figure)
+        self.btn_save_main.pack(fill=tk.X, pady=(0, 4))
+        self.btn_export_summary_main = ttk.Button(
+            quick_button_frame,
+            text="导出汇总表",
+            command=self.export_comparison_summary,
+        )
+        self.btn_export_summary_main.pack(fill=tk.X)
+        quick_start_frame.columnconfigure(1, weight=1)
+
+        settings_frame = ttk.LabelFrame(single_parent, text="读取设置")
+        settings_frame.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(settings_frame, text="分隔符").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.delim_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.delimiter_var,
+            state="readonly",
+            values=["逗号 (,)", "制表符", "空格", "分号 (;)", "自定义"],
+        )
+        self.delim_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(settings_frame, text="自定义").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.custom_delim_entry = ttk.Entry(settings_frame, textvariable=self.custom_delimiter_var)
+        self.custom_delim_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+
+        spinbox_validator = (self.root.register(self.validate_spinbox), "%P")
+
+        ttk.Label(settings_frame, text="跳过前几行").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        self.start_spin = tk.Spinbox(
+            settings_frame,
+            from_=0,
+            to=999999,
+            textvariable=self.start_row_var,
+            validate="key",
+            validatecommand=spinbox_validator,
+        )
+        self.start_spin.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(
+            settings_frame,
+            text="跳过前几行：文件前面如果有说明文字，可在这里跳过",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(settings_frame, text="列名所在行").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.header_spin = tk.Spinbox(
+            settings_frame,
+            from_=0,
+            to=999999,
+            textvariable=self.header_row_var,
+            validate="key",
+            validatecommand=spinbox_validator,
+        )
+        self.header_spin.grid(row=4, column=1, sticky="ew", padx=6, pady=4)
+
+        self.no_header_check = ttk.Checkbutton(settings_frame, text="文件无表头", variable=self.no_header_var)
+        self.no_header_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            settings_frame,
+            text="文件无表头：勾选后表示第一行就是数据，不是列名",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(
+            settings_frame,
+            text="txt 高频数据建议使用：逗号分隔 + 无表头",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        settings_frame.columnconfigure(1, weight=1)
+
+        analysis_frame = ttk.LabelFrame(advanced_parent, text="分析参数")
+        analysis_frame.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(analysis_frame, text="采样频率 FS（Hz）").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.fs_entry = ttk.Entry(analysis_frame, textvariable=self.fs_var)
+        self.fs_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(
+            analysis_frame,
+            text="表示每秒采样点数，10 表示每秒 10 个点",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(analysis_frame, text="每段点数 NSEGMENT").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        self.nsegment_spin = tk.Spinbox(
+            analysis_frame,
+            from_=2,
+            to=65536,
+            textvariable=self.nsegment_var,
+            validate="key",
+            validatecommand=spinbox_validator,
+        )
+        self.nsegment_spin.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(
+            analysis_frame,
+            text="每次参与频谱计算的点数，常用 256；数据较短时可改 128 或 64",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(analysis_frame, text="重叠比例 OVERLAP_RATIO").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.overlap_entry = ttk.Entry(analysis_frame, textvariable=self.overlap_ratio_var)
+        self.overlap_entry.grid(row=4, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(
+            analysis_frame,
+            text="相邻两段数据重叠比例，常用 0.5",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(
+            analysis_frame,
+            text="当前高频 txt 数据建议：FS=10，NSEGMENT=256，OVERLAP_RATIO=0.5",
+            foreground="#555555",
+            wraplength=300,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+
+        note = (
+            "FS 默认 10.0 为实用补齐，"
+            "不是字节级逆向已确认值。"
+        )
+        ttk.Label(analysis_frame, text=note, foreground="#555555", wraplength=300).grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
+        )
+        analysis_frame.columnconfigure(1, weight=1)
+
+        utility_frame = ttk.LabelFrame(advanced_parent, text="界面与文件工具")
+        utility_frame.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(utility_frame, text="选择文件", command=self.async_open_file).pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Button(utility_frame, text="恢复默认布局", command=self.restore_default_layout).pack(fill=tk.X, padx=6, pady=2)
+        ttk.Button(utility_frame, text="参数说明", command=self.show_parameter_help).pack(fill=tk.X, padx=6, pady=(2, 6))
+
+        compare_frame = ttk.LabelFrame(advanced_parent, text="高级功能：双设备与汇总表分析")
+        compare_frame.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(compare_frame, text="方案名").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.scheme_name_entry = ttk.Entry(compare_frame, textvariable=self.scheme_name_var)
+        self.scheme_name_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        scheme_button_frame = ttk.Frame(compare_frame)
+        scheme_button_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        ttk.Button(scheme_button_frame, text="保存方案", command=self.save_compare_scheme).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(scheme_button_frame, text="加载方案", command=self.load_compare_scheme).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        mapping_frame = ttk.LabelFrame(compare_frame, text="要素映射")
+        mapping_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        ttk.Label(mapping_frame, text="映射方式").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.mapping_mode_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.mapping_mode_var,
+            state="readonly",
+            values=["预设映射", "手动映射"],
+        )
+        self.mapping_mode_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(mapping_frame, text="预设要素").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.element_preset_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.element_preset_var,
+            state="readonly",
+            values=list(ELEMENT_PRESETS.keys()),
+        )
+        self.element_preset_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(mapping_frame, text="对比范围").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        self.compare_scope_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.compare_scope_var,
+            state="readonly",
+            values=["单对单", "设备A一列对设备B多列", "设备A多列对设备B多列"],
+        )
+        self.compare_scope_combo.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(mapping_frame, text="对齐策略").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        self.alignment_strategy_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.alignment_strategy_var,
+            state="readonly",
+            values=["最近邻匹配", "最近邻 + 容差", "重采样后对齐"],
+        )
+        self.alignment_strategy_combo.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(mapping_frame, text="出图样式").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.plot_style_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.plot_style_var,
+            state="readonly",
+            values=["自动", "连线图", "散点图", "连线+散点"],
+        )
+        self.plot_style_combo.grid(row=4, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(mapping_frame, text="出图布局").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        self.plot_layout_combo = ttk.Combobox(
+            mapping_frame,
+            textvariable=self.plot_layout_var,
+            state="readonly",
+            values=["叠加同图", "上下分图", "左右分图", "分别生成两张图"],
+        )
+        self.plot_layout_combo.grid(row=5, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Checkbutton(
+            mapping_frame,
+            text="独立窗口仅用于放大查看",
+            variable=self.use_separate_zoom_windows_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+        mapping_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(compare_frame, text="比对模式").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        self.compare_mode_combo = ttk.Combobox(
+            compare_frame,
+            textvariable=self.compare_mode_var,
+            state="readonly",
+            values=["时间序列对比", "散点一致性对比", "时间段内 PSD 对比", "互谱幅值", "协谱图", "正交谱图", "差值时间序列", "比值时间序列"],
+        )
+        self.compare_mode_combo.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="时间范围策略").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.time_range_strategy_combo = ttk.Combobox(
+            compare_frame,
+            textvariable=self.time_range_strategy_var,
+            state="readonly",
+            values=["手动输入时间范围", "使用 dat 时间范围", "使用 txt+dat 共同时间范围", "最近10分钟", "最近30分钟", "最近1小时"],
+        )
+        self.time_range_strategy_combo.grid(row=4, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="开始时间").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        self.time_start_entry = ttk.Entry(compare_frame, textvariable=self.time_start_var)
+        self.time_start_entry.grid(row=5, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="结束时间").grid(row=6, column=0, sticky="w", padx=6, pady=4)
+        self.time_end_entry = ttk.Entry(compare_frame, textvariable=self.time_end_var)
+        self.time_end_entry.grid(row=6, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="匹配容差（秒）").grid(row=7, column=0, sticky="w", padx=6, pady=4)
+        self.match_tolerance_entry = ttk.Entry(compare_frame, textvariable=self.match_tolerance_var)
+        self.match_tolerance_entry.grid(row=7, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Button(compare_frame, text="使用当前文件时间范围", command=self.use_current_file_time_range).grid(
+            row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2)
+        )
+        ttk.Button(compare_frame, text="使用 dat 时间范围", command=self.use_selected_dat_time_range).grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2)
+        )
+        ttk.Button(compare_frame, text="使用所有选中文件共同时间范围", command=self.use_common_selected_time_range).grid(
+            row=10, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2)
+        )
+        ttk.Button(compare_frame, text="自动补齐txt覆盖范围", command=self.auto_fill_txt_covering_dat_range).grid(
+            row=11, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2)
+        )
+        quick_button_frame = ttk.Frame(compare_frame)
+        quick_button_frame.grid(row=12, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        ttk.Button(quick_button_frame, text="最近10分钟", command=lambda: self.apply_recent_time_range(10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(quick_button_frame, text="最近30分钟", command=lambda: self.apply_recent_time_range(30)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Button(quick_button_frame, text="最近1小时", command=lambda: self.apply_recent_time_range(60)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        ttk.Label(compare_frame, text="设备A分析列").grid(row=13, column=0, sticky="w", padx=6, pady=4)
+        self.device_a_combo = ttk.Combobox(compare_frame, textvariable=self.device_a_column_var, state="readonly")
+        self.device_a_combo.grid(row=13, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="设备A多列（可选）").grid(row=14, column=0, sticky="nw", padx=6, pady=4)
+        a_multi_frame = ttk.Frame(compare_frame)
+        a_multi_frame.grid(row=14, column=1, sticky="ew", padx=6, pady=4)
+        self.device_a_multi_listbox = tk.Listbox(a_multi_frame, exportselection=False, selectmode=tk.EXTENDED, height=4)
+        a_multi_scroll = ttk.Scrollbar(a_multi_frame, orient=tk.VERTICAL, command=self.device_a_multi_listbox.yview)
+        self.device_a_multi_listbox.configure(yscrollcommand=a_multi_scroll.set)
+        self.device_a_multi_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        a_multi_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(compare_frame, text="设备B分析列").grid(row=15, column=0, sticky="w", padx=6, pady=4)
+        self.device_b_combo = ttk.Combobox(compare_frame, textvariable=self.device_b_column_var, state="readonly")
+        self.device_b_combo.grid(row=15, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(compare_frame, text="设备B多列（可选）").grid(row=16, column=0, sticky="nw", padx=6, pady=4)
+        b_multi_frame = ttk.Frame(compare_frame)
+        b_multi_frame.grid(row=16, column=1, sticky="ew", padx=6, pady=4)
+        self.device_b_multi_listbox = tk.Listbox(b_multi_frame, exportselection=False, selectmode=tk.EXTENDED, height=5)
+        b_multi_scroll = ttk.Scrollbar(b_multi_frame, orient=tk.VERTICAL, command=self.device_b_multi_listbox.yview)
+        self.device_b_multi_listbox.configure(yscrollcommand=b_multi_scroll.set)
+        self.device_b_multi_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        b_multi_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(
+            compare_frame,
+            textvariable=self.compare_file_info_var,
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=17, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            compare_frame,
+            textvariable=self.txt_merge_summary_var,
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=18, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(
+            compare_frame,
+            textvariable=self.dat_summary_var,
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=19, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+        ttk.Label(
+            compare_frame,
+            text="高级路径：如需互谱/协谱/正交谱，请先生成对比汇总表，再载入汇总表进行分析。",
+            foreground="#666666",
+            wraplength=300,
+        ).grid(row=20, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Button(compare_frame, text="生成对比汇总表", command=self.generate_comparison_summary).grid(
+            row=21, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 2)
+        )
+        ttk.Button(compare_frame, text="生成目标谱图", command=self.generate_legacy_compatible_target_plot).grid(
+            row=22, column=0, columnspan=2, sticky="ew", padx=6, pady=2
+        )
+        ttk.Button(compare_frame, text="使用汇总表进行分析", command=self.use_comparison_summary_for_analysis).grid(
+            row=23, column=0, columnspan=2, sticky="ew", padx=6, pady=2
+        )
+        ttk.Button(compare_frame, text="导出汇总表", command=self.export_comparison_summary).grid(
+            row=24, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 6)
+        )
+        compare_frame.columnconfigure(1, weight=1)
+
+        advanced_action_frame = ttk.LabelFrame(advanced_parent, text="更多高级分析")
+        advanced_action_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Button(advanced_action_frame, text="双设备直接出图", command=self.run_dual_device_compare).pack(
+            fill=tk.X, padx=6, pady=(6, 2)
+        )
+        ttk.Button(advanced_action_frame, text="按设备生成图谱", command=self.perform_multi_spectral_compare).pack(
+            fill=tk.X, padx=6, pady=2
+        )
+        ttk.Button(advanced_action_frame, text="导出对齐数据", command=self.export_aligned_data).pack(
+            fill=tk.X, padx=6, pady=(2, 6)
+        )
+
+        target_qc_frame = ttk.LabelFrame(advanced_parent, text="目标谱图组级质控")
+        target_qc_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 4))
+        ttk.Label(
+            target_qc_frame,
+            text="默认会自动跳过覆盖不足、频点不足、时间窗过短或谱值明显离群的组。\n如需手动放开，请选中下面的组后重新点击“生成目标谱图”。",
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).pack(fill=tk.X, padx=6, pady=(6, 4))
+        self.target_group_override_listbox = tk.Listbox(
+            target_qc_frame,
+            exportselection=False,
+            selectmode=tk.EXTENDED,
+            height=6,
+        )
+        target_qc_scroll = ttk.Scrollbar(target_qc_frame, orient=tk.VERTICAL, command=self.target_group_override_listbox.yview)
+        self.target_group_override_listbox.configure(yscrollcommand=target_qc_scroll.set)
+        self.target_group_override_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=(0, 4))
+        target_qc_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=(0, 4))
+        ttk.Label(
+            target_qc_frame,
+            textvariable=self.target_group_qc_summary_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        actions_frame = ttk.LabelFrame(single_parent, text="操作")
+        actions_frame.pack(fill=tk.X, padx=8, pady=4)
+
+        self.preserve_button = ttk.Checkbutton(
+            actions_frame,
+            text="切换文件时保留已选列",
+            variable=self.preserve_selection_var,
+        )
+        self.preserve_button.pack(anchor="w", padx=6, pady=(6, 2))
+
+        self.btn_spectral = ttk.Button(actions_frame, text="单列功率谱密度", command=lambda: self.perform_analysis("spectral"))
+        self.btn_spectral.pack(fill=tk.X, padx=6, pady=2)
+
+        self.btn_cross = ttk.Button(actions_frame, text="双列互谱分析", command=lambda: self.perform_analysis("cross"))
+        self.btn_cross.pack(fill=tk.X, padx=6, pady=2)
+
+        ttk.Label(actions_frame, text="谱类型").pack(anchor="w", padx=6, pady=(4, 0))
+        self.cross_spectrum_type_combo = ttk.Combobox(
+            actions_frame,
+            textvariable=self.cross_spectrum_type_var,
+            state="readonly",
+            values=CROSS_SPECTRUM_OPTIONS,
+        )
+        self.cross_spectrum_type_combo.pack(fill=tk.X, padx=6, pady=(0, 2))
+
+        ttk.Label(actions_frame, text="参考线").pack(anchor="w", padx=6, pady=(4, 0))
+        self.reference_slope_mode_combo = ttk.Combobox(
+            actions_frame,
+            textvariable=self.reference_slope_mode_var,
+            state="readonly",
+            values=REFERENCE_SLOPE_MODE_OPTIONS,
+        )
+        self.reference_slope_mode_combo.pack(fill=tk.X, padx=6, pady=(0, 2))
+
+        self.btn_generate = ttk.Button(actions_frame, text="生成图", command=self.generate_plot)
+        self.btn_generate.pack(fill=tk.X, padx=6, pady=2)
+
+        self.btn_save = ttk.Button(actions_frame, text="保存图片", command=self.save_figure)
+        self.btn_save.pack(fill=tk.X, padx=6, pady=2)
+
+        self.btn_export = ttk.Button(actions_frame, text="导出结果", command=self.export_results)
+        self.btn_export.pack(fill=tk.X, padx=6, pady=(2, 6))
+
+        column_frame = ttk.LabelFrame(single_parent, text="可分析列", height=320)
+        column_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=(4, 8))
+        column_frame.pack_propagate(False)
+        self.column_frame = column_frame
+
+        self.column_canvas = tk.Canvas(column_frame, highlightthickness=0)
+        self.column_scrollbar = ttk.Scrollbar(column_frame, orient=tk.VERTICAL, command=self.column_canvas.yview)
+        self.column_inner = ttk.Frame(self.column_canvas)
+        self.column_inner.bind(
+            "<Configure>",
+            lambda _event: self.column_canvas.configure(scrollregion=self.column_canvas.bbox("all")),
+        )
+        self.column_canvas_window = self.column_canvas.create_window((0, 0), window=self.column_inner, anchor="nw")
+        self.column_canvas.configure(yscrollcommand=self.column_scrollbar.set)
+        self.column_canvas.bind("<Configure>", self.on_column_canvas_configure)
+        self.column_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.column_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        ttk.Label(self.column_inner, text="加载文件后，在这里勾选要分析的列", foreground="#666666").grid(
+            row=0, column=0, sticky="w", padx=6, pady=6
+        )
+
+    def _build_right_panel(self, parent: ttk.Frame) -> None:
+        self.right_notebook = ttk.Notebook(parent)
+        self.right_notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.table_tab = ttk.Frame(self.right_notebook)
+        self.plot_tab = ttk.Frame(self.right_notebook)
+        self.right_notebook.add(self.table_tab, text="表格预览")
+        self.right_notebook.add(self.plot_tab, text="图形结果")
+        self.right_notebook.select(self.table_tab)
+
+        table_frame = ttk.Frame(self.table_tab)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        nav_frame = ttk.Frame(table_frame)
+        nav_frame.pack(fill=tk.X, padx=6, pady=6)
+
+        self.prev_page_button = ttk.Button(nav_frame, text="上一页", command=self.prev_page)
+        self.prev_page_button.pack(side=tk.LEFT)
+
+        self.next_page_button = ttk.Button(nav_frame, text="下一页", command=self.next_page)
+        self.next_page_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(nav_frame, textvariable=self.page_info_var).pack(side=tk.LEFT, padx=12)
+
+        table_container = ttk.Frame(table_frame)
+        table_container.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        self.tree = ttk.Treeview(table_container, show="headings")
+        tree_y = ttk.Scrollbar(table_container, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_x = ttk.Scrollbar(table_container, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_y.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        plot_frame = ttk.Frame(self.plot_tab)
+        plot_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            plot_frame,
+            textvariable=self.plot_title_var,
+            font=("Microsoft YaHei UI", 11, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=8, pady=(8, 4))
+        self.plot_toolbar_frame = ttk.Frame(plot_frame)
+        self.plot_toolbar_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.plot_container = ttk.Frame(plot_frame)
+        self.plot_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_container)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.plot_toolbar = NavigationToolbar2Tk(self.canvas, self.plot_toolbar_frame, pack_toolbar=False)
+        self.plot_toolbar.update()
+        self.plot_toolbar.pack(side=tk.LEFT, fill=tk.X)
+        ttk.Label(
+            plot_frame,
+            textvariable=self.diagnostic_var,
+            foreground="#555555",
+            wraplength=900,
+            justify="left",
+            anchor="w",
+        ).pack(fill=tk.X, padx=8, pady=(0, 8))
+
+    def show_plot_tab(self) -> None:
+        if self.right_notebook is not None and self.plot_tab is not None:
+            self.right_notebook.select(self.plot_tab)
+
+    def show_table_tab(self) -> None:
+        if self.right_notebook is not None and self.table_tab is not None:
+            self.right_notebook.select(self.table_tab)
+
+    def update_plot_title(self, title: str | None = None) -> None:
+        if title:
+            self.plot_title_var.set(f"图形结果：{title}")
+            return
+        for axis in self.figure.axes:
+            axis_title = axis.get_title().strip()
+            if axis_title:
+                self.plot_title_var.set(f"图形结果：{axis_title}")
+                return
+        self.plot_title_var.set("图形结果")
+
+    def refresh_canvas(self, *, switch_to_plot: bool = True, title: str | None = None) -> None:
+        if self.canvas is None:
+            return
+        self.update_plot_title(title)
+        self.canvas.draw_idle()
+        self.root.update_idletasks()
+        if switch_to_plot:
+            self.show_plot_tab()
+
+    def restore_default_layout(self) -> None:
+        if self.left_workflow_notebook is not None and self.dual_compare_tab is not None:
+            self.left_workflow_notebook.select(self.dual_compare_tab)
+        self.show_table_tab()
+        self.use_separate_zoom_windows_var.set(False)
+        self.clear_separate_plot_windows()
+        if self.plot_toolbar is not None:
+            try:
+                self.plot_toolbar.home()
+            except Exception:
+                pass
+        self.status_var.set("已恢复默认布局")
+        self.update_plot_title(None)
+        self.root.update_idletasks()
+
+    def _bind_events(self) -> None:
+        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
+        self.delim_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_settings())
+        self.selected_dat_combo.bind("<<ComboboxSelected>>", self.on_selected_dat_changed)
+        self.column_canvas.bind("<Enter>", self.bind_column_mousewheel)
+        self.column_canvas.bind("<Leave>", self.unbind_column_mousewheel)
+        self.column_inner.bind("<Enter>", self.bind_column_mousewheel)
+        self.column_inner.bind("<Leave>", self.unbind_column_mousewheel)
+
+        for variable in (
+            self.custom_delimiter_var,
+            self.start_row_var,
+            self.header_row_var,
+            self.no_header_var,
+        ):
+            variable.trace_add("write", lambda *_args: self.update_settings())
+
+        for variable in (
+            self.fs_var,
+            self.nsegment_var,
+            self.overlap_ratio_var,
+            self.cross_spectrum_type_var,
+            self.reference_slope_mode_var,
+        ):
+            variable.trace_add("write", lambda *_args: self.schedule_auto_analysis())
+
+        for variable in (self.mapping_mode_var, self.element_preset_var, self.compare_scope_var):
+            variable.trace_add("write", lambda *_args: self.refresh_compare_column_options())
+
+    def on_column_canvas_configure(self, event: tk.Event[Any]) -> None:
+        self.column_canvas.itemconfigure(self.column_canvas_window, width=event.width)
+
+    def bind_column_mousewheel(self, _event: tk.Event[Any] | None = None) -> None:
+        self.root.bind_all("<MouseWheel>", self.on_column_mousewheel)
+        self.root.bind_all("<Button-4>", self.on_column_mousewheel)
+        self.root.bind_all("<Button-5>", self.on_column_mousewheel)
+
+    def unbind_column_mousewheel(self, _event: tk.Event[Any] | None = None) -> None:
+        self.root.unbind_all("<MouseWheel>")
+        self.root.unbind_all("<Button-4>")
+        self.root.unbind_all("<Button-5>")
+
+    def on_column_mousewheel(self, event: tk.Event[Any]) -> None:
+        if getattr(event, "num", None) == 4:
+            self.column_canvas.yview_scroll(-1, "units")
+            return
+        if getattr(event, "num", None) == 5:
+            self.column_canvas.yview_scroll(1, "units")
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self.column_canvas.yview_scroll(int(-delta / 120), "units")
+
+    def validate_spinbox(self, proposed: str) -> bool:
+        return proposed == "" or proposed.isdigit()
+
+    def show_parameter_help(self) -> None:
+        help_text = (
+            "分隔符：选择文件中各列之间的分隔方式，常见是逗号。\n\n"
+            "跳过前几行：如果文件开头有说明文字、备注或设备信息，可以在这里跳过。\n\n"
+            "文件无表头：勾选后表示第一行就是数据，不是列名。\n\n"
+            "列名所在行：如果文件里有表头，可以填写列名所在的那一行编号。\n\n"
+            "采样频率 FS（Hz）：表示每秒采样点数，10 表示每秒 10 个点。\n\n"
+            "每段点数 NSEGMENT：每次参与频谱计算的数据点数，常用 256；数据较短时可改 128 或 64。\n\n"
+            "重叠比例 OVERLAP_RATIO：相邻两段数据的重叠比例，常用 0.5。\n\n"
+            "谱类型：双列分析时可在互谱幅值、协谱和正交谱之间切换。\n\n"
+            "参考线：可选自动、仅 -2/3、仅 -4/3、两条都显示或不显示。\n\n"
+            "单列功率谱密度：选中 1 列数值数据后，计算该列的频谱强度分布。\n\n"
+            "双列互谱分析：选中 2 列数值数据后，分析两列在不同频率上的共同变化强度。"
+        )
+        messagebox.showinfo("参数说明", help_text)
+
+    def parse_time_input(self, raw: str) -> pd.Timestamp | None:
+        text = raw.strip()
+        if not text:
+            return None
+        parsed_series = parse_mixed_timestamp_series(pd.Series([text]))
+        parsed = parsed_series.iloc[0]
+        if pd.isna(parsed):
+            raise ValueError("时间格式错误，请使用 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD HH:MM:SS.s")
+        return pd.Timestamp(parsed)
+
+    def resolve_time_range_inputs(self) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        start_dt = self.parse_time_input(self.time_start_var.get())
+        end_dt = self.parse_time_input(self.time_end_var.get())
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            raise ValueError("开始时间不能晚于结束时间。")
+        return start_dt, end_dt
+
+    def guess_timestamp_column(self, df: pd.DataFrame) -> str | None:
+        preferred_names = ("时间戳", "TIMESTAMP", "timestamp", "Timestamp", "time", "Time", "日期时间")
+        for name in preferred_names:
+            if name in df.columns:
+                parsed = parse_mixed_timestamp_series(df[name])
+                if parsed.notna().sum() >= 3:
+                    return name
+
+        for col in df.columns[: min(len(df.columns), 3)]:
+            parsed = parse_mixed_timestamp_series(df[col])
+            if parsed.notna().sum() >= max(3, int(len(df) * 0.6)):
+                return str(col)
+        return None
+
+    def get_profile_excluded_columns(
+        self,
+        profile_name: str,
+        df: pd.DataFrame,
+        timestamp_col: str | None,
+    ) -> set[str]:
+        return core.get_profile_excluded_columns(profile_name, df, timestamp_col)
+
+    def prioritize_suggested_columns(self, columns: list[str]) -> list[str]:
+        priority = ["CO2浓度", "H2O浓度"]
+        ordered = [name for name in priority if name in columns]
+        ordered.extend(name for name in columns if name not in ordered)
+        return ordered
+
+    def build_parsed_result_from_dataframe(
+        self,
+        df: pd.DataFrame,
+        profile_name: str,
+        timestamp_col: str | None,
+        *,
+        source_row_count: int | None = None,
+    ) -> ParsedFileResult:
+        return core.build_parsed_result_from_dataframe(
+            df,
+            profile_name,
+            timestamp_col,
+            source_row_count=source_row_count,
+        )
+
+    def parse_ygas_mode1_file(self, path: Path) -> ParsedFileResult:
+        return core.parse_ygas_mode1_file(path)
+
+    def parse_toa5_file(self, path: Path) -> ParsedFileResult:
+        return core.parse_toa5_file(path)
+
+    def parse_dat_file(self, path: Path) -> ParsedFileResult:
+        return self.parse_toa5_file(path)
+
+    def get_parsed_time_bounds(self, parsed: ParsedFileResult) -> tuple[pd.Timestamp, pd.Timestamp, int]:
+        return core.get_parsed_time_bounds(parsed)
+
+    def load_and_merge_ygas_files(self, paths: list[Path]) -> tuple[ParsedFileResult, dict[str, Any]]:
+        return core.load_and_merge_ygas_files(paths)
+
+    def classify_selected_compare_files(self) -> tuple[list[Path], Path | None, list[Path]]:
+        selected_files = self.get_selected_file_paths()
+        ygas_paths: list[Path] = []
+        dat_path: Path | None = None
+        other_paths: list[Path] = []
+
+        for path in selected_files:
+            profile = detect_file_profile(path, read_preview_lines(path))
+            if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"} or path.suffix.lower() in {".txt", ".log"}:
+                ygas_paths.append(path)
+            elif profile == "TOA5_DAT" or path.suffix.lower() == ".dat":
+                if dat_path is None:
+                    dat_path = path
+                else:
+                    other_paths.append(path)
+            else:
+                other_paths.append(path)
+
+        return ygas_paths, dat_path, other_paths
+
+    def ensure_legacy_target_selection_valid(
+        self,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        other_paths: list[Path],
+    ) -> None:
+        if dat_path is None:
+            raise ValueError("请先选择 1 个 dat 文件，再生成目标谱图。")
+        if not ygas_paths:
+            raise ValueError("请先选择 1 个或多个 ygas txt/log 文件，再生成目标谱图。")
+
+        extra_dat_paths: list[Path] = []
+        for path in other_paths:
+            profile = detect_file_profile(path, read_preview_lines(path))
+            if profile == "TOA5_DAT" or path.suffix.lower() == ".dat":
+                extra_dat_paths.append(path)
+        if extra_dat_paths:
+            names = "、".join(path.name for path in extra_dat_paths[:3])
+            suffix = " 等" if len(extra_dat_paths) > 3 else ""
+            raise ValueError(
+                f"目标谱图只支持 1 个 dat 文件，请取消多余 dat 选择：{names}{suffix}"
+            )
+
+    def validate_legacy_target_selection(
+        self,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        other_paths: list[Path],
+    ) -> None:
+        self.ensure_legacy_target_selection_valid(ygas_paths, dat_path, other_paths)
+
+    def build_compare_selection_from_paths(
+        self,
+        ygas_paths: list[Path],
+        dat_path: Path,
+        *,
+        required_ygas_columns: list[str] | None = None,
+        required_dat_columns: list[str] | None = None,
+        target_context: dict[str, Any] | None = None,
+        reporter: Any | None = None,
+    ) -> tuple[ParsedFileResult, str, ParsedFileResult, str, dict[str, Any]]:
+        if reporter is not None:
+            reporter("正在解析设备A文件…")
+        if required_ygas_columns:
+            merged_ygas, txt_summary = core.load_and_merge_ygas_files_fast(ygas_paths, required_columns=required_ygas_columns)
+        else:
+            merged_ygas, txt_summary = self.load_and_merge_ygas_files(ygas_paths)
+        if reporter is not None:
+            reporter("正在解析设备B文件…")
+        if required_dat_columns:
+            parsed_dat = self.parse_target_profiled_file(dat_path, device_kind="dat", required_columns=required_dat_columns)
+        else:
+            parsed_dat = self.parse_dat_file(dat_path)
+        dat_start, dat_end, dat_points = self.get_parsed_time_bounds(parsed_dat)
+        dat_summary = {
+            "start": dat_start,
+            "end": dat_end,
+            "total_points": dat_points,
+            "raw_rows": int(parsed_dat.source_row_count or len(parsed_dat.dataframe)),
+            "valid_timestamp_points": int(parsed_dat.timestamp_valid_count),
+            "file_name": dat_path.name,
+        }
+        return merged_ygas, f"txt合并({len(ygas_paths)}个文件)", parsed_dat, dat_path.name, {
+            "txt_paths": ygas_paths,
+            "dat_path": dat_path,
+            "txt_summary": txt_summary,
+            "dat_summary": dat_summary,
+            "target_spectral_context": dict(target_context) if target_context else None,
+        }
+
+    def build_compare_selection(self) -> tuple[ParsedFileResult, str, ParsedFileResult, str, dict[str, Any]]:
+        ygas_paths, dat_path, _other = self.classify_selected_compare_files()
+        if dat_path is None:
+            raise ValueError("请先选择 1 个 dat 文件作为设备B。")
+        if not ygas_paths:
+            raise ValueError("请先选择 1 个或多个 txt/log 文件作为设备A。")
+        return self.build_compare_selection_from_paths(ygas_paths, dat_path)
+
+    def parse_generic_profiled_file(self, path: Path) -> ParsedFileResult:
+        result = self.load_file_with_file_settings(path)
+        df = result.dataframe.copy()
+        preview_lines = read_preview_lines(path)
+        detected_profile = detect_file_profile(path, preview_lines)
+        if result.mode1_layout and result.mode1_layout.get("matched"):
+            detected_profile = "YGAS_MODE1_16" if result.mode1_layout.get("variant") == "mode1-16-with-index" else "YGAS_MODE1_15"
+        timestamp_col = self.guess_timestamp_column(df)
+        return self.build_parsed_result_from_dataframe(df, detected_profile, timestamp_col)
+
+    def parse_profiled_file(self, path: Path) -> ParsedFileResult:
+        preview_lines = read_preview_lines(path)
+        profile = detect_file_profile(path, preview_lines)
+        if str(path) in self.saved_read_settings:
+            generic = self.parse_generic_profiled_file(path)
+            if generic.timestamp_col is not None and generic.suggested_columns:
+                return generic
+            if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"}:
+                return self.parse_ygas_mode1_file(path)
+            if profile == "TOA5_DAT":
+                return self.parse_toa5_file(path)
+            return generic
+
+        if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"}:
+            return self.parse_ygas_mode1_file(path)
+        if profile == "TOA5_DAT":
+            return self.parse_toa5_file(path)
+        return self.parse_generic_profiled_file(path)
+
+    def is_target_cross_compare_mode(self, compare_mode: str | None) -> bool:
+        return str(compare_mode or "").strip() in {"互谱幅值", "协谱图", "正交谱图"}
+
+    def build_target_required_columns(
+        self,
+        *,
+        target_element: str,
+        device_kind: str,
+        include_reference: bool = False,
+    ) -> list[str]:
+        device_key = "A" if device_kind == "ygas" else "B"
+        ordered: list[str] = []
+        for value in ELEMENT_PRESETS.get(target_element, {}).get(device_key, []):
+            text = str(value).strip()
+            if text and text not in ordered:
+                ordered.append(text)
+        if include_reference and device_kind == "dat":
+            for value in ["Uz", "uz", "W", "w", "通道3"]:
+                if value not in ordered:
+                    ordered.append(value)
+        return ordered
+
+    def resolve_target_spectral_context_for_parsed(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+        *,
+        spectrum_mode: str | None,
+        comparison_is_target_spectral: bool,
+    ) -> dict[str, Any] | None:
+        target_element = self.resolve_target_element_name()
+        ygas_target_column = self.select_target_element_column(parsed_a, device_key="A", target_element=target_element)
+        dat_target_column = self.select_target_element_column(parsed_b, device_key="B", target_element=target_element)
+        reference_column = core.select_reference_uz_column(parsed_b, device_key="B")
+        if not ygas_target_column or not dat_target_column or not reference_column:
+            return None
+        return core.build_target_spectral_context(
+            target_element=target_element,
+            reference_column=reference_column,
+            ygas_target_column=ygas_target_column,
+            dat_target_column=dat_target_column,
+            display_target_label=target_element,
+            spectrum_mode=spectrum_mode,
+            comparison_is_target_spectral=comparison_is_target_spectral,
+        )
+
+    def get_current_target_spectral_context(self) -> dict[str, Any] | None:
+        if self.current_data_source_kind in {"comparison_analysis", "comparison_preview"}:
+            return core.get_target_spectral_context(self.current_comparison_metadata)
+        return core.get_target_spectral_context(self.current_target_plot_metadata)
+
+    def build_target_parsed_file_cache_key(
+        self,
+        path: Path,
+        *,
+        cache_scope: str,
+        required_columns: list[str] | None = None,
+    ) -> tuple[Any, ...]:
+        stat = path.stat()
+        setting_payload = self.saved_read_settings.get(str(path))
+        setting_signature = json.dumps(setting_payload, sort_keys=True, ensure_ascii=False) if setting_payload else ""
+        required_signature = json.dumps(sorted({str(value).strip() for value in (required_columns or []) if str(value).strip()}), ensure_ascii=False)
+        return (
+            cache_scope,
+            str(path.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            setting_signature,
+            required_signature,
+        )
+
+    def parse_target_profiled_file(
+        self,
+        path: Path,
+        *,
+        device_kind: str,
+        required_columns: list[str] | None = None,
+    ) -> ParsedFileResult:
+        cache_key = self.build_target_parsed_file_cache_key(
+            path,
+            cache_scope=f"target:{device_kind}",
+            required_columns=required_columns,
+        )
+        cached = self.target_parsed_file_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if str(path) in self.saved_read_settings:
+            result = self.parse_profiled_file(path)
+            self.target_parsed_file_cache[cache_key] = result
+            return result
+
+        preview_lines = read_preview_lines(path)
+        profile = detect_file_profile(path, preview_lines)
+        if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"}:
+            result = core.parse_ygas_mode1_file_fast(path, required_columns=required_columns)
+        elif profile == "TOA5_DAT":
+            result = core.parse_toa5_file_fast(path, required_columns=required_columns)
+        else:
+            result = self.parse_profiled_file(path)
+        self.target_parsed_file_cache[cache_key] = result
+        return result
+
+    def get_compare_file_paths(self) -> list[Path]:
+        selected_files = self.get_selected_file_paths()
+        return selected_files[:2]
+
+    def get_listbox_selected_values(self, listbox: tk.Listbox) -> list[str]:
+        return [str(listbox.get(index)) for index in listbox.curselection()]
+
+    def get_selected_target_group_overrides(self) -> set[str]:
+        selected_keys: set[str] = set(getattr(self, "pending_target_group_override_keys", set()))
+        if not hasattr(self, "target_group_override_listbox") or self.target_group_override_listbox is None:
+            return selected_keys
+        for index in self.target_group_override_listbox.curselection():
+            group_key = str(self.target_group_override_listbox.get(index)).split(" | ", 1)[0]
+            if self.target_group_forceable_map.get(group_key, False):
+                selected_keys.add(group_key)
+        return selected_keys
+
+    def update_target_group_qc_panel(self, target_metadata: dict[str, Any] | None = None) -> None:
+        if not hasattr(self, "target_group_override_listbox") or self.target_group_override_listbox is None:
+            return
+
+        current_selection = self.get_selected_target_group_overrides()
+        self.pending_target_group_override_keys = set(current_selection)
+        self.target_group_override_listbox.delete(0, tk.END)
+        self.target_group_forceable_map = {}
+        if not target_metadata:
+            self.pending_target_group_override_keys = set()
+            self.target_group_qc_summary_var.set("目标谱图组质控：等待生成目标谱图")
+            return
+
+        group_records = list(target_metadata.get("group_records", []))
+        for record in group_records:
+            forceable = bool(record.get("forceable"))
+            group_key = str(record.get("group_key", record.get("window_label", "")))
+            group_label = str(record.get("group_label", group_key))
+            status = str(record.get("status", "未知"))
+            reason = str(record.get("reason", ""))
+            manual_hint = " | 可手动保留" if forceable and status == "跳过" else ""
+            display = f"{group_key} | {group_label} | {status} | {reason}{manual_hint}"
+            self.target_group_override_listbox.insert(tk.END, display)
+            self.target_group_forceable_map[group_key] = forceable
+        for index, record in enumerate(group_records):
+            if str(record.get("group_key", "")) in current_selection and bool(record.get("forceable")):
+                self.target_group_override_listbox.selection_set(index)
+        self.pending_target_group_override_keys = {
+            str(record.get("group_key", ""))
+            for record in group_records
+            if str(record.get("group_key", "")) in current_selection and bool(record.get("forceable"))
+        }
+
+        kept = sum(1 for record in group_records if record.get("status") in {"保留", "手动保留"})
+        skipped = sum(1 for record in group_records if record.get("status") == "跳过")
+        forceable_count = sum(1 for record in group_records if bool(record.get("forceable")))
+        effective_nsegment_values = sorted(
+            {
+                int(value)
+                for record in group_records
+                for value in (record.get("ygas_effective_nsegment"), record.get("dat_effective_nsegment"))
+                if value is not None
+            }
+        )
+        first_positive_freq_values = [
+            float(value)
+            for record in group_records
+            for value in (record.get("ygas_first_positive_freq"), record.get("dat_first_positive_freq"))
+            if value is not None
+        ]
+        psd_kernel_values = sorted(
+            {
+                str(value)
+                for record in group_records
+                for value in (record.get("ygas_psd_kernel"), record.get("dat_psd_kernel"))
+                if value
+            }
+        )
+        summary = f"目标谱图组质控：保留 {kept} 组 | 跳过 {skipped} 组 | 可手动放开 {forceable_count} 组"
+        if effective_nsegment_values:
+            summary += f" | effective_nsegment={ '/'.join(str(value) for value in effective_nsegment_values) }"
+        if first_positive_freq_values:
+            summary += f" | first_positive_freq≈{min(first_positive_freq_values):.12g} Hz"
+        if psd_kernel_values:
+            summary += f" | psd_kernel={ '/'.join(psd_kernel_values) }"
+        self.target_group_qc_summary_var.set(summary)
+
+    def set_listbox_values(self, listbox: tk.Listbox, columns: list[str], selected_values: list[str] | None = None) -> None:
+        selected_values = selected_values or []
+        listbox.delete(0, tk.END)
+        for column in columns:
+            listbox.insert(tk.END, column)
+        for index, column in enumerate(columns):
+            if column in selected_values:
+                listbox.selection_set(index)
+
+    def select_first_matching_column(self, columns: list[str], candidates: list[str]) -> str | None:
+        lowered = {str(column).lower(): str(column) for column in columns}
+        for candidate in candidates:
+            direct = lowered.get(candidate.lower())
+            if direct:
+                return direct
+        return None
+
+    def apply_element_mapping(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+    ) -> tuple[str | None, str | None, str]:
+        mapping_mode = self.mapping_mode_var.get().strip() or "手动映射"
+        mapping_name = "手动映射"
+        hit_a: str | None = None
+        hit_b: str | None = None
+
+        if mapping_mode == "预设映射":
+            mapping_name = self.element_preset_var.get().strip() or "CO2"
+            preset = ELEMENT_PRESETS.get(mapping_name, {})
+            hit_a = self.select_first_matching_column(parsed_a.suggested_columns, preset.get("A", []))
+            hit_b = self.select_first_matching_column(parsed_b.suggested_columns, preset.get("B", []))
+            if hit_a:
+                self.device_a_column_var.set(hit_a)
+            if hit_b:
+                self.device_b_column_var.set(hit_b)
+
+        if not self.device_a_column_var.get() and parsed_a.suggested_columns:
+            self.device_a_column_var.set(parsed_a.suggested_columns[0])
+        if not self.device_b_column_var.get() and parsed_b.suggested_columns:
+            self.device_b_column_var.set(parsed_b.suggested_columns[0])
+
+        preferred_a = [self.device_a_column_var.get()] if self.device_a_column_var.get() else []
+        preferred_b = [self.device_b_column_var.get()] if self.device_b_column_var.get() else []
+        self.set_listbox_values(self.device_a_multi_listbox, parsed_a.suggested_columns, preferred_a)
+        self.set_listbox_values(self.device_b_multi_listbox, parsed_b.suggested_columns, preferred_b)
+        return hit_a, hit_b, mapping_name
+
+    def build_compare_pairs(self) -> list[dict[str, str]]:
+        a_single = self.device_a_column_var.get().strip()
+        b_single = self.device_b_column_var.get().strip()
+        a_values = self.get_listbox_selected_values(self.device_a_multi_listbox) or ([a_single] if a_single else [])
+        b_values = self.get_listbox_selected_values(self.device_b_multi_listbox) or ([b_single] if b_single else [])
+        scope = self.compare_scope_var.get().strip() or "单对单"
+
+        if scope == "单对单":
+            if not a_single or not b_single:
+                return []
+            return [{"a_col": a_single, "b_col": b_single, "label": f"{a_single} vs {b_single}"}]
+
+        if scope == "设备A一列对设备B多列":
+            if not a_single or not b_values:
+                return []
+            return [{"a_col": a_single, "b_col": b_col, "label": f"{a_single} vs {b_col}"} for b_col in b_values]
+
+        if not a_values or not b_values:
+            return []
+        if len(a_values) == len(b_values):
+            return [{"a_col": a_col, "b_col": b_col, "label": f"{a_col} vs {b_col}"} for a_col, b_col in zip(a_values, b_values)]
+        if len(a_values) == 1:
+            return [{"a_col": a_values[0], "b_col": b_col, "label": f"{a_values[0]} vs {b_col}"} for b_col in b_values]
+        if len(b_values) == 1:
+            return [{"a_col": a_col, "b_col": b_values[0], "label": f"{a_col} vs {b_values[0]}"} for a_col in a_values]
+        return [{"a_col": a_col, "b_col": b_col, "label": f"{a_col} vs {b_col}"} for a_col, b_col in zip(a_values, b_values)]
+
+    def apply_recent_time_range(self, minutes: int) -> None:
+        try:
+            _parsed_a, _label_a, _parsed_b, _label_b, meta = self.build_compare_selection()
+            end_dt = meta["dat_summary"]["end"]
+        except Exception:
+            if self.current_file is None:
+                self.render_plot_message("请先选择含时间戳的数据文件。", level="warning")
+                return
+            parsed = self.parse_profiled_file(self.current_file)
+            start_bound, end_bound, _count = self.get_parsed_time_bounds(parsed)
+            end_dt = end_bound
+        start_dt = end_dt - pd.Timedelta(minutes=minutes)
+        self.time_start_var.set(start_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_end_var.set(end_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_range_strategy_var.set(f"最近{minutes}分钟" if minutes < 60 else "最近1小时")
+        self.status_var.set(f"已填入最近 {minutes} 分钟时间范围")
+
+    def build_legacy_target_override_config_path(self, scheme_path: Path) -> Path:
+        return scheme_path.with_name(f"{scheme_path.stem}_target_spectrum_overrides.json")
+
+    def save_legacy_target_override_config(self, scheme_path: Path) -> Path:
+        override_path = self.build_legacy_target_override_config_path(scheme_path)
+        payload = {
+            "target_element": self.resolve_target_element_name(),
+            "selected_dat": self.selected_dat_var.get().strip(),
+            "group_keys": sorted(self.get_selected_target_group_overrides()),
+        }
+        with override_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        self.pending_target_group_override_keys = set(str(value) for value in payload["group_keys"])
+        return override_path
+
+    def load_legacy_target_override_config(self, scheme_path: Path) -> set[str]:
+        override_path = self.build_legacy_target_override_config_path(scheme_path)
+        if not override_path.exists():
+            legacy_fallback = scheme_path.with_name(f"{scheme_path.stem}_legacy_target_overrides.json")
+            override_path = legacy_fallback if legacy_fallback.exists() else override_path
+        if not override_path.exists():
+            self.pending_target_group_override_keys = set()
+            return set()
+        with override_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        keys = {str(value) for value in payload.get("group_keys", []) if str(value).strip()}
+        self.pending_target_group_override_keys = keys
+        return keys
+
+    def save_compare_scheme(self) -> None:
+        scheme = {
+            "scheme_name": self.scheme_name_var.get().strip() or "默认方案",
+            "mapping_mode": self.mapping_mode_var.get(),
+            "element_preset": self.element_preset_var.get(),
+            "compare_scope": self.compare_scope_var.get(),
+            "alignment_strategy": self.alignment_strategy_var.get(),
+            "plot_style": self.plot_style_var.get(),
+            "plot_layout": self.plot_layout_var.get(),
+            "use_separate_zoom_windows": bool(self.use_separate_zoom_windows_var.get()),
+            "cross_spectrum_type": self.cross_spectrum_type_var.get(),
+            "reference_slope_mode": self.reference_slope_mode_var.get(),
+            "compare_mode": self.compare_mode_var.get(),
+            "time_range_strategy": self.time_range_strategy_var.get(),
+            "time_start": self.time_start_var.get(),
+            "time_end": self.time_end_var.get(),
+            "match_tolerance": self.match_tolerance_var.get(),
+            "device_a_column": self.device_a_column_var.get(),
+            "device_b_column": self.device_b_column_var.get(),
+            "device_a_multi": self.get_listbox_selected_values(self.device_a_multi_listbox),
+            "device_b_multi": self.get_listbox_selected_values(self.device_b_multi_listbox),
+            "selected_dat": self.selected_dat_var.get(),
+            "legacy_target_use_analysis_params": bool(self.legacy_target_use_analysis_params_var.get()),
+            "legacy_target_spectrum_mode": self.legacy_target_spectrum_mode_var.get(),
+            "legacy_target_color_mode": self.legacy_target_color_mode_var.get(),
+            "target_cross_ygas_color": self.target_cross_ygas_color_var.get(),
+            "target_cross_dat_color": self.target_cross_dat_color_var.get(),
+            "fs": self.fs_var.get(),
+            "nsegment": self.nsegment_var.get(),
+            "overlap_ratio": self.overlap_ratio_var.get(),
+        }
+        path = filedialog.asksaveasfilename(
+            title="保存比对方案",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile=f"{sanitize_filename(scheme['scheme_name'])}_compare_scheme.json",
+        )
+        if not path:
+            return
+        scheme_path = Path(path)
+        scheme["legacy_target_override_config"] = self.build_legacy_target_override_config_path(scheme_path).name
+        with scheme_path.open("w", encoding="utf-8") as handle:
+            json.dump(scheme, handle, ensure_ascii=False, indent=2)
+        override_path = self.save_legacy_target_override_config(scheme_path)
+        self.status_var.set(f"比对方案已保存：{path}")
+        self.status_var.set(f"比对方案已保存：{path} | target overrides={override_path.name}")
+
+    def load_compare_scheme(self) -> None:
+        path = filedialog.askopenfilename(
+            title="加载比对方案",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            scheme = json.load(handle)
+
+        self.scheme_name_var.set(str(scheme.get("scheme_name", "默认方案")))
+        self.mapping_mode_var.set(str(scheme.get("mapping_mode", "预设映射")))
+        self.element_preset_var.set(str(scheme.get("element_preset", "CO2")))
+        self.compare_scope_var.set(str(scheme.get("compare_scope", "单对单")))
+        self.alignment_strategy_var.set(str(scheme.get("alignment_strategy", "最近邻 + 容差")))
+        self.plot_style_var.set(str(scheme.get("plot_style", "自动")))
+        self.plot_layout_var.set(str(scheme.get("plot_layout", "叠加同图")))
+        self.use_separate_zoom_windows_var.set(bool(scheme.get("use_separate_zoom_windows", False)))
+        self.cross_spectrum_type_var.set(str(scheme.get("cross_spectrum_type", CROSS_SPECTRUM_MAGNITUDE)))
+        self.reference_slope_mode_var.set(str(scheme.get("reference_slope_mode", REFERENCE_SLOPE_MODE_AUTO)))
+        self.compare_mode_var.set(str(scheme.get("compare_mode", "时间序列对比")))
+        self.time_range_strategy_var.set(str(scheme.get("time_range_strategy", "使用 txt+dat 共同时间范围")))
+        self.time_start_var.set(str(scheme.get("time_start", "")))
+        self.time_end_var.set(str(scheme.get("time_end", "")))
+        self.match_tolerance_var.set(str(scheme.get("match_tolerance", "0.2")))
+        self.device_a_column_var.set(str(scheme.get("device_a_column", "")))
+        self.device_b_column_var.set(str(scheme.get("device_b_column", "")))
+        self.selected_dat_var.set(str(scheme.get("selected_dat", "")))
+        self.legacy_target_use_analysis_params_var.set(bool(scheme.get("legacy_target_use_analysis_params", False)))
+        self.legacy_target_spectrum_mode_var.set(
+            str(scheme.get("legacy_target_spectrum_mode", core.LEGACY_TARGET_SPECTRUM_MODE_PSD))
+        )
+        self.legacy_target_color_mode_var.set(
+            str(scheme.get("legacy_target_color_mode", LEGACY_TARGET_COLOR_MODE_BY_DEVICE))
+        )
+        self.target_cross_ygas_color_var.set(str(scheme.get("target_cross_ygas_color", "")))
+        self.target_cross_dat_color_var.set(str(scheme.get("target_cross_dat_color", "")))
+        self.fs_var.set(str(scheme.get("fs", self.fs_var.get())))
+        self.nsegment_var.set(str(scheme.get("nsegment", self.nsegment_var.get())))
+        self.overlap_ratio_var.set(str(scheme.get("overlap_ratio", self.overlap_ratio_var.get())))
+        self.refresh_compare_column_options()
+        self.set_listbox_values(
+            self.device_a_multi_listbox,
+            [str(self.device_a_multi_listbox.get(i)) for i in range(self.device_a_multi_listbox.size())],
+            [str(value) for value in scheme.get("device_a_multi", [])],
+        )
+        self.set_listbox_values(
+            self.device_b_multi_listbox,
+            [str(self.device_b_multi_listbox.get(i)) for i in range(self.device_b_multi_listbox.size())],
+            [str(value) for value in scheme.get("device_b_multi", [])],
+        )
+        scheme_path = Path(path)
+        self.load_legacy_target_override_config(scheme_path)
+        if self.current_target_plot_metadata:
+            self.update_target_group_qc_panel(self.current_target_plot_metadata)
+        self.status_var.set(f"已加载比对方案：{path}")
+
+    def update_compare_summaries(
+        self,
+        txt_summary: dict[str, Any] | None = None,
+        dat_summary: dict[str, Any] | None = None,
+    ) -> None:
+        if txt_summary is None:
+            self.txt_merge_summary_var.set("txt 合并摘要：等待选择 txt/log 文件")
+        else:
+            self.txt_merge_summary_var.set(
+                f"txt 合并摘要：文件数={txt_summary['file_count']} | 开始={txt_summary['start']} | "
+                f"结束={txt_summary['end']} | 原始总行数={txt_summary.get('raw_rows', txt_summary['total_points'])} | "
+                f"有效时间戳点数={txt_summary.get('valid_timestamp_points', txt_summary['total_points'])} | "
+                f"合并后点数={txt_summary['total_points']}"
+            )
+        if dat_summary is None:
+            self.dat_summary_var.set("dat 摘要：等待选择 dat 文件")
+        else:
+            self.dat_summary_var.set(
+                f"dat 摘要：开始={dat_summary['start']} | 结束={dat_summary['end']} | "
+                f"原始总行数={dat_summary.get('raw_rows', dat_summary['total_points'])} | "
+                f"有效时间戳点数={dat_summary.get('valid_timestamp_points', dat_summary['total_points'])} | "
+                f"总点数={dat_summary['total_points']}"
+            )
+
+    def build_timestamp_quality_items(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+        *,
+        label_a: str = "设备A",
+        label_b: str = "设备B",
+    ) -> list[str]:
+        items = [
+            f"{label_a}原始点数={parsed_a.source_row_count or len(parsed_a.dataframe)}",
+            f"{label_a}有效时间点数={parsed_a.timestamp_valid_count}",
+            f"{label_a}时间戳有效率={parsed_a.timestamp_valid_ratio:.1%}",
+            f"{label_b}原始点数={parsed_b.source_row_count or len(parsed_b.dataframe)}",
+            f"{label_b}有效时间点数={parsed_b.timestamp_valid_count}",
+            f"{label_b}时间戳有效率={parsed_b.timestamp_valid_ratio:.1%}",
+        ]
+        if parsed_a.timestamp_warning:
+            items.append(f"{label_a}时间戳警告={parsed_a.timestamp_warning}")
+        if parsed_b.timestamp_warning:
+            items.append(f"{label_b}时间戳警告={parsed_b.timestamp_warning}")
+        return items
+
+    def update_compare_column_values(self, combo: ttk.Combobox, variable: tk.StringVar, columns: list[str]) -> None:
+        combo.configure(values=columns)
+        current = variable.get()
+        if current in columns:
+            return
+        if "CO2浓度" in columns:
+            variable.set("CO2浓度")
+            return
+        if "H2O浓度" in columns:
+            variable.set("H2O浓度")
+            return
+        variable.set(columns[0] if columns else "")
+
+    def refresh_compare_column_options(self) -> None:
+        try:
+            parsed_a, label_a, parsed_b, label_b, meta = self.build_compare_selection()
+        except Exception as exc:
+            selected_paths = self.get_selected_file_paths()
+            ygas_paths, dat_path, _other = self.classify_selected_compare_files()
+            if selected_paths and (dat_path is None or not ygas_paths):
+                if ygas_paths and dat_path is None:
+                    self.compare_file_info_var.set(
+                        f"当前仅识别到 ygas 文件 {len(ygas_paths)} 个。可直接生成单台设备图谱；双设备对比需再补 1 个 dat 文件。"
+                    )
+                elif dat_path is not None and not ygas_paths:
+                    dat_count = sum(1 for path in selected_paths if path.suffix.lower() == ".dat")
+                    self.compare_file_info_var.set(
+                        f"当前仅识别到 dat 文件 {max(dat_count, 1)} 个。可直接生成单台设备图谱；双设备对比需再补 1 个 txt/log 文件。"
+                    )
+                elif len(selected_paths) == 1:
+                    self.compare_file_info_var.set(
+                        f"当前仅选择 1 个文件：{selected_paths[0].name}。可直接生成单台设备图谱；双设备对比需再选择另一台设备文件。"
+                    )
+                else:
+                    self.compare_file_info_var.set(
+                        "当前所选文件尚未形成双设备配对。可先做单台设备图谱；如需对比，请同时选择 txt/log 和 dat。"
+                    )
+            elif len(selected_paths) < 2:
+                self.compare_file_info_var.set("双设备比对：请先选择多个 txt/log 和 1 个 dat 文件")
+            else:
+                self.compare_file_info_var.set(f"双设备比对：文件解析失败 - {exc}")
+            self.device_a_combo.configure(values=[])
+            self.device_b_combo.configure(values=[])
+            self.device_a_column_var.set("")
+            self.device_b_column_var.set("")
+            return
+
+        self.update_compare_column_values(self.device_a_combo, self.device_a_column_var, parsed_a.suggested_columns)
+        self.update_compare_column_values(self.device_b_combo, self.device_b_column_var, parsed_b.suggested_columns)
+        hit_a, hit_b, mapping_name = self.apply_element_mapping(parsed_a, parsed_b)
+        self.compare_file_info_var.set(
+            f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 映射={mapping_name}"
+        )
+        if self.mapping_mode_var.get() == "预设映射" and (hit_a is None or hit_b is None):
+            self.compare_file_info_var.set(
+                f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 预设“{mapping_name}”未完全命中"
+            )
+        self.update_compare_summaries(meta["txt_summary"], meta["dat_summary"])
+
+    def build_device_grouped_spectral_selection(
+        self,
+        selected_files: list[Path],
+        *,
+        target_column: str,
+        reporter: Any | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        skipped_files: list[str] = []
+        total_files = len(selected_files)
+
+        for index, path in enumerate(selected_files, start=1):
+            if reporter is not None:
+                reporter(f"正在解析文件并识别设备… {index}/{total_files}：{path.name}")
+            try:
+                parsed = self.parse_target_profiled_file(path, device_kind="grouped_spectral", required_columns=[target_column])
+            except Exception as exc:
+                skipped_files.append(f"{path.name}(解析失败: {exc})")
+                continue
+
+            if target_column not in parsed.dataframe.columns:
+                skipped_files.append(f"{path.name}(缺少列)")
+                continue
+
+            device_info = core.resolve_device_identifier(parsed, path)
+            group = grouped.setdefault(
+                str(device_info["device_id"]),
+                {
+                    "device_id": str(device_info["device_id"]),
+                    "device_label": str(device_info["device_label"]),
+                    "device_source": str(device_info["device_source"]),
+                    "entries": [],
+                },
+            )
+            group["entries"].append(
+                {
+                    "path": path,
+                    "parsed": parsed,
+                }
+            )
+
+        device_groups: list[dict[str, Any]] = []
+        for group in grouped.values():
+            entries = list(group["entries"])
+            merged_parsed, merge_metadata = core.merge_parsed_results_for_device_group(
+                [item["parsed"] for item in entries],
+                source_paths=[item["path"] for item in entries],
+                device_id=group["device_id"],
+            )
+            column_values = pd.to_numeric(merged_parsed.dataframe[target_column], errors="coerce").to_numpy(dtype=float)
+            valid_count = int(np.count_nonzero(np.isfinite(column_values)))
+            if valid_count < 2:
+                skipped_files.append(f"{group['device_label']}(有效点数不足)")
+                continue
+            group["merged_parsed"] = merged_parsed
+            group["merge_metadata"] = merge_metadata
+            group["file_count"] = len(entries)
+            group["source_paths"] = [item["path"] for item in entries]
+            group["valid_value_count"] = valid_count
+            device_groups.append(group)
+
+        device_groups.sort(key=lambda item: str(item["device_label"]).lower())
+        return device_groups, skipped_files
+
+    def prepare_multi_spectral_compare_payload(
+        self,
+        selected_files: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        series_results: list[dict[str, Any]] = []
+        device_groups, skipped_files = self.build_device_grouped_spectral_selection(
+            selected_files,
+            target_column=target_column,
+            reporter=reporter,
+        )
+
+        for index, group in enumerate(device_groups, start=1):
+            if reporter is not None:
+                reporter(
+                    f"正在计算设备图谱… {index}/{max(len(device_groups), 1)}："
+                    f"{group['device_label']}（{group['file_count']} 个文件）"
+                )
+            try:
+                merged_parsed = group["merged_parsed"]
+                data = pd.to_numeric(merged_parsed.dataframe[target_column], errors="coerce").to_numpy(dtype=float)
+                effective_fs = self.resolve_compare_fs(merged_parsed, fs)
+                freq, density, details = self.compute_psd_from_array_with_params(
+                    data,
+                    effective_fs,
+                    requested_nsegment,
+                    overlap_ratio,
+                )
+                positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
+                freq = freq[positive]
+                density = density[positive]
+                if len(freq) == 0:
+                    skipped_files.append(f"{group['device_label']}(无有效谱值)")
+                    continue
+
+                details = dict(details)
+                details["device_id"] = str(group["device_id"])
+                details["device_label"] = str(group["device_label"])
+                details["device_source"] = str(group["device_source"])
+                details["device_file_count"] = int(group["file_count"])
+                details["device_group_merge_strategy"] = str(group["merge_metadata"].get("merge_strategy", ""))
+                details["source_paths"] = [str(path) for path in group["source_paths"]]
+                details["grouped_profile_name"] = str(merged_parsed.profile_name)
+
+                series_results.append(
+                    {
+                        "label": str(group["device_label"]),
+                        "freq": freq,
+                        "density": density,
+                        "details": details,
+                        "device_id": str(group["device_id"]),
+                        "file_count": int(group["file_count"]),
+                        "source_paths": [str(path) for path in group["source_paths"]],
+                    }
+                )
+            except Exception as exc:
+                skipped_files.append(f"{group['device_label']}(计算失败: {exc})")
+
+        return {
+            "target_column": target_column,
+            "series_results": series_results,
+            "skipped_files": skipped_files,
+            "device_groups": [
+                {
+                    "device_id": str(group["device_id"]),
+                    "device_label": str(group["device_label"]),
+                    "device_source": str(group["device_source"]),
+                    "file_count": int(group["file_count"]),
+                    "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
+                }
+                for group in device_groups
+            ],
+            "device_count": len(series_results),
+            "file_count": len(selected_files),
+        }
+
+    def on_multi_spectral_compare_ready(self, payload: dict[str, Any]) -> None:
+        target_column = str(payload["target_column"])
+        series_results = list(payload["series_results"])
+        skipped_files = list(payload["skipped_files"])
+        device_count = int(payload.get("device_count", len(series_results)))
+        if not series_results:
+            self.status_var.set("设备图谱生成失败：没有有效系列")
+            self.update_diagnostic_info(layout="设备分组模式", analysis_label=target_column, batch_success=0, batch_skips=len(skipped_files))
+            self.render_plot_message("按设备分组后没有找到可用于生成图谱的有效系列。", level="warning")
+            messagebox.showerror("分析失败", "所选文件在设备分组后没有可用于生成图谱的有效数据。")
+            return
+        mode_title = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
+        self.status_var.set(f"正在生成图：{mode_title} / {target_column}")
+        self.root.update_idletasks()
+        self.plot_multi_spectral_results(target_column, series_results, skipped_files, payload=payload)
+
+    def prepare_dual_compare_payload(
+        self,
+        *,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        selected_paths: list[Path],
+        compare_mode: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        if dat_path is not None and ygas_paths:
+            target_context: dict[str, Any] | None = None
+            required_ygas_columns: list[str] | None = None
+            required_dat_columns: list[str] | None = None
+            if self.is_target_cross_compare_mode(compare_mode):
+                target_element = self.resolve_target_element_name()
+                required_ygas_columns = self.build_target_required_columns(
+                    target_element=target_element,
+                    device_kind="ygas",
+                )
+                required_dat_columns = self.build_target_required_columns(
+                    target_element=target_element,
+                    device_kind="dat",
+                    include_reference=True,
+                )
+            parsed_a, label_a, parsed_b, label_b, selection_meta = self.build_compare_selection_from_paths(
+                ygas_paths,
+                dat_path,
+                required_ygas_columns=required_ygas_columns,
+                required_dat_columns=required_dat_columns,
+                target_context=target_context,
+                reporter=reporter,
+            )
+            if self.is_target_cross_compare_mode(compare_mode):
+                selection_meta["target_spectral_context"] = self.resolve_target_spectral_context_for_parsed(
+                    parsed_a,
+                    parsed_b,
+                    spectrum_mode=compare_mode,
+                    comparison_is_target_spectral=True,
+                )
+                if selection_meta["target_spectral_context"] is None:
+                    raise ValueError("当前 ygas+dat 目标频谱场景未找到完整的 Uz -> target canonical pair。")
+            return {
+                "parsed_a": parsed_a,
+                "label_a": label_a,
+                "parsed_b": parsed_b,
+                "label_b": label_b,
+                "selection_meta": selection_meta,
+                "compare_mode": compare_mode,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            }
+
+        if len(selected_paths) < 2:
+            raise ValueError("请先选择两个文件，或选择多个 txt/log 加 1 个 dat 文件。")
+
+        if reporter is not None:
+            reporter("正在解析设备A文件…")
+        parsed_a = self.parse_profiled_file(selected_paths[0])
+        if reporter is not None:
+            reporter("正在解析设备B文件…")
+        parsed_b = self.parse_profiled_file(selected_paths[1])
+        return {
+            "parsed_a": parsed_a,
+            "label_a": self.format_source_label(selected_paths[0]),
+            "parsed_b": parsed_b,
+            "label_b": self.format_source_label(selected_paths[1]),
+            "selection_meta": {
+                "txt_summary": None,
+                "dat_summary": None,
+            },
+            "compare_mode": compare_mode,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+        }
+
+    def on_dual_compare_payload_ready(self, payload: dict[str, Any]) -> None:
+        parsed_a = payload["parsed_a"]
+        label_a = str(payload["label_a"])
+        parsed_b = payload["parsed_b"]
+        label_b = str(payload["label_b"])
+        selection_meta = dict(payload["selection_meta"])
+        target_context = core.get_target_spectral_context(selection_meta)
+        compare_mode = str(payload["compare_mode"])
+        start_dt = payload["start_dt"]
+        end_dt = payload["end_dt"]
+
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = self.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+
+        self.update_compare_column_values(self.device_a_combo, self.device_a_column_var, parsed_a.suggested_columns)
+        self.update_compare_column_values(self.device_b_combo, self.device_b_column_var, parsed_b.suggested_columns)
+        hit_a, hit_b, mapping_name = self.apply_element_mapping(parsed_a, parsed_b)
+        self.compare_file_info_var.set(
+            f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 映射={mapping_name}"
+        )
+        if self.mapping_mode_var.get() == "预设映射" and (hit_a is None or hit_b is None):
+            self.compare_file_info_var.set(
+                f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 预设“{mapping_name}”未完全命中"
+            )
+        self.update_compare_summaries(selection_meta.get("txt_summary"), selection_meta.get("dat_summary"))
+
+        if (
+            self.mapping_mode_var.get() == "预设映射"
+            and (hit_a is None or hit_b is None)
+            and target_context is None
+        ):
+            raise ValueError(f"预设映射“{mapping_name}”未命中，请切换为手动映射或调整列选择。")
+
+        if target_context is not None and self.is_target_cross_compare_mode(compare_mode):
+            pairs = [
+                {
+                    "a_col": str(target_context.get("ygas_target_column") or target_context.get("target_column")),
+                    "b_col": str(target_context["reference_column"]),
+                    "label": f"{target_context['display_target_label']}(ygas) vs {target_context['reference_column']}",
+                },
+                {
+                    "a_col": str(target_context.get("dat_target_column") or ""),
+                    "b_col": str(target_context["reference_column"]),
+                    "label": f"{target_context['display_target_label']}(dat) vs {target_context['reference_column']}",
+                },
+            ]
+        else:
+            pairs = self.build_compare_pairs()
+            if not pairs:
+                raise ValueError("当前没有可用于比对的列映射，请先选择设备A和设备B的目标列。")
+
+        compare_scope = self.compare_scope_var.get().strip() or "单对单"
+        alignment_strategy = self.get_alignment_strategy(compare_mode)
+        plot_style = self.resolve_plot_style(compare_mode)
+        plot_layout = self.resolve_plot_layout(compare_mode)
+        fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        match_tolerance = self.get_match_tolerance_seconds(default_value=0.2)
+        spectrum_type = self.get_selected_cross_spectrum_type(compare_mode)
+        scheme_name = self.scheme_name_var.get().strip() or "默认方案"
+
+        self.start_background_task(
+            status_text=f"正在准备双设备比对数据：{compare_mode}",
+            worker=lambda reporter: self.prepare_dual_plot_payload(
+                parsed_a=parsed_a,
+                label_a=label_a,
+                parsed_b=parsed_b,
+                label_b=label_b,
+                pairs=pairs,
+                selection_meta=selection_meta,
+                compare_mode=compare_mode,
+                compare_scope=compare_scope,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                mapping_name=mapping_name,
+                scheme_name=scheme_name,
+                alignment_strategy=alignment_strategy,
+                plot_style=plot_style,
+                plot_layout=plot_layout,
+                fs_ui=fs_ui,
+                requested_nsegment=requested_nsegment,
+                overlap_ratio=overlap_ratio,
+                match_tolerance=match_tolerance,
+                spectrum_type=spectrum_type,
+                reporter=reporter,
+            ),
+            on_success=self.on_prepared_dual_plot_ready,
+            error_title="双设备比对",
+        )
+
+    def prepare_dual_plot_payload(
+        self,
+        *,
+        parsed_a: ParsedFileResult,
+        label_a: str,
+        parsed_b: ParsedFileResult,
+        label_b: str,
+        pairs: list[dict[str, str]],
+        selection_meta: dict[str, Any] | None,
+        compare_mode: str,
+        compare_scope: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        mapping_name: str,
+        scheme_name: str,
+        alignment_strategy: str,
+        plot_style: str,
+        plot_layout: str,
+        fs_ui: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        match_tolerance: float,
+        spectrum_type: str,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        base_payload = {
+            "parsed_a": parsed_a,
+            "label_a": label_a,
+            "parsed_b": parsed_b,
+            "label_b": label_b,
+            "pairs": pairs,
+            "selection_meta": dict(selection_meta or {}),
+            "compare_mode": compare_mode,
+            "compare_scope": compare_scope,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "mapping_name": mapping_name,
+            "scheme_name": scheme_name,
+            "alignment_strategy": alignment_strategy,
+            "plot_style": plot_style,
+            "plot_layout": plot_layout,
+            "fs_ui": fs_ui,
+            "requested_nsegment": requested_nsegment,
+            "overlap_ratio": overlap_ratio,
+            "match_tolerance": match_tolerance,
+            "spectrum_type": spectrum_type,
+        }
+
+        if compare_mode == "时间序列对比":
+            if reporter is not None:
+                reporter("正在准备时间序列数据…")
+            export_frames: list[pd.DataFrame] = []
+            exported_a: set[str] = set()
+            pair_data: list[dict[str, Any]] = []
+            plotted_count = 0
+            total_a_points = 0
+            total_b_points = 0
+            for index, pair in enumerate(pairs):
+                series_a, meta_a = self.prepare_compare_series(parsed_a, pair["a_col"], start_dt, end_dt, "设备A")
+                series_b, meta_b = self.prepare_compare_series(parsed_b, pair["b_col"], start_dt, end_dt, "设备B")
+                a_name = meta_a["value_name"]
+                b_name = meta_b["value_name"]
+                pair_data.append(
+                    {
+                        "pair": pair,
+                        "series_a": series_a,
+                        "series_b": series_b,
+                        "a_name": a_name,
+                        "b_name": b_name,
+                        "color_a": SERIES_COLORS[index % len(SERIES_COLORS)],
+                        "color_b": SERIES_COLORS[(index + 1) % len(SERIES_COLORS)] if len(pairs) == 1 else SERIES_COLORS[(index + 3) % len(SERIES_COLORS)],
+                    }
+                )
+                if pair["a_col"] not in exported_a:
+                    export_frames.append(series_a[["时间戳", a_name]].rename(columns={a_name: f"{label_a}_{pair['a_col']}"}))
+                    exported_a.add(pair["a_col"])
+                export_frames.append(series_b[["时间戳", b_name]].rename(columns={b_name: f"{label_b}_{pair['b_col']}"}))
+                plotted_count += 1
+                total_a_points = max(total_a_points, meta_a["valid_count"])
+                total_b_points = max(total_b_points, meta_b["valid_count"])
+            if plotted_count == 0:
+                raise ValueError("没有可用于时间序列对比的有效系列。")
+            return {
+                **base_payload,
+                "kind": "time_series",
+                "pair_data": pair_data,
+                "export_frames": export_frames,
+                "plotted_count": plotted_count,
+                "total_a_points": total_a_points,
+                "total_b_points": total_b_points,
+            }
+
+        if compare_mode == "散点一致性对比":
+            if reporter is not None:
+                reporter("正在时间对齐…")
+            if len(pairs) == 1 and compare_scope == "单对单":
+                pair = pairs[0]
+                aligned, meta = self.align_compare_frames(
+                    parsed_a,
+                    pair["a_col"],
+                    parsed_b,
+                    pair["b_col"],
+                    start_dt,
+                    end_dt,
+                    tolerance_seconds=match_tolerance,
+                    alignment_strategy=alignment_strategy,
+                )
+                value_a = meta["meta_a"]["value_name"]
+                value_b = meta["meta_b"]["value_name"]
+                diff = aligned[value_a] - aligned[value_b]
+                return {
+                    **base_payload,
+                    "kind": "scatter_single",
+                    "pair": pair,
+                    "aligned": aligned,
+                    "meta": meta,
+                    "mean_diff": float(diff.mean()),
+                    "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+                    "corr": float(aligned[value_a].corr(aligned[value_b])),
+                }
+
+            series_items: list[dict[str, Any]] = []
+            export_frames: list[pd.DataFrame] = []
+            success_count = 0
+            matched_points_total = 0
+            for index, pair in enumerate(pairs):
+                aligned, meta = self.align_compare_frames(
+                    parsed_a,
+                    pair["a_col"],
+                    parsed_b,
+                    pair["b_col"],
+                    start_dt,
+                    end_dt,
+                    tolerance_seconds=match_tolerance,
+                    alignment_strategy=alignment_strategy,
+                )
+                value_a = meta["meta_a"]["value_name"]
+                value_b = meta["meta_b"]["value_name"]
+                series_items.append(
+                    {
+                        "pair": pair,
+                        "x": aligned[value_a].to_numpy(dtype=float),
+                        "y": aligned[value_b].to_numpy(dtype=float),
+                        "color": SERIES_COLORS[index % len(SERIES_COLORS)],
+                    }
+                )
+                export_frames.append(
+                    aligned[["时间戳", value_a, value_b]].rename(
+                        columns={value_a: f"{label_a}_{pair['label']}_A", value_b: f"{label_b}_{pair['label']}_B"}
+                    )
+                )
+                success_count += 1
+                matched_points_total += meta["matched_count"]
+            if success_count == 0:
+                raise ValueError("散点一致性对比没有得到可用的有效结果。")
+            return {
+                **base_payload,
+                "kind": "scatter_multi",
+                "series_items": series_items,
+                "export_frames": export_frames,
+                "success_count": success_count,
+                "matched_points_total": matched_points_total,
+            }
+
+        if compare_mode == "时间段内 PSD 对比":
+            if reporter is not None:
+                reporter("正在时间对齐…")
+            plotted_keys: set[tuple[str, str]] = set()
+            series_results: list[dict[str, Any]] = []
+            txt_points = 0
+            dat_points = 0
+            fs_a_last = DEFAULT_FS
+            fs_b_last = DEFAULT_FS
+            if reporter is not None:
+                reporter("正在计算 PSD/CSD…")
+            for pair in pairs:
+                series_a, meta_a = self.prepare_compare_series(parsed_a, pair["a_col"], start_dt, end_dt, "设备A")
+                series_b, meta_b = self.prepare_compare_series(parsed_b, pair["b_col"], start_dt, end_dt, "设备B")
+                txt_points = max(txt_points, meta_a["valid_count"])
+                dat_points = max(dat_points, meta_b["valid_count"])
+                fs_a = self.resolve_compare_fs(parsed_a, fs_ui)
+                fs_b = self.resolve_compare_fs(parsed_b, fs_ui)
+                fs_a_last = fs_a
+                fs_b_last = fs_b
+                for side, label, column, array, fs_value in (
+                    ("txt", label_a, pair["a_col"], series_a[meta_a["value_name"]].to_numpy(dtype=float), fs_a),
+                    ("dat", label_b, pair["b_col"], series_b[meta_b["value_name"]].to_numpy(dtype=float), fs_b),
+                ):
+                    key = (side, column)
+                    if key in plotted_keys:
+                        continue
+                    plotted_keys.add(key)
+                    freq, density, details = self.compute_psd_from_array_with_params(array, fs_value, requested_nsegment, overlap_ratio)
+                    positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
+                    freq_plot = freq[positive]
+                    density_plot = density[positive]
+                    if len(freq_plot) == 0:
+                        continue
+                    series_results.append(
+                        {
+                            "label": f"{label} - {column}",
+                            "side": side,
+                            "column": column,
+                            "freq": freq_plot,
+                            "density": density_plot,
+                            "details": details,
+                        }
+                    )
+            if not series_results:
+                raise ValueError("时间段内 PSD 对比没有得到可用的有效谱值。")
+            return {
+                **base_payload,
+                "kind": "psd_compare",
+                "series_results": series_results,
+                "txt_points": txt_points,
+                "dat_points": dat_points,
+                "fs_a_last": fs_a_last,
+                "fs_b_last": fs_b_last,
+            }
+
+        target_context = core.get_target_spectral_context(base_payload["selection_meta"])
+        if compare_mode in {"互谱幅值", "协谱图", "正交谱图"} and target_context is not None:
+            if reporter is not None:
+                reporter("正在按目标谱图 canonical 双系列链路对齐 Uz 与目标量…")
+            reference_series, reference_meta = self.prepare_compare_series(
+                parsed_b,
+                str(target_context["reference_column"]),
+                start_dt,
+                end_dt,
+                "设备B",
+            )
+            reference_frame = reference_series[["时间戳", reference_meta["value_name"]]].rename(
+                columns={reference_meta["value_name"]: "value"}
+            )
+            reference_fs = self.resolve_compare_fs(parsed_b, fs_ui)
+            canonical_specs = [
+                {
+                    "series_role": "ygas_target_vs_uz",
+                    "device_kind": "cross_ygas",
+                    "source_kind": "ygas",
+                    "target_column": str(target_context.get("ygas_target_column") or target_context.get("target_column") or ""),
+                    "label": f"{target_context['display_target_label']}(ygas) vs {target_context['reference_column']}",
+                    "parsed": parsed_a,
+                },
+                {
+                    "series_role": "dat_target_vs_uz",
+                    "device_kind": "cross_dat",
+                    "source_kind": "dat",
+                    "target_column": str(target_context.get("dat_target_column") or ""),
+                    "label": f"{target_context['display_target_label']}(dat) vs {target_context['reference_column']}",
+                    "parsed": parsed_b,
+                },
+            ]
+            plot_series: list[dict[str, Any]] = []
+            export_frames: list[pd.DataFrame] = []
+            aligned_frames: list[pd.DataFrame] = []
+            fs_used_values: list[float] = []
+            series_details: list[dict[str, Any]] = []
+            matched_points_total = 0
+            total_a_points = 0
+            total_b_points = int(reference_meta["valid_count"])
+            for index, spec in enumerate(canonical_specs):
+                target_column = str(spec["target_column"])
+                if not target_column:
+                    continue
+                target_series, target_meta = self.prepare_compare_series(
+                    spec["parsed"],
+                    target_column,
+                    start_dt,
+                    end_dt,
+                    "设备A" if spec["source_kind"] == "ygas" else "设备B",
+                )
+                target_frame = target_series[["时间戳", target_meta["value_name"]]].rename(
+                    columns={target_meta["value_name"]: "value"}
+                )
+                target_fs = self.resolve_compare_fs(spec["parsed"], fs_ui)
+                cross_payload = core.compute_target_cross_spectrum_payload(
+                    target_frame=target_frame,
+                    reference_frame=reference_frame,
+                    target_fs=float(target_fs),
+                    reference_fs=float(reference_fs),
+                    target_element=str(target_context["display_target_label"]),
+                    reference_column=str(target_context["reference_column"]),
+                    target_column=target_column,
+                    requested_nsegment=requested_nsegment,
+                    overlap_ratio=overlap_ratio,
+                    spectrum_type=spectrum_type,
+                    use_requested_nsegment=True,
+                    insufficient_message="当前数据不足以生成有效互谱/协谱结果。",
+                    display_target_label=str(target_context["display_target_label"]),
+                    target_context=target_context,
+                    series_role=str(spec["series_role"]),
+                    device_kind=str(spec["device_kind"]),
+                    display_label=str(spec["label"]),
+                )
+                details = dict(cross_payload["details"])
+                details["spectrum_mode"] = compare_mode
+                details["target_spectral_context"] = target_context
+                plot_series.append(
+                    {
+                        "label": str(spec["label"]),
+                        "color": self.resolve_target_cross_series_color(str(spec["device_kind"]), 0)
+                        or SERIES_COLORS[index % len(SERIES_COLORS)],
+                        "freq": np.asarray(cross_payload["freq"])[np.asarray(cross_payload["mask"], dtype=bool)],
+                        "values": np.asarray(cross_payload["values"])[np.asarray(cross_payload["mask"], dtype=bool)],
+                        "series_role": str(spec["series_role"]),
+                        "device_kind": str(spec["device_kind"]),
+                    }
+                )
+                export_frames.append(cross_payload["export_frame"])
+                aligned_frames.append(cross_payload["aligned_frame"])
+                fs_used_values.append(float(details["effective_fs"]))
+                series_details.append(details)
+                matched_points_total += int(cross_payload["matched_count"])
+                if spec["source_kind"] == "ygas":
+                    total_a_points = max(total_a_points, int(target_meta["valid_count"]))
+                total_b_points = max(total_b_points, int(target_meta["valid_count"]))
+            if not plot_series:
+                raise ValueError("当前 ygas+dat 目标频谱场景没有生成有效的 canonical cross 系列。")
+            details = dict(series_details[0])
+            details["generated_cross_series_count"] = int(len(plot_series))
+            details["generated_cross_series_roles"] = [str(item["series_role"]) for item in plot_series]
+            details["canonical_cross_pairs"] = list(target_context.get("canonical_cross_pairs") or [])
+            details["ygas_target_column"] = target_context.get("ygas_target_column")
+            details["dat_target_column"] = target_context.get("dat_target_column")
+            return {
+                **base_payload,
+                "kind": "cross_compare",
+                "plot_series": plot_series,
+                "export_frames": export_frames,
+                "aligned_frames": aligned_frames,
+                "success_count": int(len(plot_series)),
+                "matched_points_total": int(matched_points_total),
+                "total_a_points": int(total_a_points),
+                "total_b_points": int(total_b_points),
+                "fs_used_values": fs_used_values,
+                "last_details": details,
+                "series_details": series_details,
+                "canonical_pairs": canonical_specs,
+                "target_spectral_context": target_context,
+                "uses_target_spectral_context": True,
+            }
+
+        if compare_mode in {"互谱幅值", "协谱图", "正交谱图"}:
+            if reporter is not None:
+                reporter("正在时间对齐…")
+            export_frames: list[pd.DataFrame] = []
+            aligned_frames: list[pd.DataFrame] = []
+            plot_series: list[dict[str, Any]] = []
+            success_count = 0
+            matched_points_total = 0
+            total_a_points = 0
+            total_b_points = 0
+            fs_used_values: list[float] = []
+            last_details: dict[str, Any] | None = None
+            if reporter is not None:
+                reporter("正在计算 PSD/CSD…")
+            for index, pair in enumerate(pairs):
+                aligned, meta = self.align_compare_frames(
+                    parsed_a,
+                    pair["a_col"],
+                    parsed_b,
+                    pair["b_col"],
+                    start_dt,
+                    end_dt,
+                    tolerance_seconds=match_tolerance,
+                    alignment_strategy=alignment_strategy,
+                )
+                value_a = meta["meta_a"]["value_name"]
+                value_b = meta["meta_b"]["value_name"]
+                fs_aligned = estimate_fs_from_timestamp(aligned, "时间戳") or fs_ui
+                freq, values, details = self.compute_cross_spectrum_from_arrays_with_params(
+                    aligned[value_a].to_numpy(dtype=float),
+                    aligned[value_b].to_numpy(dtype=float),
+                    fs_aligned,
+                    requested_nsegment,
+                    overlap_ratio,
+                    spectrum_type=spectrum_type,
+                    insufficient_message="当前数据不足以生成有效协谱图。",
+                )
+                details = dict(details)
+                details.update(core.describe_generic_default_cross_implementation())
+                details["alignment_strategy"] = alignment_strategy
+                details["cross_reference_column"] = pair["a_col"]
+                details["reference_column"] = pair["a_col"]
+                details["target_column"] = pair["b_col"]
+                details["cross_order"] = f"{pair['a_col']} -> {pair['b_col']}"
+                values, mask, details = core.resolve_cross_display_output(
+                    freq,
+                    details,
+                    analysis_context=details.get("analysis_context"),
+                    cross_execution_path=details.get("cross_execution_path"),
+                    spectrum_type=spectrum_type,
+                    insufficient_message="当前数据不足以生成有效协谱图。",
+                )
+                if not np.any(mask):
+                    continue
+                export_frames.append(
+                    self.build_cross_export_frame(
+                        freq,
+                        details,
+                        mask,
+                        prefix=None if len(pairs) == 1 else pair["label"],
+                    )
+                )
+                aligned_frames.append(
+                    aligned[["时间戳", value_a, value_b]].rename(
+                        columns={
+                            value_a: "设备A值" if len(pairs) == 1 else f"{pair['label']}_设备A值",
+                            value_b: "设备B值" if len(pairs) == 1 else f"{pair['label']}_设备B值",
+                        }
+                    )
+                )
+                plot_series.append(
+                    {
+                        "label": pair["label"],
+                        "color": SERIES_COLORS[index % len(SERIES_COLORS)],
+                        "freq": freq[mask],
+                        "values": values[mask],
+                    }
+                )
+                success_count += 1
+                matched_points_total += meta["matched_count"]
+                total_a_points = max(total_a_points, meta["meta_a"]["valid_count"])
+                total_b_points = max(total_b_points, meta["meta_b"]["valid_count"])
+                fs_used_values.append(fs_aligned)
+                last_details = details
+            if success_count == 0:
+                raise ValueError("当前数据不足以生成有效协谱图。")
+            return {
+                **base_payload,
+                "kind": "cross_compare",
+                "plot_series": plot_series,
+                "export_frames": export_frames,
+                "aligned_frames": aligned_frames,
+                "success_count": success_count,
+                "matched_points_total": matched_points_total,
+                "total_a_points": total_a_points,
+                "total_b_points": total_b_points,
+                "fs_used_values": fs_used_values,
+                "last_details": last_details,
+            }
+
+        if reporter is not None:
+            reporter("正在时间对齐…")
+        export_frames: list[pd.DataFrame] = []
+        plot_series: list[dict[str, Any]] = []
+        success_count = 0
+        matched_points_total = 0
+        if reporter is not None:
+            reporter("正在计算结果序列…")
+        for index, pair in enumerate(pairs):
+            aligned, meta = self.align_compare_frames(
+                parsed_a,
+                pair["a_col"],
+                parsed_b,
+                pair["b_col"],
+                start_dt,
+                end_dt,
+                tolerance_seconds=match_tolerance,
+                alignment_strategy=alignment_strategy,
+            )
+            value_a = meta["meta_a"]["value_name"]
+            value_b = meta["meta_b"]["value_name"]
+            if compare_mode == "差值时间序列":
+                transformed = aligned[value_a] - aligned[value_b]
+                prefix = "差值"
+            else:
+                denominator = aligned[value_b].where(np.abs(aligned[value_b]) > 1e-12)
+                transformed = aligned[value_a] / denominator
+                prefix = "比值"
+            transformed = transformed.replace([np.inf, -np.inf], np.nan)
+            valid = np.isfinite(transformed.to_numpy(dtype=float))
+            transformed_frame = pd.DataFrame(
+                {
+                    "时间戳": aligned.loc[valid, "时间戳"],
+                    f"{prefix}_{pair['label']}": transformed.loc[valid],
+                }
+            ).dropna()
+            if len(transformed_frame) < 2:
+                continue
+            plot_series.append(
+                {
+                    "label": pair["label"],
+                    "color": SERIES_COLORS[index % len(SERIES_COLORS)],
+                    "frame": transformed_frame,
+                }
+            )
+            export_frames.append(transformed_frame)
+            success_count += 1
+            matched_points_total += meta["matched_count"]
+        if success_count == 0:
+            raise ValueError(f"{compare_mode}没有得到可用的有效结果。")
+        return {
+            **base_payload,
+            "kind": "transformed",
+            "plot_series": plot_series,
+            "export_frames": export_frames,
+            "success_count": success_count,
+            "matched_points_total": matched_points_total,
+        }
+
+    def on_prepared_dual_plot_ready(self, payload: dict[str, Any]) -> None:
+        kind = str(payload["kind"])
+        self.status_var.set(f"正在生成图：{payload['compare_mode']}")
+        self.root.update_idletasks()
+        if kind == "time_series":
+            self.render_time_series_compare_payload(payload)
+            return
+        if kind == "scatter_single":
+            pair = payload["pair"]
+            self.plot_scatter_consistency_compare(
+                [payload["label_a"], payload["label_b"]],
+                payload["parsed_a"],
+                pair["a_col"],
+                payload["parsed_b"],
+                pair["b_col"],
+                payload["aligned"],
+                payload["meta"],
+            )
+            self.current_aligned_metadata.update(
+                {
+                    "方案名": payload["scheme_name"],
+                    "映射名称": payload["mapping_name"],
+                    "匹配点数": payload["meta"]["matched_count"],
+                    "成功系列数": 1,
+                }
+            )
+            return
+        if kind == "scatter_multi":
+            self.render_scatter_multi_payload(payload)
+            return
+        if kind == "psd_compare":
+            self.render_psd_compare_series(
+                payload["label_a"],
+                payload["label_b"],
+                payload["parsed_a"],
+                payload["parsed_b"],
+                payload["series_results"],
+                mapping_name=payload["mapping_name"],
+                start_dt=payload["start_dt"],
+                end_dt=payload["end_dt"],
+                txt_points=payload["txt_points"],
+                dat_points=payload["dat_points"],
+                fs_a_last=payload["fs_a_last"],
+                fs_b_last=payload["fs_b_last"],
+            )
+            return
+        if kind == "cross_compare":
+            self.render_cross_compare_payload(payload)
+            return
+        if kind == "transformed":
+            self.render_transformed_compare_payload(payload)
+            return
+        raise ValueError(f"未识别的双设备绘图数据类型：{kind}")
+
+    def render_time_series_compare_payload(self, payload: dict[str, Any]) -> None:
+        label_a = payload["label_a"]
+        label_b = payload["label_b"]
+        pair_data = payload["pair_data"]
+        style = payload["plot_style"]
+        layout = payload["plot_layout"]
+        mapping_name = payload["mapping_name"]
+        parsed_a = payload["parsed_a"]
+        parsed_b = payload["parsed_b"]
+        export_frames = payload["export_frames"]
+        plotted_count = int(payload["plotted_count"])
+        total_a_points = int(payload["total_a_points"])
+        total_b_points = int(payload["total_b_points"])
+        start_dt = payload["start_dt"]
+        end_dt = payload["end_dt"]
+
+        self.reset_plot_output_state()
+        if layout == "叠加同图":
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            plotted_a: set[str] = set()
+            for item in pair_data:
+                pair = item["pair"]
+                if pair["a_col"] not in plotted_a:
+                    self.apply_series_style(
+                        ax,
+                        item["series_a"]["时间戳"],
+                        item["series_a"][item["a_name"]],
+                        color=item["color_a"],
+                        label=f"{label_a} - {pair['a_col']}",
+                        style=style,
+                    )
+                    plotted_a.add(pair["a_col"])
+                self.apply_series_style(
+                    ax,
+                    item["series_b"]["时间戳"],
+                    item["series_b"][item["b_name"]],
+                    color=item["color_b"],
+                    label=f"{label_b} - {pair['b_col']}",
+                    style=style,
+                )
+            ax.set_title("时间序列对比")
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Value")
+            ax.grid(True, linestyle="--", alpha=0.3)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc="upper right")
+            self.figure.autofmt_xdate()
+            self.figure.tight_layout()
+            self.refresh_canvas()
+        elif layout in {"上下分图", "左右分图"}:
+            self.figure.clear()
+            axes = self.figure.subplots(2, 1, sharex=True) if layout == "上下分图" else self.figure.subplots(1, 2)
+            ax_a, ax_b = axes[0], axes[1]
+            plotted_a: set[str] = set()
+            for item in pair_data:
+                pair = item["pair"]
+                if pair["a_col"] not in plotted_a:
+                    self.apply_series_style(
+                        ax_a,
+                        item["series_a"]["时间戳"],
+                        item["series_a"][item["a_name"]],
+                        color=item["color_a"],
+                        label=f"{label_a} - {pair['a_col']}",
+                        style=style,
+                    )
+                    plotted_a.add(pair["a_col"])
+                self.apply_series_style(
+                    ax_b,
+                    item["series_b"]["时间戳"],
+                    item["series_b"][item["b_name"]],
+                    color=item["color_b"],
+                    label=f"{label_b} - {pair['b_col']}",
+                    style=style,
+                )
+            ax_a.set_title(f"设备A：{'、'.join(sorted({item['pair']['a_col'] for item in pair_data}))}")
+            ax_b.set_title(f"设备B：{'、'.join(sorted({item['pair']['b_col'] for item in pair_data}))}")
+            for axis in (ax_a, ax_b):
+                axis.set_xlabel("Time")
+                axis.set_ylabel("Value")
+                axis.grid(True, linestyle="--", alpha=0.3)
+                if axis.get_legend_handles_labels()[1]:
+                    axis.legend(loc="upper right")
+            self.figure.autofmt_xdate()
+            self.figure.tight_layout()
+            self.refresh_canvas()
+        else:
+            self.figure.clear()
+            axes = self.figure.subplots(2, 1, sharex=True)
+            ax_a, ax_b = axes[0], axes[1]
+            plotted_a: set[str] = set()
+            for item in pair_data:
+                pair = item["pair"]
+                if pair["a_col"] in plotted_a:
+                    continue
+                self.apply_series_style(
+                    ax_a,
+                    item["series_a"]["时间戳"],
+                    item["series_a"][item["a_name"]],
+                    color=item["color_a"],
+                    label=f"{label_a} - {pair['a_col']}",
+                    style=style,
+                )
+                plotted_a.add(pair["a_col"])
+            for item in pair_data:
+                pair = item["pair"]
+                self.apply_series_style(
+                    ax_b,
+                    item["series_b"]["时间戳"],
+                    item["series_b"][item["b_name"]],
+                    color=item["color_b"],
+                    label=f"{label_b} - {pair['b_col']}",
+                    style=style,
+                )
+            ax_a.set_title(f"设备A：{'、'.join(sorted({item['pair']['a_col'] for item in pair_data}))}")
+            ax_b.set_title(f"设备B：{'、'.join(sorted({item['pair']['b_col'] for item in pair_data}))}")
+            for axis in (ax_a, ax_b):
+                axis.set_xlabel("Time")
+                axis.set_ylabel("Value")
+                axis.grid(True, linestyle="--", alpha=0.3)
+                if axis.get_legend_handles_labels()[1]:
+                    axis.legend(loc="upper right")
+            self.figure.autofmt_xdate()
+            self.figure.tight_layout()
+            self.refresh_canvas(title="图形结果：主页面总览图")
+
+            if self.use_separate_zoom_windows_var.get():
+                entries: list[dict[str, Any]] = []
+                fig_a = Figure(figsize=(6, 4), dpi=100)
+                ax_a = fig_a.add_subplot(111)
+                plotted_a = set()
+                for item in pair_data:
+                    pair = item["pair"]
+                    if pair["a_col"] in plotted_a:
+                        continue
+                    self.apply_series_style(
+                        ax_a,
+                        item["series_a"]["时间戳"],
+                        item["series_a"][item["a_name"]],
+                        color=item["color_a"],
+                        label=f"{label_a} - {pair['a_col']}",
+                        style=style,
+                    )
+                    plotted_a.add(pair["a_col"])
+                ax_a.set_title(f"设备A：{'、'.join(sorted({item['pair']['a_col'] for item in pair_data}))}")
+                ax_a.set_xlabel("Time")
+                ax_a.set_ylabel("Value")
+                ax_a.grid(True, linestyle="--", alpha=0.3)
+                if ax_a.get_legend_handles_labels()[1]:
+                    ax_a.legend(loc="upper right")
+                fig_a.autofmt_xdate()
+                fig_a.tight_layout()
+                entries.append(
+                    {
+                        "figure": fig_a,
+                        "title": "设备A - 时间序列对比",
+                        "filename": f"deviceA_{sanitize_filename(pair_data[0]['pair']['a_col'])}_{self.get_plot_style_tag(style)}.png",
+                    }
+                )
+                fig_b = Figure(figsize=(6, 4), dpi=100)
+                ax_b = fig_b.add_subplot(111)
+                for item in pair_data:
+                    pair = item["pair"]
+                    self.apply_series_style(
+                        ax_b,
+                        item["series_b"]["时间戳"],
+                        item["series_b"][item["b_name"]],
+                        color=item["color_b"],
+                        label=f"{label_b} - {pair['b_col']}",
+                        style=style,
+                    )
+                ax_b.set_title(f"设备B：{'、'.join(sorted({item['pair']['b_col'] for item in pair_data}))}")
+                ax_b.set_xlabel("Time")
+                ax_b.set_ylabel("Value")
+                ax_b.grid(True, linestyle="--", alpha=0.3)
+                if ax_b.get_legend_handles_labels()[1]:
+                    ax_b.legend(loc="upper right")
+                fig_b.autofmt_xdate()
+                fig_b.tight_layout()
+                entries.append(
+                    {
+                        "figure": fig_b,
+                        "title": "设备B - 时间序列对比",
+                        "filename": f"deviceB_{sanitize_filename(pair_data[0]['pair']['b_col'])}_{self.get_plot_style_tag(style)}.png",
+                    }
+                )
+                self.show_separate_plot_windows(entries)
+
+        self.current_plot_kind = "aligned_time_series"
+        self.current_plot_columns = [pair["pair"]["label"] for pair in pair_data]
+        self.current_result_frame = None
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = list(export_frames)
+        self.current_compare_files = [label_a, label_b]
+        self.register_plot_style_layout(style, layout)
+        self.current_aligned_metadata = {
+            "方案名": payload["scheme_name"],
+            "映射名称": mapping_name,
+            "对齐策略": "原始时间轴叠加",
+            "时间范围": f"{start_dt or '自动'} ~ {end_dt or '自动'}",
+            "匹配点数": "",
+            "成功系列数": plotted_count,
+            "出图样式": style,
+            "出图布局": layout,
+        }
+        self.update_diagnostic_info(
+            layout=f"{parsed_a.profile_name} / {parsed_b.profile_name}",
+            analysis_label="；".join(item["pair"]["label"] for item in pair_data),
+            extra_items=[
+                f"当前要素映射={mapping_name}",
+                f"实际命中设备A列={'、'.join(sorted({item['pair']['a_col'] for item in pair_data}))}",
+                f"实际命中设备B列={'、'.join(sorted({item['pair']['b_col'] for item in pair_data}))}",
+                "对齐策略=原始时间轴叠加",
+                f"出图样式={style}",
+                f"出图布局={layout}",
+                f"时间范围={start_dt or '自动'} ~ {end_dt or '自动'}",
+                f"txt 合并后点数={total_a_points}",
+                f"dat 裁切后点数={total_b_points}",
+                f"成功系列数={plotted_count}",
+            ] + self.build_timestamp_quality_items(parsed_a, parsed_b),
+        )
+        status = f"图已生成：时间序列对比 / {mapping_name} / 成功系列数={plotted_count}"
+        if layout == "分别生成两张图":
+            if self.separate_plot_windows:
+                status += f" | 已生成独立图窗口：{len(self.separate_plot_windows)} 个"
+            else:
+                status += " | 主页面保留总览，未弹出独立窗口"
+        self.status_var.set(status)
+
+    def render_transformed_compare_payload(self, payload: dict[str, Any]) -> None:
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        for item in payload["plot_series"]:
+            self.apply_series_style(
+                ax,
+                item["frame"]["时间戳"],
+                item["frame"].iloc[:, 1],
+                color=item["color"],
+                label=item["label"],
+                style=payload["plot_style"],
+            )
+        ax.set_title(payload["compare_mode"])
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Value")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(loc="upper right")
+        self.figure.autofmt_xdate()
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = "aligned_diff" if payload["compare_mode"] == "差值时间序列" else "aligned_ratio"
+        self.current_plot_columns = [pair["label"] for pair in payload["pairs"]]
+        self.current_result_frame = None
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = list(payload["export_frames"])
+        self.current_compare_files = [payload["label_a"], payload["label_b"]]
+        self.register_plot_style_layout(payload["plot_style"], payload["plot_layout"])
+        quality_warnings: list[str] = []
+        if payload["matched_points_total"] < 20:
+            quality_warnings.append("匹配点数偏少，散点一致性结果可能不稳定。")
+        self.current_aligned_metadata = {
+            "方案名": payload["scheme_name"],
+            "映射名称": payload["mapping_name"],
+            "对齐策略": payload["alignment_strategy"],
+            "时间范围": f"{payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+            "匹配点数": payload["matched_points_total"],
+            "成功系列数": payload["success_count"],
+            "出图样式": payload["plot_style"],
+            "出图布局": payload["plot_layout"],
+        }
+        self.update_diagnostic_info(
+            layout=f"{payload['parsed_a'].profile_name} / {payload['parsed_b'].profile_name}",
+            analysis_label=payload["compare_mode"],
+            extra_items=[
+                f"当前要素映射={payload['mapping_name']}",
+                f"实际命中设备A列={'、'.join(sorted({pair['a_col'] for pair in payload['pairs']}))}",
+                f"实际命中设备B列={'、'.join(sorted({pair['b_col'] for pair in payload['pairs']}))}",
+                f"对齐策略={payload['alignment_strategy']}",
+                f"出图样式={payload['plot_style']}",
+                f"出图布局={payload['plot_layout']}",
+                f"时间范围={payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+                f"匹配点数={payload['matched_points_total']}",
+                f"成功系列数={payload['success_count']}",
+            ] + self.build_timestamp_quality_items(payload["parsed_a"], payload["parsed_b"]) + quality_warnings,
+        )
+        self.status_var.set(f"图已生成：{payload['compare_mode']} / {payload['mapping_name']} / 成功系列数={payload['success_count']}")
+
+    def render_scatter_multi_payload(self, payload: dict[str, Any]) -> None:
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        for item in payload["series_items"]:
+            self.apply_series_style(ax, item["x"], item["y"], color=item["color"], label=item["pair"]["label"], style=payload["plot_style"])
+        ax.set_title("散点一致性对比")
+        ax.set_xlabel(payload["label_a"])
+        ax.set_ylabel(payload["label_b"])
+        ax.grid(True, linestyle="--", alpha=0.3)
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(loc="upper right")
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = "aligned_scatter"
+        self.current_plot_columns = [pair["label"] for pair in payload["pairs"]]
+        self.current_result_frame = None
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = list(payload["export_frames"])
+        self.current_compare_files = [payload["label_a"], payload["label_b"]]
+        self.register_plot_style_layout(payload["plot_style"], payload["plot_layout"])
+        self.current_aligned_metadata = {
+            "方案名": payload["scheme_name"],
+            "映射名称": payload["mapping_name"],
+            "对齐策略": payload["alignment_strategy"],
+            "时间范围": f"{payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+            "匹配点数": payload["matched_points_total"],
+            "成功系列数": payload["success_count"],
+            "出图样式": payload["plot_style"],
+            "出图布局": payload["plot_layout"],
+        }
+        self.update_diagnostic_info(
+            layout=f"{payload['parsed_a'].profile_name} / {payload['parsed_b'].profile_name}",
+            analysis_label="；".join(pair["label"] for pair in payload["pairs"]),
+            extra_items=[
+                f"当前要素映射={payload['mapping_name']}",
+                f"实际命中设备A列={'、'.join(sorted({pair['a_col'] for pair in payload['pairs']}))}",
+                f"实际命中设备B列={'、'.join(sorted({pair['b_col'] for pair in payload['pairs']}))}",
+                f"对齐策略={payload['alignment_strategy']}",
+                f"出图样式={payload['plot_style']}",
+                f"出图布局={payload['plot_layout']}",
+                f"时间范围={payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+                f"匹配点数={payload['matched_points_total']}",
+                f"成功系列数={payload['success_count']}",
+            ] + self.build_timestamp_quality_items(payload["parsed_a"], payload["parsed_b"]),
+        )
+        self.status_var.set(f"图已生成：散点一致性对比 / {payload['mapping_name']} / 成功系列数={payload['success_count']}")
+
+    def render_cross_compare_payload(self, payload: dict[str, Any]) -> None:
+        display_meta = self.get_cross_spectrum_display_meta(payload["spectrum_type"])
+        target_context = core.get_target_spectral_context(payload.get("target_spectral_context") or payload.get("selection_meta"))
+        last_details = payload["last_details"]
+        display_semantics = str(last_details.get("display_semantics") or "")
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        for item in payload["plot_series"]:
+            self.apply_series_style(
+                ax,
+                item["freq"],
+                item["values"],
+                color=item["color"],
+                label=item["label"],
+                style=payload["plot_style"],
+            )
+        ax.set_xscale("log")
+        if display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or payload["spectrum_type"] == CROSS_SPECTRUM_MAGNITUDE:
+            ax.set_yscale("log")
+            all_freq = np.concatenate([item["freq"] for item in payload["plot_series"]])
+            all_values = np.concatenate([item["values"] for item in payload["plot_series"]])
+        else:
+            all_values = np.concatenate([item["values"] for item in payload["plot_series"]])
+            max_abs = float(np.nanmax(np.abs(all_values))) if all_values.size else 0.0
+            linthresh = max(max_abs * 1e-3, 1e-12)
+            ax.set_yscale("symlog", linthresh=linthresh)
+            ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1.0, alpha=0.8)
+        all_freq = np.concatenate([item["freq"] for item in payload["plot_series"]])
+        all_values = np.concatenate([item["values"] for item in payload["plot_series"]])
+        if all_freq.size and all_values.size:
+            self.add_selected_reference_slopes(
+                ax,
+                all_freq,
+                all_values,
+                is_psd=False,
+                spectrum_type=payload["spectrum_type"],
+            )
+        if target_context is not None:
+            title = f"{display_meta['title_prefix']}：{target_context['reference_column']} vs {target_context['display_target_label']}"
+        else:
+            title = (
+                f"{display_meta['title_prefix']}：{payload['pairs'][0]['a_col']} vs {payload['pairs'][0]['b_col']}"
+                if len(payload["pairs"]) == 1
+                else f"{display_meta['title_prefix']}对比"
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(display_meta["ylabel"])
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(loc="upper right")
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = display_meta["plot_kind"]
+        if target_context is not None:
+            self.current_plot_columns = [str(target_context["reference_column"]), str(target_context["display_target_label"])]
+        else:
+            self.current_plot_columns = [pair["label"] for pair in payload["pairs"]]
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_result_frame = self.merge_frequency_frames(payload["export_frames"])
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = list(payload["aligned_frames"])
+        self.current_compare_files = [payload["label_a"], payload["label_b"]]
+        self.register_plot_style_layout(payload["plot_style"], payload["plot_layout"])
+        fs_text = ",".join(f"{value:g}" for value in sorted({round(value, 6) for value in payload["fs_used_values"]}))
+        valid_freq_points = int(sum(len(item["freq"]) for item in payload["plot_series"]))
+        quality_warnings: list[str] = []
+        if valid_freq_points < 10:
+            quality_warnings.append("有效频点偏少，请检查时间范围、对齐结果或频谱参数。")
+        if payload["matched_points_total"] < 20:
+            quality_warnings.append("匹配点数偏少，当前双设备频域结果可能不稳定。")
+        if display_semantics != core.CROSS_DISPLAY_SEMANTICS_ABS:
+            all_values = np.concatenate([item["values"] for item in payload["plot_series"]]) if payload["plot_series"] else np.array([])
+            if all_values.size:
+                near_zero_ratio = float(np.mean(np.abs(all_values) <= 1e-12))
+                if near_zero_ratio >= 0.8:
+                    quality_warnings.append("协谱/正交谱大部分点接近 0，请确认列映射和时间范围。")
+        self.current_aligned_metadata = {
+            "方案名": payload["scheme_name"],
+            "映射名称": payload["mapping_name"],
+            "谱类型": payload["spectrum_type"],
+            "对齐策略": payload["alignment_strategy"],
+            "时间范围": f"{payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+            "匹配点数": payload["matched_points_total"],
+            "成功系列数": payload["success_count"],
+            "出图样式": payload["plot_style"],
+            "出图布局": payload["plot_layout"],
+            "FS": fs_text,
+            "display_semantics": display_semantics or None,
+        }
+        if target_context is not None:
+            self.current_aligned_metadata.update(
+                {
+                    "reference_column": str(target_context["reference_column"]),
+                    "ygas_target_column": str(target_context.get("ygas_target_column") or target_context.get("target_column") or ""),
+                    "dat_target_column": str(target_context.get("dat_target_column") or ""),
+                    "canonical_cross_pairs": " | ".join(str(item) for item in (target_context.get("canonical_cross_pairs") or [])),
+                    "generated_cross_series_count": int(payload.get("success_count", len(payload["plot_series"]))),
+                    "generated_cross_series_roles": " | ".join(
+                        sorted(
+                            {
+                                str(item.get("series_role"))
+                                for item in payload["plot_series"]
+                                if str(item.get("series_role") or "").strip()
+                            }
+                        )
+                    ),
+                }
+            )
+        if target_context is not None:
+            actual_hit_items = [
+                f"reference_column={target_context['reference_column']}",
+                f"ygas_target_column={target_context.get('ygas_target_column')}",
+                f"dat_target_column={target_context.get('dat_target_column')}",
+                f"canonical_cross_pairs={' | '.join(str(item) for item in (target_context.get('canonical_cross_pairs') or []))}",
+            ]
+        else:
+            actual_hit_items = [
+                f"实际命中设备A列={'、'.join(sorted({pair['a_col'] for pair in payload['pairs']}))}",
+                f"实际命中设备B列={'、'.join(sorted({pair['b_col'] for pair in payload['pairs']}))}",
+            ]
+        extra_items = [
+            f"当前要素映射={payload['mapping_name']}",
+            f"对齐策略={payload['alignment_strategy']}",
+            f"谱类型={payload['spectrum_type']}",
+            f"出图样式={payload['plot_style']}",
+            f"出图布局={payload['plot_layout']}",
+            f"时间范围={payload['start_dt'] or '自动'} ~ {payload['end_dt'] or '自动'}",
+            f"匹配点数={payload['matched_points_total']}",
+            f"有效频点数={valid_freq_points}",
+            f"txt 合并后点数={payload['total_a_points']}",
+            f"dat 裁切后点数={payload['total_b_points']}",
+            f"成功系列数={payload['success_count']}",
+        ] + actual_hit_items + self.build_timestamp_quality_items(payload["parsed_a"], payload["parsed_b"]) + quality_warnings
+        if target_context is not None:
+            extra_items.extend(
+                [
+                    f"cross_execution_path={last_details.get('cross_execution_path') if payload.get('last_details') else 'target_spectral_canonical'}",
+                    f"cross_implementation_id={last_details.get('cross_implementation_id') if payload.get('last_details') else core.TARGET_COSPECTRUM_IMPLEMENTATION_ID}",
+                    f"cross_implementation_label={last_details.get('cross_implementation_label') if payload.get('last_details') else core.resolve_target_cospectrum_implementation().get('implementation_label')}",
+                    f"cross_reference_column={last_details.get('cross_reference_column', target_context['reference_column']) if payload.get('last_details') else target_context['reference_column']}",
+                    f"alignment_strategy={last_details.get('alignment_strategy', payload['alignment_strategy']) if payload.get('last_details') else payload['alignment_strategy']}",
+                    f"reference_column={target_context['reference_column']}",
+                    f"ygas_target_column={target_context.get('ygas_target_column')}",
+                    f"dat_target_column={target_context.get('dat_target_column')}",
+                    f"canonical_cross_pairs={' | '.join(str(item) for item in (target_context.get('canonical_cross_pairs') or []))}",
+                    f"generated_cross_series_count={payload.get('success_count', len(payload['plot_series']))}",
+                    "generated_cross_series_roles="
+                    + " | ".join(
+                        sorted(
+                            {
+                                str(item.get("series_role"))
+                                for item in payload["plot_series"]
+                                if str(item.get("series_role") or "").strip()
+                            }
+                        )
+                    ),
+                    f"display_semantics={last_details.get('display_semantics')}",
+                    f"display_value_source={last_details.get('display_value_source')}",
+                ]
+            )
+        if payload["spectrum_type"] in CROSS_SPECTRUM_OPTIONS and last_details is not None:
+            for key in (
+                "cross_execution_path",
+                "cross_implementation_id",
+                "cross_implementation_label",
+                "alignment_strategy",
+                "cross_reference_column",
+                "target_column",
+                "cross_order",
+                "series_role",
+                "device_kind",
+                "display_label",
+                "display_semantics",
+                "display_value_source",
+            ):
+                if last_details.get(key) is not None:
+                    extra_items.append(f"{key}={last_details[key]}")
+            for key in ("cross_kernel", "window", "detrend", "scaling", "return_onesided", "average"):
+                if last_details.get(key) is not None:
+                    extra_items.append(f"{key}={last_details[key]}")
+        if last_details is not None:
+            self.update_diagnostic_info(
+                layout=f"{payload['parsed_a'].profile_name} / {payload['parsed_b'].profile_name}",
+                analysis_label=title.replace(f"{display_meta['title_prefix']}：", "", 1),
+                fs=payload["fs_used_values"][-1] if payload["fs_used_values"] else None,
+                nsegment=int(last_details["nsegment"]),
+                overlap_ratio=float(last_details["overlap_ratio"]),
+                nperseg=int(last_details["nperseg"]),
+                noverlap=int(last_details["noverlap"]),
+                extra_items=extra_items,
+            )
+        else:
+            self.update_diagnostic_info(
+                layout=f"{payload['parsed_a'].profile_name} / {payload['parsed_b'].profile_name}",
+                analysis_label=title.replace(f"{display_meta['title_prefix']}：", "", 1),
+                extra_items=extra_items,
+            )
+        self.status_var.set(f"图已生成：{display_meta['title_prefix']} / {payload['mapping_name']} / 成功系列数={payload['success_count']}")
+
+    def use_current_file_time_range(self) -> None:
+        if self.current_file is None:
+            messagebox.showwarning("提示", "请先选择一个文件。")
+            return
+
+        try:
+            parsed = self.parse_profiled_file(self.current_file)
+        except Exception as exc:
+            self.render_plot_message(f"当前文件解析失败：{exc}", level="warning")
+            self.status_var.set(f"时间范围提取失败：{exc}")
+            return
+
+        if parsed.timestamp_col is None or parsed.timestamp_col not in parsed.dataframe.columns:
+            self.render_plot_message("未识别到时间列，无法填写时间范围。", level="warning")
+            self.status_var.set("当前文件未识别到时间列")
+            return
+
+        timestamps = parse_mixed_timestamp_series(parsed.dataframe[parsed.timestamp_col]).dropna()
+        if timestamps.empty:
+            self.render_plot_message("当前文件时间列为空，无法填写时间范围。", level="warning")
+            self.status_var.set("当前文件时间列为空")
+            return
+
+        self.time_start_var.set(timestamps.min().strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_end_var.set(timestamps.max().strftime("%Y-%m-%d %H:%M:%S"))
+        self.status_var.set("已填入当前文件的时间范围")
+
+    def use_selected_dat_time_range(self) -> None:
+        try:
+            _parsed_a, _label_a, parsed_b, _label_b, meta = self.build_compare_selection()
+        except Exception as exc:
+            self.render_plot_message(f"无法提取 dat 时间范围：{exc}", level="warning")
+            self.status_var.set(f"dat 时间范围提取失败：{exc}")
+            return
+
+        dat_summary = meta["dat_summary"]
+        self.time_start_var.set(dat_summary["start"].strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_end_var.set(dat_summary["end"].strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_range_strategy_var.set("使用 dat 时间范围")
+        self.status_var.set("已填入 dat 文件时间范围")
+
+    def use_common_selected_time_range(self) -> None:
+        try:
+            _parsed_a, _label_a, _parsed_b, _label_b, meta = self.build_compare_selection()
+            common_start = max(meta["txt_summary"]["start"], meta["dat_summary"]["start"])
+            common_end = min(meta["txt_summary"]["end"], meta["dat_summary"]["end"])
+        except Exception as exc:
+            self.render_plot_message(f"共同时间范围计算失败：{exc}", level="warning")
+            self.status_var.set(f"共同时间范围计算失败：{exc}")
+            return
+
+        if common_start > common_end:
+            self.render_plot_message(
+                self.build_no_common_time_range_message(meta["txt_summary"], meta["dat_summary"]),
+                level="warning",
+            )
+            self.status_var.set("txt 与 dat 没有共同时间范围")
+            return
+
+        self.time_start_var.set(common_start.strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_end_var.set(common_end.strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        self.status_var.set("已填入 txt 与 dat 的共同时间范围")
+
+    def auto_fill_txt_covering_dat_range(self) -> None:
+        selected_files = self.get_selected_file_paths()
+        if not selected_files:
+            messagebox.showwarning("提示", "请先选择一个 dat 文件。")
+            return
+
+        dat_candidates = [path for path in selected_files if path.suffix.lower() == ".dat"]
+        dat_path = dat_candidates[0] if dat_candidates else None
+        if dat_path is None and self.current_file is not None and self.current_file.suffix.lower() == ".dat":
+            dat_path = self.current_file
+        if dat_path is None:
+            messagebox.showwarning("提示", "请先在文件列表中选择一个 dat 文件。")
+            return
+
+        try:
+            parsed_dat = self.parse_dat_file(dat_path)
+            dat_start, dat_end, _count = self.get_parsed_time_bounds(parsed_dat)
+        except Exception as exc:
+            self.render_plot_message(f"dat 文件解析失败：{exc}", level="warning")
+            self.status_var.set(f"dat 文件解析失败：{exc}")
+            return
+
+        matched_paths: list[Path] = []
+        parsed_ranges: list[tuple[Path, pd.Timestamp, pd.Timestamp]] = []
+        for path in self.file_paths:
+            if path.suffix.lower() not in {".txt", ".log"}:
+                continue
+            try:
+                parsed = self.parse_ygas_mode1_file(path)
+                txt_start, txt_end, _txt_count = self.get_parsed_time_bounds(parsed)
+            except Exception:
+                continue
+            parsed_ranges.append((path, txt_start, txt_end))
+            if txt_end >= dat_start and txt_start <= dat_end:
+                matched_paths.append(path)
+
+        overall_start = min((start for _path, start, _end in parsed_ranges), default=None)
+        overall_end = max((end for _path, _start, end in parsed_ranges), default=None)
+        coverage_start = min((start for path, start, _end in parsed_ranges if path in matched_paths), default=None)
+        coverage_end = max((end for path, _start, end in parsed_ranges if path in matched_paths), default=None)
+        missing_before = max((dat_start - coverage_start).total_seconds() / 60.0, 0.0) if coverage_start is not None else None
+        missing_after = max((dat_end - coverage_end).total_seconds() / 60.0, 0.0) if coverage_end is not None else None
+
+        if not matched_paths:
+            coverage_text = " | ".join(
+                [
+                    f"已找到 txt/log：0 个",
+                    f"可解析 txt/log：{len(parsed_ranges)} 个",
+                    f"整体覆盖开始：{overall_start if overall_start is not None else '无'}",
+                    f"整体覆盖结束：{overall_end if overall_end is not None else '无'}",
+                ]
+            )
+            self.txt_merge_summary_var.set(f"txt 合并摘要：{coverage_text}")
+            self.render_plot_message("没有找到可覆盖当前 dat 时间段的 txt/log 文件。", level="warning")
+            self.status_var.set("自动补齐失败：未找到重叠 txt/log")
+            return
+
+        self.file_listbox.selection_clear(0, tk.END)
+        selected_target_paths = [dat_path, *matched_paths]
+        for index, path in enumerate(self.file_paths):
+            if path in selected_target_paths:
+                self.file_listbox.selection_set(index)
+                if path == dat_path:
+                    self.file_listbox.activate(index)
+                    self.file_listbox.see(index)
+        self.refresh_compare_column_options()
+        self.use_common_selected_time_range()
+        coverage_status = (
+            f"txt 合并摘要：文件数={len(matched_paths)} | 覆盖开始={coverage_start} | 覆盖结束={coverage_end} | "
+            f"距 dat 开始还差={missing_before:.1f} 分钟 | 距 dat 结束还差={missing_after:.1f} 分钟"
+            if coverage_start is not None and coverage_end is not None and missing_before is not None and missing_after is not None
+            else f"txt 合并摘要：文件数={len(matched_paths)}"
+        )
+        self.txt_merge_summary_var.set(coverage_status)
+        status = f"已自动补齐 {len(matched_paths)} 个 txt/log 文件"
+        if (missing_before or 0.0) > 0 or (missing_after or 0.0) > 0:
+            status += f" | 仍未完整覆盖 dat：前差 {missing_before:.1f} 分钟，后差 {missing_after:.1f} 分钟"
+        else:
+            status += " | 已覆盖当前 dat 时间段"
+        self.status_var.set(status)
+
+    def describe_layout(self, mode1_layout: dict[str, Any] | None) -> str:
+        if mode1_layout and mode1_layout.get("matched"):
+            variant = str(mode1_layout.get("variant", ""))
+            if variant == "mode1-15":
+                return "MODE1-15"
+            if variant == "mode1-16-with-index":
+                return "MODE1-16"
+        return "普通表格"
+
+    def update_diagnostic_info(
+        self,
+        *,
+        layout: str | None = None,
+        analysis_label: str | None = None,
+        valid_points: int | None = None,
+        fs: float | None = None,
+        nsegment: int | None = None,
+        overlap_ratio: float | None = None,
+        nperseg: int | None = None,
+        noverlap: int | None = None,
+        batch_success: int | None = None,
+        batch_skips: int | None = None,
+        extra_items: list[str] | None = None,
+    ) -> None:
+        items: list[str] = []
+        if self.current_data_source_label:
+            items.append(f"当前数据源={self.current_data_source_label}")
+        comparison_frame = self.current_comparison_frame
+        if self.current_data_source_kind == "comparison_analysis" and self.raw_data is not None:
+            items.append("当前分析表=对比汇总表")
+            items.append(f"行数={len(self.raw_data)}")
+            items.append(f"列数={len(self.raw_data.columns)}")
+            if self.current_comparison_metadata.get("alignment_strategy"):
+                items.append(f"对齐策略={self.current_comparison_metadata['alignment_strategy']}")
+            if self.current_comparison_metadata.get("time_range_label"):
+                items.append(f"时间范围={self.current_comparison_metadata['time_range_label']}")
+        elif self.current_data_source_kind == "comparison_preview" and comparison_frame is not None:
+            items.append("当前预览表=对比汇总表")
+            items.append(f"行数={len(comparison_frame)}")
+            items.append(f"列数={len(comparison_frame.columns)}")
+            if self.current_comparison_metadata.get("alignment_strategy"):
+                items.append(f"对齐策略={self.current_comparison_metadata['alignment_strategy']}")
+            if self.current_comparison_metadata.get("time_range_label"):
+                items.append(f"时间范围={self.current_comparison_metadata['time_range_label']}")
+        target_context = self.get_current_target_spectral_context()
+        if target_context is not None:
+            items.append(f"reference_column={target_context['reference_column']}")
+            items.append(f"ygas_target_column={target_context.get('ygas_target_column', target_context.get('target_column'))}")
+            items.append(f"dat_target_column={target_context.get('dat_target_column')}")
+            if target_context.get("canonical_cross_pairs"):
+                items.append(
+                    "canonical_cross_pairs="
+                    + " | ".join(str(item) for item in (target_context.get("canonical_cross_pairs") or []))
+                )
+        items.append(f"已识别布局：{layout or self.current_layout_label}")
+        if analysis_label:
+            items.append(f"当前分析列：{analysis_label}")
+        if valid_points is not None:
+            items.append(f"有效点数：{valid_points}")
+        if fs is not None:
+            items.append(f"FS={fs:g}")
+        if nsegment is not None:
+            items.append(f"NSEGMENT={nsegment}")
+        if overlap_ratio is not None:
+            items.append(f"OVERLAP_RATIO={overlap_ratio:g}")
+        if nperseg is not None:
+            items.append(f"nperseg={nperseg}")
+        if noverlap is not None:
+            items.append(f"noverlap={noverlap}")
+        if batch_success is not None:
+            items.append(f"成功系列数={batch_success}")
+        if batch_skips is not None:
+            items.append(f"跳过文件数={batch_skips}")
+        if self.current_plot_layout_label:
+            items.append(f"当前主图模式={self.current_plot_layout_label}")
+        if self.current_plot_layout_label == "分别生成两张图":
+            items.append(f"已弹出独立窗口={'是' if bool(self.separate_plot_windows) else '否'}")
+        if self.separate_plot_windows:
+            items.append(f"独立图窗口数={len(self.separate_plot_windows)}")
+        if extra_items:
+            items.extend(extra_items)
+        self.diagnostic_var.set(" | ".join(items))
+
+    def render_plot_message(self, message: str, level: str = "info") -> None:
+        color_map = {
+            "info": "#4f5d75",
+            "warning": "#c77d00",
+            "error": "#c1121f",
+        }
+        text_color = color_map.get(level, "#4f5d75")
+
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.55,
+            message,
+            ha="center",
+            va="center",
+            fontsize=16,
+            color=text_color,
+            wrap=True,
+            transform=ax.transAxes,
+        )
+        self.figure.tight_layout()
+        self.refresh_canvas(title="图形结果")
+
+        self.current_plot_kind = None
+        self.current_plot_columns = []
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_result_frame = None
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = []
+        self.current_aligned_metadata = {}
+        self.current_target_plot_metadata = {}
+        self.current_compare_files = []
+
+    def resolve_delimiter(self, delimiter_choice: str, custom_delimiter: str) -> str:
+        delim_map = {
+            "逗号 (,)": ",",
+            "制表符": "\t",
+            "空格": r"\s+",
+            "分号 (;)": ";",
+            "自定义": custom_delimiter or ",",
+        }
+        return delim_map.get(delimiter_choice, ",")
+
+    def preview_suggests_no_header(self, preview: pd.DataFrame) -> bool:
+        if preview.empty:
+            return False
+
+        values = [str(value).strip() for value in preview.iloc[0].tolist() if pd.notna(value) and str(value).strip()]
+        if not values:
+            return False
+
+        data_like = sum(self.looks_like_number(value) or self.looks_like_timestamp(value) for value in values)
+        header_like = sum(self.looks_like_header_name(value) for value in values)
+        return data_like >= max(1, math.ceil(len(values) * 0.6)) and data_like > header_like
+
+    def infer_read_settings(self, path: Path) -> dict[str, str | bool]:
+        inferred: dict[str, str | bool] = {
+            "delimiter": "逗号 (,)",
+            "custom_delimiter": "",
+            "start_row": "0",
+            "header_row": "0",
+            "no_header": False,
+        }
+
+        try:
+            detected_profile = detect_file_profile(path, read_preview_lines(path))
+            if detected_profile == "TOA5_DAT":
+                return inferred
+            preview = pd.read_csv(
+                path,
+                sep=",",
+                skiprows=0,
+                header=None,
+                engine="python",
+                on_bad_lines="skip",
+                dtype=str,
+                nrows=8,
+            )
+        except Exception:
+            if path.suffix.lower() == ".txt":
+                inferred["no_header"] = True
+            return inferred
+
+        if path.suffix.lower() == ".txt":
+            inferred["no_header"] = True
+            return inferred
+
+        if path.suffix.lower() in TEXT_LIKE_SUFFIXES:
+            mode1_layout = detect_mode1_layout(preview)
+            if mode1_layout.get("matched") or self.preview_suggests_no_header(preview):
+                inferred["no_header"] = True
+
+        return inferred
+
+    def should_use_profile_parser_for_display(self, path: Path) -> str | None:
+        detected_profile = detect_file_profile(path, read_preview_lines(path))
+        if detected_profile in {"YGAS_MODE1_15", "YGAS_MODE1_16", "TOA5_DAT"}:
+            return detected_profile
+        return None
+
+    def build_loader_result_from_parsed(self, parsed: ParsedFileResult) -> LoaderResult:
+        excluded_columns = self.get_profile_excluded_columns(parsed.profile_name, parsed.dataframe, parsed.timestamp_col)
+        mode1_layout: dict[str, Any] | None = None
+        if parsed.profile_name.startswith("YGAS_MODE1"):
+            variant = "mode1-16-with-index" if parsed.profile_name == "YGAS_MODE1_16" else "mode1-15"
+            mode1_layout = {
+                "matched": True,
+                "variant": variant,
+                "display_columns": list(parsed.dataframe.columns),
+                "excluded_cols": set(excluded_columns),
+            }
+        return LoaderResult(
+            dataframe=parsed.dataframe.copy(),
+            columns=list(parsed.dataframe.columns),
+            available_columns=list(parsed.available_columns),
+            suggested_columns=list(parsed.suggested_columns),
+            used_mode1_template=parsed.profile_name.startswith("YGAS_MODE1"),
+            mode1_layout=mode1_layout,
+            profile_name=parsed.profile_name,
+            excluded_columns=excluded_columns,
+        )
+
+    def get_read_settings_for_file(self, path: Path) -> dict[str, str | bool]:
+        saved = self.saved_read_settings.get(str(path))
+        if saved is not None:
+            return {
+                "delimiter": str(saved.get("delimiter", "逗号 (,)")),
+                "custom_delimiter": str(saved.get("custom_delimiter", "")),
+                "start_row": str(saved.get("start_row", "0")),
+                "header_row": str(saved.get("header_row", "0")),
+                "no_header": bool(saved.get("no_header", False)),
+            }
+        return self.infer_read_settings(path)
+
+    def get_supported_files(self, folder: Path) -> list[Path]:
+        return sorted(
+            [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED_SUFFIXES],
+            key=lambda path: path.name.lower(),
+        )
+
+    def populate_file_list(self, files: list[Path]) -> None:
+        self.file_paths = files
+        self.file_listbox.delete(0, tk.END)
+        for path in files:
+            self.file_listbox.insert(tk.END, path.name)
+
+    def select_file_in_list(self, path: Path) -> bool:
+        try:
+            index = self.file_paths.index(path)
+        except ValueError:
+            return False
+
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(index)
+        self.file_listbox.activate(index)
+        self.file_listbox.see(index)
+        return True
+
+    def select_paths_in_list(self, paths: list[Path], *, active_path: Path | None = None) -> bool:
+        selected = {path.resolve() for path in paths}
+        self.file_listbox.selection_clear(0, tk.END)
+        active_index: int | None = None
+        first_index: int | None = None
+
+        for index, path in enumerate(self.file_paths):
+            if path.resolve() not in selected:
+                continue
+            self.file_listbox.selection_set(index)
+            if first_index is None:
+                first_index = index
+            if active_path is not None and path == active_path:
+                active_index = index
+
+        target_index = active_index if active_index is not None else first_index
+        if target_index is None:
+            return False
+
+        self.file_listbox.activate(target_index)
+        self.file_listbox.see(target_index)
+        return True
+
+    def build_summary_from_range_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        file_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not entries:
+            return None
+        return {
+            "start": min(pd.Timestamp(entry["start"]) for entry in entries),
+            "end": max(pd.Timestamp(entry["end"]) for entry in entries),
+            "total_points": int(sum(int(entry.get("points", 0)) for entry in entries)),
+            "raw_rows": int(sum(int(entry.get("raw_rows", entry.get("points", 0))) for entry in entries)),
+            "valid_timestamp_points": int(sum(int(entry.get("valid_timestamp_points", entry.get("points", 0))) for entry in entries)),
+            "file_count": len(entries),
+            "file_name": file_name or (entries[0]["path"].name if len(entries) == 1 else f"{len(entries)} 个文件"),
+        }
+
+    def activate_single_device_selection(
+        self,
+        infos: list[dict[str, Any]],
+        *,
+        device_kind: str,
+    ) -> None:
+        if not infos:
+            raise ValueError("没有可用于单设备模式的文件。")
+
+        selected_paths = [Path(info["path"]) for info in infos]
+        preview_path = selected_paths[0]
+        summary = self.build_summary_from_range_entries(
+            infos,
+            file_name=preview_path.name if len(selected_paths) == 1 else f"{len(selected_paths)} 个文件",
+        )
+        self.selected_dat_var.set("")
+        self.select_paths_in_list(selected_paths, active_path=preview_path)
+
+        if device_kind == "ygas":
+            self.compare_file_info_var.set(
+                f"已识别单设备 ygas 文件 {len(selected_paths)} 个，可直接生成单台设备图谱；双设备主路径需再补 1 个 dat 文件。"
+            )
+            self.update_compare_summaries(summary, None)
+        else:
+            self.compare_file_info_var.set(
+                f"已识别单设备 dat 文件 {len(selected_paths)} 个，可直接生成单台设备图谱；双设备主路径需再补 1 个 txt/log 文件。"
+            )
+            self.update_compare_summaries(None, summary)
+
+        summary_items = [
+            f"单设备模式={device_kind}",
+            f"文件数={len(selected_paths)}",
+        ]
+        if summary is not None:
+            summary_items.append(f"时间范围={self.format_time_range_text(summary['start'], summary['end'])}")
+            summary_items.append(f"有效时间戳点数={summary.get('valid_timestamp_points', summary['total_points'])}")
+        self.folder_prepare_summary_var.set("自动准备摘要：" + " | ".join(summary_items))
+
+        self.apply_file_read_defaults(preview_path)
+        self.start_async_file_loading(preview_path)
+        if self.left_workflow_notebook is not None and self.single_analysis_tab is not None:
+            self.left_workflow_notebook.select(self.single_analysis_tab)
+        self.render_plot_message(
+            "当前目录只识别到 1 台设备的数据。\n\n可直接选择 1 列生成单台设备图谱；若勾选多个同设备文件，可按设备分组后合并生成图谱。",
+            level="info",
+        )
+        self.status_var.set(f"单设备模式已就绪：{device_kind} 文件 {len(selected_paths)} 个")
+
+    def format_time_range_text(self, start: pd.Timestamp | None, end: pd.Timestamp | None) -> str:
+        if start is None or end is None:
+            return "无"
+        return f"{start.strftime('%Y-%m-%d %H:%M:%S')} ~ {end.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    def build_dat_option_label(self, dat_info: dict[str, Any]) -> str:
+        start = pd.Timestamp(dat_info["start"]).strftime("%m-%d %H:%M")
+        end = pd.Timestamp(dat_info["end"]).strftime("%H:%M")
+        return f"{dat_info['path'].name} | {start}-{end}"
+
+    def choose_best_dat_info(
+        self,
+        ygas_infos: list[dict[str, Any]],
+        dat_infos: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not dat_infos:
+            return None
+        if not ygas_infos:
+            return dat_infos[0]
+
+        ygas_start = min(pd.Timestamp(info["start"]) for info in ygas_infos)
+        ygas_end = max(pd.Timestamp(info["end"]) for info in ygas_infos)
+        ygas_mid = ygas_start + (ygas_end - ygas_start) / 2
+
+        def overlap_seconds(start_a: pd.Timestamp, end_a: pd.Timestamp, start_b: pd.Timestamp, end_b: pd.Timestamp) -> float:
+            overlap_start = max(start_a, start_b)
+            overlap_end = min(end_a, end_b)
+            return max((overlap_end - overlap_start).total_seconds(), 0.0)
+
+        def rank_value(dat_info: dict[str, Any]) -> tuple[int, float, float]:
+            dat_start = pd.Timestamp(dat_info["start"])
+            dat_end = pd.Timestamp(dat_info["end"])
+            overlapping_groups = sum(
+                1
+                for info in ygas_infos
+                if overlap_seconds(pd.Timestamp(info["start"]), pd.Timestamp(info["end"]), dat_start, dat_end) > 0
+            )
+            overlap_span = overlap_seconds(ygas_start, ygas_end, dat_start, dat_end)
+            dat_mid = dat_start + (dat_end - dat_start) / 2
+            midpoint_penalty = abs((dat_mid - ygas_mid).total_seconds())
+            return overlapping_groups, overlap_span, -midpoint_penalty
+
+        return max(dat_infos, key=rank_value)
+
+    def build_auto_selection_for_dat(
+        self,
+        payload: dict[str, Any],
+        dat_path: Path,
+    ) -> dict[str, Any]:
+        ygas_infos = list(payload.get("ygas_infos", []))
+        dat_infos = list(payload.get("dat_infos", []))
+        dat_info = next((info for info in dat_infos if Path(info["path"]) == dat_path), None)
+        if dat_info is None:
+            raise ValueError("未找到可用的 dat 文件信息。")
+
+        dat_start = pd.Timestamp(dat_info["start"])
+        dat_end = pd.Timestamp(dat_info["end"])
+        overlapping_infos: list[dict[str, Any]] = []
+        skipped_infos: list[dict[str, Any]] = []
+        for info in ygas_infos:
+            start = pd.Timestamp(info["start"])
+            end = pd.Timestamp(info["end"])
+            if end >= dat_start and start <= dat_end:
+                overlapping_infos.append(info)
+            else:
+                skipped_infos.append(info)
+
+        selected_infos = overlapping_infos if overlapping_infos else list(ygas_infos)
+        txt_summary = self.build_summary_from_range_entries(selected_infos)
+        dat_summary = self.build_summary_from_range_entries([dat_info], file_name=dat_info["path"].name)
+        common_start: pd.Timestamp | None = None
+        common_end: pd.Timestamp | None = None
+        if txt_summary is not None and dat_summary is not None:
+            common_start = max(pd.Timestamp(txt_summary["start"]), pd.Timestamp(dat_summary["start"]))
+            common_end = min(pd.Timestamp(txt_summary["end"]), pd.Timestamp(dat_summary["end"]))
+            if common_start > common_end:
+                common_start = None
+                common_end = None
+
+        coverage_start = min((pd.Timestamp(info["start"]) for info in overlapping_infos), default=None)
+        coverage_end = max((pd.Timestamp(info["end"]) for info in overlapping_infos), default=None)
+        missing_before = None
+        missing_after = None
+        if coverage_start is not None:
+            missing_before = max((dat_start - coverage_start).total_seconds() / 60.0, 0.0)
+        if coverage_end is not None:
+            missing_after = max((dat_end - coverage_end).total_seconds() / 60.0, 0.0)
+
+        return {
+            "dat_info": dat_info,
+            "selected_ygas_infos": selected_infos,
+            "selected_ygas_paths": [Path(info["path"]) for info in selected_infos],
+            "skipped_ygas_infos": skipped_infos,
+            "txt_summary": txt_summary,
+            "dat_summary": dat_summary,
+            "common_start": common_start,
+            "common_end": common_end,
+            "group_count": len(overlapping_infos),
+            "expected_series_count": len(overlapping_infos) * 2,
+            "missing_before_minutes": missing_before,
+            "missing_after_minutes": missing_after,
+        }
+
+    def prepare_folder_auto_selection_payload(
+        self,
+        files: list[Path],
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        ygas_infos: list[dict[str, Any]] = []
+        dat_infos: list[dict[str, Any]] = []
+        ignored_files: list[str] = []
+        parse_errors: list[str] = []
+
+        total_files = len(files)
+        for index, path in enumerate(files, start=1):
+            if reporter is not None:
+                reporter(f"正在自动识别文件… {index}/{total_files}：{path.name}")
+            suffix = path.suffix.lower()
+            try:
+                profile = detect_file_profile(path, read_preview_lines(path))
+                if suffix in {".txt", ".log"} or profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"}:
+                    parsed = self.parse_profiled_file(path)
+                    start, end, points = self.get_parsed_time_bounds(parsed)
+                    ygas_infos.append(
+                        {
+                            "path": path,
+                            "profile": parsed.profile_name,
+                            "start": start,
+                            "end": end,
+                            "points": points,
+                            "raw_rows": int(parsed.source_row_count or len(parsed.dataframe)),
+                            "valid_timestamp_points": int(parsed.timestamp_valid_count),
+                        }
+                    )
+                    continue
+                if suffix == ".dat" or profile == "TOA5_DAT":
+                    parsed = self.parse_dat_file(path)
+                    start, end, points = self.get_parsed_time_bounds(parsed)
+                    dat_infos.append(
+                        {
+                            "path": path,
+                            "profile": parsed.profile_name,
+                            "start": start,
+                            "end": end,
+                            "points": points,
+                            "raw_rows": int(parsed.source_row_count or len(parsed.dataframe)),
+                            "valid_timestamp_points": int(parsed.timestamp_valid_count),
+                        }
+                    )
+                    continue
+                ignored_files.append(path.name)
+            except Exception as exc:
+                parse_errors.append(f"{path.name}：{exc}")
+
+        payload: dict[str, Any] = {
+            "ygas_infos": sorted(ygas_infos, key=lambda item: (pd.Timestamp(item["start"]), item["path"].name.lower())),
+            "dat_infos": sorted(dat_infos, key=lambda item: (pd.Timestamp(item["start"]), item["path"].name.lower())),
+            "ignored_files": ignored_files,
+            "parse_errors": parse_errors,
+        }
+        best_dat = self.choose_best_dat_info(payload["ygas_infos"], payload["dat_infos"])
+        if best_dat is not None:
+            payload["selected_dat_path"] = Path(best_dat["path"])
+            payload["selection"] = self.build_auto_selection_for_dat(payload, Path(best_dat["path"]))
+        else:
+            payload["selected_dat_path"] = None
+            payload["selection"] = None
+        return payload
+
+    def apply_auto_prepared_selection(self, payload: dict[str, Any], *, selected_dat_path: Path | None = None) -> None:
+        self.auto_prepare_payload = payload
+        ygas_infos = list(payload.get("ygas_infos", []))
+        dat_infos = list(payload.get("dat_infos", []))
+        self.auto_dat_options = {self.build_dat_option_label(info): Path(info["path"]) for info in dat_infos}
+        self.selected_dat_combo.configure(values=list(self.auto_dat_options.keys()))
+
+        if not ygas_infos:
+            if dat_infos:
+                self.activate_single_device_selection(dat_infos, device_kind="dat")
+                return
+            self.compare_file_info_var.set("自动准备失败：未找到可用 ygas txt/log 文件")
+            self.update_compare_summaries()
+            self.folder_prepare_summary_var.set("自动准备摘要：未找到可用 ygas txt/log 文件")
+            self.selected_dat_var.set("")
+            self.render_plot_message("未找到可用 ygas txt/log 文件。", level="warning")
+            self.status_var.set("自动准备失败：未找到可用 ygas txt/log")
+            return
+
+        if not dat_infos:
+            self.activate_single_device_selection(ygas_infos, device_kind="ygas")
+            return
+
+        chosen_path = selected_dat_path or payload.get("selected_dat_path")
+        if chosen_path is None:
+            chosen_info = self.choose_best_dat_info(ygas_infos, dat_infos)
+            chosen_path = Path(chosen_info["path"]) if chosen_info is not None else None
+        if chosen_path is None:
+            self.render_plot_message("自动准备失败：未找到可用 dat 文件。", level="warning")
+            self.status_var.set("自动准备失败：未找到可用 dat 文件")
+            return
+
+        selection = self.build_auto_selection_for_dat(payload, Path(chosen_path))
+        dat_label = next((label for label, path in self.auto_dat_options.items() if path == chosen_path), chosen_path.name)
+        self.selected_dat_var.set(dat_label)
+        self.element_preset_var.set("CO2")
+
+        selected_paths = [*selection["selected_ygas_paths"], Path(selection["dat_info"]["path"])]
+        preview_path = selection["selected_ygas_paths"][0] if selection["selected_ygas_paths"] else Path(selection["dat_info"]["path"])
+        self.select_paths_in_list(selected_paths, active_path=preview_path)
+        self.compare_file_info_var.set(
+            f"自动准备完成：ygas={len(ygas_infos)} 个 | dat={len(dat_infos)} 个 | 当前 dat={Path(selection['dat_info']['path']).name}"
+        )
+        self.update_compare_summaries(selection["txt_summary"], selection["dat_summary"])
+
+        common_text = self.format_time_range_text(selection["common_start"], selection["common_end"])
+        summary_items = [
+            f"共同时间范围={common_text}",
+            f"可生成谱图的分组数={selection['group_count']}",
+        ]
+        if selection["skipped_ygas_infos"]:
+            summary_items.append(f"已跳过不重叠 txt/log={len(selection['skipped_ygas_infos'])} 个")
+        if selection["missing_before_minutes"] is not None and selection["missing_before_minutes"] > 0:
+            summary_items.append(f"dat 开始前仍缺 {selection['missing_before_minutes']:.1f} 分钟")
+        if selection["missing_after_minutes"] is not None and selection["missing_after_minutes"] > 0:
+            summary_items.append(f"dat 结束后仍缺 {selection['missing_after_minutes']:.1f} 分钟")
+        if payload.get("parse_errors"):
+            summary_items.append(f"解析失败={len(payload['parse_errors'])} 个")
+        self.folder_prepare_summary_var.set("自动准备摘要：" + " | ".join(summary_items))
+
+        if selection["common_start"] is not None and selection["common_end"] is not None:
+            self.time_start_var.set(selection["common_start"].strftime("%Y-%m-%d %H:%M:%S"))
+            self.time_end_var.set(selection["common_end"].strftime("%Y-%m-%d %H:%M:%S"))
+            self.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        else:
+            dat_summary = selection["dat_summary"]
+            self.time_start_var.set(pd.Timestamp(dat_summary["start"]).strftime("%Y-%m-%d %H:%M:%S"))
+            self.time_end_var.set(pd.Timestamp(dat_summary["end"]).strftime("%Y-%m-%d %H:%M:%S"))
+            self.time_range_strategy_var.set("使用 dat 时间范围")
+
+        self.refresh_compare_column_options()
+        self.apply_file_read_defaults(preview_path)
+        self.start_async_file_loading(preview_path)
+        if self.left_workflow_notebook is not None and self.dual_compare_tab is not None:
+            self.left_workflow_notebook.select(self.dual_compare_tab)
+
+        if selection["group_count"] <= 0:
+            txt_summary = selection["txt_summary"]
+            dat_summary = selection["dat_summary"]
+            if txt_summary is not None and dat_summary is not None:
+                self.render_plot_message(self.build_no_common_time_range_message(txt_summary, dat_summary), level="warning")
+            else:
+                self.render_plot_message("dat 与 txt/log 时间不重叠，暂时无法生成目标谱图。", level="warning")
+            self.status_var.set("自动准备完成，但当前没有可用共同时间范围")
+            return
+
+        self.status_var.set(f"自动准备完成：已选 ygas {len(selection['selected_ygas_paths'])} 个，dat 1 个，可直接生成目标谱图")
+
+    def async_open_directory(self) -> None:
+        folder = filedialog.askdirectory(title="选择目录")
+        if not folder:
+            return
+
+        self.remember_current_selection()
+        self.remember_current_read_settings()
+        self.current_folder = Path(folder)
+        self.current_target_group_preview_frame = None
+        self.update_target_group_qc_panel(None)
+        files = self.get_supported_files(self.current_folder)
+        self.populate_file_list(files)
+
+        if files:
+            self.status_var.set(f"已载入目录：{self.current_folder}，正在自动识别文件…")
+            self.current_target_plot_metadata = {}
+            self.current_target_group_preview_frame = None
+            self.current_result_frame = None
+            self.current_result_freq = None
+            self.current_result_values = None
+            self.current_compare_files = []
+            self.current_plot_kind = None
+            self.current_plot_columns = []
+            self.reset_plot_output_state()
+
+            self.start_background_task(
+                status_text="正在自动识别文件…",
+                worker=lambda reporter: self.prepare_folder_auto_selection_payload(files, reporter),
+                on_success=lambda payload: self.apply_auto_prepared_selection(payload),
+                error_title="自动准备文件夹",
+            )
+        else:
+            self.compare_file_info_var.set("自动准备失败：当前目录没有可用数据文件")
+            self.update_compare_summaries()
+            self.folder_prepare_summary_var.set("自动准备摘要：当前目录没有可用的 txt/log/dat 文件")
+            self.status_var.set("当前目录没有可用的数据文件")
+            self.render_plot_message("当前目录没有可用的 txt/log/dat 文件。", level="warning")
+
+    def async_open_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="选择文件",
+            filetypes=[
+                ("高频数据文件", "*.txt *.log *.csv *.dat"),
+                ("TXT 文件", "*.txt"),
+                ("LOG 文件", "*.log"),
+                ("CSV 文件", "*.csv"),
+                ("DAT 文件", "*.dat"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        chosen_path = Path(file_path)
+        if chosen_path.suffix.lower() not in ALLOWED_SUFFIXES:
+            messagebox.showerror("不支持的文件", "请选择 txt、log、csv 或 dat 文件。")
+            return
+
+        self.remember_current_selection()
+        self.remember_current_read_settings()
+        self.current_folder = chosen_path.parent
+        self.current_target_group_preview_frame = None
+        self.update_target_group_qc_panel(None)
+        files = self.get_supported_files(self.current_folder)
+        self.populate_file_list(files)
+
+        if not self.select_file_in_list(chosen_path):
+            self.status_var.set("所选文件未出现在当前目录列表中")
+            return
+
+        self.apply_file_read_defaults(chosen_path)
+        self.start_async_file_loading(chosen_path)
+        self.status_var.set(f"已选择文件：{chosen_path.name}")
+
+    def on_selected_dat_changed(self, _event: tk.Event[Any] | None = None) -> None:
+        label = self.selected_dat_var.get().strip()
+        if not label or self.auto_prepare_payload is None:
+            return
+        dat_path = self.auto_dat_options.get(label)
+        if dat_path is None:
+            return
+        try:
+            self.apply_auto_prepared_selection(self.auto_prepare_payload, selected_dat_path=dat_path)
+            self.status_var.set(f"已切换 dat：{dat_path.name}")
+        except Exception as exc:
+            self.render_plot_message(f"切换 dat 失败：{exc}", level="warning")
+            self.status_var.set(f"切换 dat 失败：{exc}")
+
+    def on_file_select(self, _event: tk.Event[Any] | None = None) -> None:
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        active_index = self.file_listbox.index(tk.ACTIVE)
+        target_index = active_index if active_index in selection else selection[-1]
+        new_path = self.file_paths[target_index]
+        self.refresh_compare_column_options()
+        if self.current_file == new_path:
+            return
+
+        self.remember_current_selection()
+        self.remember_current_read_settings()
+        self.apply_file_read_defaults(new_path)
+        self.start_async_file_loading(new_path)
+
+    def update_settings(self) -> None:
+        self._update_delimiter_state()
+        if self.suspend_setting_reload:
+            return
+        if self.current_file is None:
+            return
+
+        self.remember_current_read_settings()
+        if self.reload_after_id is not None:
+            self.root.after_cancel(self.reload_after_id)
+        self.reload_after_id = self.root.after(300, lambda: self.start_async_file_loading(self.current_file))
+
+    def remember_current_read_settings(self) -> None:
+        if self.current_file is None:
+            return
+        self.saved_read_settings[str(self.current_file)] = {
+            "delimiter": self.delimiter_var.get(),
+            "custom_delimiter": self.custom_delimiter_var.get(),
+            "start_row": self.start_row_var.get(),
+            "header_row": self.header_row_var.get(),
+            "no_header": self.no_header_var.get(),
+        }
+
+    def apply_read_settings(
+        self,
+        *,
+        delimiter: str,
+        custom_delimiter: str,
+        start_row: str,
+        header_row: str,
+        no_header: bool,
+    ) -> None:
+        self.suspend_setting_reload = True
+        try:
+            self.delimiter_var.set(delimiter)
+            self.custom_delimiter_var.set(custom_delimiter)
+            self.start_row_var.set(start_row)
+            self.header_row_var.set(header_row)
+            self.no_header_var.set(no_header)
+            self._update_delimiter_state()
+        finally:
+            self.suspend_setting_reload = False
+
+    def apply_file_read_defaults(self, path: Path) -> None:
+        settings = self.get_read_settings_for_file(path)
+        self.apply_read_settings(
+            delimiter=str(settings["delimiter"]),
+            custom_delimiter=str(settings["custom_delimiter"]),
+            start_row=str(settings["start_row"]),
+            header_row=str(settings["header_row"]),
+            no_header=bool(settings["no_header"]),
+        )
+
+    def _update_delimiter_state(self) -> None:
+        custom_enabled = self.delimiter_var.get() == "自定义"
+        state = "normal" if custom_enabled else "disabled"
+        self.custom_delim_entry.configure(state=state)
+
+        header_state = "disabled" if self.no_header_var.get() else "normal"
+        self.header_spin.configure(state=header_state)
+
+    def get_delimiter(self) -> str:
+        return self.resolve_delimiter(self.delimiter_var.get(), self.custom_delimiter_var.get())
+
+    def get_header_value(self) -> int | None:
+        if self.no_header_var.get():
+            return None
+        return max(parse_int(self.header_row_var.get(), 0), 0)
+
+    def looks_like_timestamp(self, value: str) -> bool:
+        return bool(TIMESTAMP_PATTERN.match(value.strip()))
+
+    def looks_like_number(self, value: str) -> bool:
+        return bool(NUMERIC_PATTERN.match(value.strip()))
+
+    def looks_like_header_name(self, value: str) -> bool:
+        return bool(HEADER_NAME_PATTERN.match(value.strip()))
+
+    def should_suggest_no_header(self, path: Path) -> bool:
+        if path.suffix.lower() not in TEXT_LIKE_SUFFIXES:
+            return False
+        if self.no_header_var.get():
+            return False
+
+        state = self.no_header_prompt_state.get(str(path))
+        if state in {"accepted", "rejected"}:
+            return False
+
+        try:
+            preview = pd.read_csv(
+                path,
+                sep=self.get_delimiter(),
+                skiprows=max(parse_int(self.start_row_var.get(), 0), 0),
+                header=None,
+                engine="python",
+                on_bad_lines="skip",
+                dtype=str,
+                nrows=1,
+            )
+        except Exception:
+            return False
+
+        return self.preview_suggests_no_header(preview)
+
+    def get_current_loader_options(self) -> tuple[str, int, int | None]:
+        delimiter = self.get_delimiter()
+        start_row = max(parse_int(self.start_row_var.get(), 0), 0)
+        header_row = self.get_header_value()
+        return delimiter, start_row, header_row
+
+    def load_file_with_current_settings(self, path: Path) -> LoaderResult:
+        delimiter, start_row, header_row = self.get_current_loader_options()
+        return self.load_file_with_options(path, delimiter, start_row, header_row)
+
+    def load_file_with_options(
+        self,
+        path: Path,
+        delimiter: str,
+        start_row: int,
+        header_row: int | None,
+    ) -> LoaderResult:
+        profile_parser = self.should_use_profile_parser_for_display(path)
+        if profile_parser in {"YGAS_MODE1_15", "YGAS_MODE1_16"}:
+            return self.build_loader_result_from_parsed(self.parse_ygas_mode1_file(path))
+        if profile_parser == "TOA5_DAT":
+            return self.build_loader_result_from_parsed(self.parse_toa5_file(path))
+        loader = AsyncFileLoader(
+            file_path=str(path),
+            delimiter=delimiter,
+            start_row=start_row,
+            header_row=header_row,
+        )
+        return loader.load()
+
+    def load_file_with_file_settings(self, path: Path) -> LoaderResult:
+        settings = self.get_read_settings_for_file(path)
+        return self.load_file_with_options(
+            path,
+            self.resolve_delimiter(str(settings["delimiter"]), str(settings["custom_delimiter"])),
+            max(parse_int(str(settings["start_row"]), 0), 0),
+            None if bool(settings["no_header"]) else max(parse_int(str(settings["header_row"]), 0), 0),
+        )
+
+    def classify_dataframe_columns(
+        self,
+        df: pd.DataFrame,
+        excluded_columns: set[str] | None = None,
+    ) -> tuple[dict[str, np.ndarray], set[str], set[str]]:
+        return core.classify_numeric_columns(df, excluded_columns=excluded_columns)
+
+    def get_selected_file_paths(self) -> list[Path]:
+        indices = list(self.file_listbox.curselection())
+        if indices:
+            return [self.file_paths[index] for index in indices]
+        if self.current_file is not None:
+            return [self.current_file]
+        return []
+
+    def start_async_file_loading(self, path: Path) -> None:
+        if self.reload_after_id is not None:
+            self.root.after_cancel(self.reload_after_id)
+            self.reload_after_id = None
+
+        self.current_file = path
+        self.active_load_token += 1
+        self.loading_in_progress = True
+        token = self.active_load_token
+        delimiter, start_row, header_row = self.get_current_loader_options()
+        self.status_var.set(f"正在加载：{path.name}")
+
+        def task() -> None:
+            try:
+                result = self.load_file_with_options(path, delimiter, start_row, header_row)
+                self.loading_queue.put(
+                    {
+                        "token": token,
+                        "success": True,
+                        "path": path,
+                        "result": result,
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - GUI error path
+                self.loading_queue.put(
+                    {
+                        "token": token,
+                        "success": False,
+                        "path": path,
+                        "error": str(exc),
+                    }
+                )
+
+        threading.Thread(target=task, daemon=True).start()
+        if self.check_queue_after_id is None:
+            self.check_queue_after_id = self.root.after(100, self.check_loading_status)
+
+    def check_loading_status(self) -> None:
+        processed = False
+        while True:
+            try:
+                item = self.loading_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            processed = True
+            if item["token"] != self.active_load_token:
+                continue
+
+            self.loading_in_progress = False
+            if item["success"]:
+                self.on_file_loaded(item["path"], item["result"])
+            else:
+                self.status_var.set(f"加载失败：{item['path'].name}")
+                messagebox.showerror("加载失败", item["error"])
+
+        if processed or not self.loading_queue.empty() or self.loading_in_progress:
+            self.check_queue_after_id = self.root.after(100, self.check_loading_status)
+        else:
+            self.check_queue_after_id = None
+
+    def start_background_task(
+        self,
+        *,
+        status_text: str,
+        worker: Any,
+        on_success: Any,
+        error_title: str,
+    ) -> None:
+        self.active_task_token += 1
+        token = self.active_task_token
+        self.background_task_in_progress = True
+        self.status_var.set(status_text)
+        self.root.update_idletasks()
+
+        def report_progress(text: str) -> None:
+            self.task_queue.put(
+                {
+                    "token": token,
+                    "kind": "progress",
+                    "text": text,
+                }
+            )
+
+        def task() -> None:
+            try:
+                payload = worker(report_progress)
+                self.task_queue.put(
+                    {
+                        "token": token,
+                        "success": True,
+                        "payload": payload,
+                        "callback": on_success,
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - GUI error path
+                self.task_queue.put(
+                    {
+                        "token": token,
+                        "success": False,
+                        "error": str(exc),
+                        "error_title": error_title,
+                    }
+                )
+
+        threading.Thread(target=task, daemon=True).start()
+        if self.check_task_after_id is None:
+            self.check_task_after_id = self.root.after(100, self.check_background_task_status)
+
+    def check_background_task_status(self) -> None:
+        processed = False
+        while True:
+            try:
+                item = self.task_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            processed = True
+            if item["token"] != self.active_task_token:
+                continue
+
+            if item.get("kind") == "progress":
+                self.status_var.set(str(item.get("text", "正在处理…")))
+                self.root.update_idletasks()
+                continue
+
+            self.background_task_in_progress = False
+            if item["success"]:
+                callback = item["callback"]
+                try:
+                    callback(item["payload"])
+                except Exception as exc:
+                    message = str(exc)
+                    self.status_var.set(f"后台任务失败：{message}")
+                    self.update_diagnostic_info(layout=self.current_layout_label)
+                    self.render_plot_message(message, level="warning")
+                    messagebox.showerror("后台任务失败", message)
+            else:
+                message = item["error"]
+                self.status_var.set(f"{item['error_title']}失败：{message}")
+                self.update_diagnostic_info(layout=self.current_layout_label)
+                self.render_plot_message(message, level="warning")
+                messagebox.showerror(item["error_title"], message)
+
+        if processed or not self.task_queue.empty() or self.background_task_in_progress:
+            self.check_task_after_id = self.root.after(100, self.check_background_task_status)
+        else:
+            self.check_task_after_id = None
+
+    def on_file_loaded(self, path: Path, result: LoaderResult) -> None:
+        df = result.dataframe
+        self.preview_data = None
+        self.current_data_source_kind = "file"
+        self.current_data_source_label = f"当前文件：{path.name}"
+
+        if self.should_suggest_no_header(path):
+            prompt = (
+                "检测到首行更像数据而不是表头。\n\n"
+                "是否按无表头(header=None)重新加载？"
+            )
+            if messagebox.askyesno("检测到可能无表头", prompt):
+                self.no_header_prompt_state[str(path)] = "accepted"
+                self.no_header_var.set(True)
+                self.start_async_file_loading(path)
+                return
+            self.no_header_prompt_state[str(path)] = "rejected"
+
+        self.raw_data = df
+        self.page_index = 0
+        if result.profile_name:
+            self.current_layout_label = result.profile_name
+        else:
+            self.current_layout_label = self.describe_layout(result.mode1_layout)
+        self.excluded_analysis_cols = set(result.excluded_columns or set())
+        if result.mode1_layout is not None:
+            self.excluded_analysis_cols.update(set(result.mode1_layout.get("excluded_cols", set())))
+        self.column_data, self.non_numeric_cols, self.unsuitable_spectrum_cols = self.classify_dataframe_columns(
+            df,
+            excluded_columns=self.excluded_analysis_cols,
+        )
+        self.current_used_mode1_template = result.used_mode1_template
+
+        self.create_column_selector()
+        self.update_table_view()
+        self.refresh_compare_column_options()
+
+        numeric_count = len(self.column_data)
+        non_numeric_count = len(self.non_numeric_cols)
+        status_suffix = ""
+        if self.unsuitable_spectrum_cols:
+            status_suffix += f" | 已排除不适合谱分析的列：{len(self.unsuitable_spectrum_cols)} 列"
+        if result.used_mode1_template:
+            status_suffix += " | 已识别 MODE1 布局"
+        elif result.profile_name == "TOA5_DAT":
+            status_suffix += " | 已识别 TOA5 布局"
+        self.status_var.set(
+            f"已加载 {path.name} | 总列数 {len(df.columns)} | 可分析列 {numeric_count} | 非数值列 {non_numeric_count}{status_suffix}"
+        )
+        timestamp_items: list[str] = []
+        timestamp_col = "时间戳" if "时间戳" in df.columns else self.guess_timestamp_column(df)
+        if timestamp_col and timestamp_col in df.columns:
+            parsed_timestamps = parse_mixed_timestamp_series(df[timestamp_col])
+            timestamp_stats = build_timestamp_parse_stats(df[timestamp_col], parsed_timestamps)
+            timestamp_items.append(
+                f"时间戳有效率={timestamp_stats['valid_ratio']:.1%} "
+                f"({timestamp_stats['valid_count']}/{timestamp_stats['row_count']})"
+            )
+            estimated_fs = estimate_fs_from_timestamp(df, timestamp_col)
+            if estimated_fs is not None:
+                timestamp_items.append(f"估算FS={estimated_fs:g}")
+            if timestamp_stats["warning"]:
+                timestamp_items.append(str(timestamp_stats["warning"]))
+        self.update_diagnostic_info(layout=self.current_layout_label, extra_items=timestamp_items or None)
+
+        if not self.column_data:
+            if path.suffix.lower() in TEXT_LIKE_SUFFIXES and self.current_layout_label == "普通表格":
+                self.render_plot_message("当前文件布局识别失败，请检查分隔符、表头或起始行设置。", level="warning")
+            else:
+                self.render_plot_message("当前文件没有可用于谱分析的有效列。", level="warning")
+
+    def create_column_selector(self) -> None:
+        for child in self.column_inner.winfo_children():
+            child.destroy()
+
+        preserved = self.restore_selection_candidates()
+        self.column_vars.clear()
+
+        display_columns = [
+            col for col in (self.raw_data.columns if self.raw_data is not None else []) if col in self.column_data
+        ]
+        guidance_lines: list[tuple[str, str]] = []
+        if self.current_data_source_kind == "comparison_analysis":
+            target_context = core.get_target_spectral_context(self.current_comparison_metadata)
+            guidance_lines.append(("汇总表模式：可勾选 1 列做 PSD，或勾选 2 列做互谱/协谱/正交谱。", "#234e70"))
+            if target_context is not None:
+                guidance_lines.append(
+                    (
+                        "当前属于目标频谱上下文，"
+                        + "canonical pairs = "
+                        + "；".join(str(item) for item in (target_context.get("canonical_cross_pairs") or []))
+                        + "。",
+                        "#2c5282",
+                    )
+                )
+            else:
+                guidance_lines.append(("建议优先选择一列 A_... 和一列 B_...，例如 A_CO2浓度 与 B_CO2_Avg。", "#666666"))
+
+        if not display_columns:
+            ttk.Label(self.column_inner, text="未检测到可用于谱分析的数值列").grid(
+                row=0, column=0, sticky="w", padx=6, pady=6
+            )
+        else:
+            row_cursor = 0
+            if guidance_lines:
+                for text, color in guidance_lines:
+                    ttk.Label(
+                        self.column_inner,
+                        text=text,
+                        foreground=color,
+                        wraplength=300,
+                        justify="left",
+                    ).grid(row=row_cursor, column=0, sticky="w", padx=6, pady=(6 if row_cursor == 0 else 0, 4))
+                    row_cursor += 1
+            ttk.Label(
+                self.column_inner,
+                text="列较多时可用右侧滚动条或鼠标滚轮查看更多",
+                foreground="#666666",
+            ).grid(row=row_cursor, column=0, sticky="w", padx=6, pady=(6 if row_cursor == 0 else 0, 4))
+            row_cursor += 1
+        row_offset = row_cursor if display_columns else 0
+        for idx, col in enumerate(display_columns):
+            var = tk.BooleanVar(value=col in preserved)
+            self.column_vars[col] = var
+            cb = ttk.Checkbutton(
+                self.column_inner,
+                text=col,
+                variable=var,
+                command=lambda name=col: self.on_column_changed(name),
+            )
+            cb.grid(row=row_offset + idx, column=0, sticky="w", padx=6, pady=2)
+
+        self.schedule_auto_analysis()
+
+    def restore_selection_candidates(self) -> set[str]:
+        if self.current_data_source_kind == "comparison_analysis":
+            target_context = core.get_target_spectral_context(self.current_comparison_metadata)
+            if target_context is not None:
+                return {
+                    column
+                    for column in [
+                        str(target_context.get("summary_ygas_target_column") or target_context.get("summary_target_column") or ""),
+                        str(target_context.get("summary_reference_column") or ""),
+                    ]
+                    if column in self.column_data
+                }
+            return set()
+
+        if not self.preserve_selection_var.get():
+            if self.current_used_mode1_template:
+                if "CO2浓度" in self.column_data:
+                    return {"CO2浓度"}
+                if "H2O浓度" in self.column_data:
+                    return {"H2O浓度"}
+            return set()
+
+        current_key = str(self.current_file) if self.current_file else ""
+        current_saved = set(self.saved_selections.get(current_key, []))
+        if current_saved:
+            return current_saved
+
+        previous = set(self.selected_columns)
+        restored = {col for col in previous if col in self.column_data}
+        if restored:
+            return restored
+
+        if self.current_used_mode1_template:
+            if "CO2浓度" in self.column_data:
+                return {"CO2浓度"}
+            if "H2O浓度" in self.column_data:
+                return {"H2O浓度"}
+
+        return set()
+
+    @property
+    def selected_columns(self) -> list[str]:
+        return [name for name, var in self.column_vars.items() if var.get()]
+
+    def remember_current_selection(self) -> None:
+        if (
+            not self.preserve_selection_var.get()
+            or self.current_file is None
+            or self.current_data_source_kind == "comparison_analysis"
+        ):
+            return
+        self.saved_selections[str(self.current_file)] = list(self.selected_columns)
+
+    def on_column_changed(self, changed_name: str) -> None:
+        chosen = self.selected_columns
+        if len(chosen) > 2:
+            self.column_vars[changed_name].set(False)
+            messagebox.showwarning("警告", "最多只能选择两列进行分析。")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            self.render_plot_message("当前最多支持 1 列功率谱密度或 2 列互谱分析。", level="warning")
+            return
+
+        if (
+            self.preserve_selection_var.get()
+            and self.current_file is not None
+            and self.current_data_source_kind != "comparison_analysis"
+        ):
+            self.saved_selections[str(self.current_file)] = list(chosen)
+
+        self.schedule_auto_analysis()
+
+    def schedule_auto_analysis(self) -> None:
+        if self.auto_analysis_after_id is not None:
+            try:
+                self.root.after_cancel(self.auto_analysis_after_id)
+            except tk.TclError:
+                pass
+            self.auto_analysis_after_id = None
+        self.auto_analysis_after_id = self.root.after(80, self.auto_perform_analysis)
+
+    def auto_perform_analysis(self) -> None:
+        self.auto_analysis_after_id = None
+        chosen = self.selected_columns
+        if len(chosen) == 1:
+            self.perform_analysis("spectral", quiet=True)
+        elif len(chosen) == 2:
+            self.perform_analysis("cross", quiet=True)
+        elif len(chosen) == 0:
+            if self.current_data_source_kind == "comparison_analysis":
+                self.update_diagnostic_info(layout=self.current_layout_label)
+                self.render_plot_message(
+                    "当前主表是对比汇总表。\n\n请勾选 1 列做功率谱密度，或勾选 2 列做互谱/协谱/正交谱分析。",
+                    level="info",
+                )
+                return
+            if self.current_file is None:
+                self.update_diagnostic_info(layout=self.current_layout_label)
+                self.render_plot_message("请选择文件并勾选要分析的列。")
+            elif self.column_data:
+                self.update_diagnostic_info(layout=self.current_layout_label)
+                self.render_plot_message("请先在左侧勾选 1 列做功率谱密度，或勾选 2 列做互谱分析。")
+        else:
+            self.status_var.set("请选择 1 列做 PSD，或选择 2 列做互谱。")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            if self.current_data_source_kind == "comparison_analysis":
+                self.render_plot_message("对比汇总表当前最多支持 1 列做 PSD，或 2 列做互谱/协谱/正交谱分析。", level="warning")
+            else:
+                self.render_plot_message("当前最多支持 1 列功率谱密度或 2 列互谱分析。", level="warning")
+
+    def generate_plot(self) -> None:
+        chosen = self.selected_columns
+        selected_files = self.get_selected_file_paths()
+
+        if len(chosen) == 1 and len(selected_files) > 1:
+            if messagebox.askyesno("生成图", "检测到已选择多个文件，是否按设备分组后生成图谱？\n\n单设备会先合并同设备文件，多设备会保留叠加对比。"):
+                self.perform_multi_spectral_compare()
+            else:
+                self.perform_analysis("spectral")
+            return
+
+        if len(chosen) == 1:
+            self.perform_analysis("spectral")
+            return
+
+        if len(chosen) == 2:
+            self.perform_analysis("cross")
+            return
+
+        if len(chosen) == 0:
+            self.status_var.set("生成图失败：未选择分析列")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            self.render_plot_message("请先在左侧勾选 1 列或 2 列，然后再点击“生成图”。", level="warning")
+            return
+
+        self.status_var.set("生成图失败：选择列数量不正确")
+        self.update_diagnostic_info(layout=self.current_layout_label)
+        self.render_plot_message("当前最多支持 1 列功率谱密度或 2 列互谱分析。", level="warning")
+
+    def perform_analysis(self, analysis_type: str, quiet: bool = False) -> None:
+        try:
+            if analysis_type == "spectral":
+                if len(self.selected_columns) != 1:
+                    raise ValueError("频谱分析需要且只能选择 1 列。")
+                freq, density, details = self.spectral_analysis()
+                self.plot_results("spectral", freq, density, self.selected_columns, details)
+            else:
+                if len(self.selected_columns) != 2:
+                    raise ValueError("互谱分析需要且只能选择 2 列。")
+                freq, density, details = self.cross_spectral_analysis()
+                warning_message = str(details.get("selection_warning") or "").strip()
+                if warning_message and not quiet:
+                    messagebox.showwarning("提示", warning_message)
+                self.plot_results("cross", freq, density, self.selected_columns, details)
+            self.last_param_error_message = None
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"分析失败：{message}")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            level = "warning" if message.startswith("参数错误") else "error"
+            self.render_plot_message(message, level=level)
+            is_param_error = message.startswith("参数错误")
+            if is_param_error:
+                if self.last_param_error_message != message:
+                    messagebox.showerror("参数错误", message)
+                    self.last_param_error_message = message
+            elif not quiet:
+                messagebox.showerror("分析失败", message)
+
+    def compute_psd_from_array_with_params(
+        self,
+        data: np.ndarray,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        return core.compute_psd_from_array_with_params(data, fs, requested_nsegment, overlap_ratio)
+
+    def compute_psd_from_array(self, data: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        return self.compute_psd_from_array_with_params(data, fs, requested_nsegment, overlap_ratio)
+
+    def get_analysis_params(self) -> tuple[float, int, float]:
+        # Practical completion: FS defaulted to 10.0 and exposed in UI for usability.
+        try:
+            fs = float(self.fs_var.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("参数错误：FS 必须是大于 0 的数字。") from exc
+        if fs <= 0:
+            raise ValueError("参数错误：FS 必须大于 0。")
+
+        try:
+            nsegment = int(self.nsegment_var.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("参数错误：NSEGMENT 必须是大于等于 2 的整数。") from exc
+        if nsegment < 2:
+            raise ValueError("参数错误：NSEGMENT 必须大于等于 2。")
+
+        try:
+            overlap_ratio = float(self.overlap_ratio_var.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("参数错误：OVERLAP_RATIO 必须在 [0, 1) 范围内。") from exc
+        if not (0 <= overlap_ratio < 1):
+            raise ValueError("参数错误：OVERLAP_RATIO 必须在 [0, 1) 范围内。")
+
+        return fs, nsegment, overlap_ratio
+
+    def get_selected_cross_spectrum_type(self, compare_mode: str | None = None) -> str:
+        if compare_mode == "互谱幅值":
+            return CROSS_SPECTRUM_MAGNITUDE
+        if compare_mode == "协谱图":
+            return CROSS_SPECTRUM_REAL
+        if compare_mode == "正交谱图":
+            return CROSS_SPECTRUM_IMAG
+        spectrum_type = self.cross_spectrum_type_var.get().strip() or CROSS_SPECTRUM_MAGNITUDE
+        if spectrum_type not in CROSS_SPECTRUM_OPTIONS:
+            return CROSS_SPECTRUM_MAGNITUDE
+        return spectrum_type
+
+    def get_selected_reference_slope_mode(self) -> str:
+        return normalize_reference_slope_mode(self.reference_slope_mode_var.get())
+
+    def get_cross_spectrum_display_meta(self, spectrum_type: str) -> dict[str, str]:
+        return core.get_cross_spectrum_display_meta(spectrum_type)
+
+    def build_reference_slope_diagnostic_items(
+        self,
+        *,
+        is_psd: bool,
+        spectrum_type: str | None = None,
+    ) -> list[str]:
+        selected_mode = self.get_selected_reference_slope_mode()
+        specs = resolve_reference_slope_specs(selected_mode, is_psd=is_psd, spectrum_type=spectrum_type)
+        return [
+            f"reference_slope_mode={selected_mode}",
+            f"reference_slope_selection={format_reference_slope_selection(specs)}",
+        ]
+
+    def add_selected_reference_slopes(
+        self,
+        ax: Any,
+        freq: np.ndarray,
+        density: np.ndarray,
+        *,
+        is_psd: bool,
+        spectrum_type: str | None = None,
+        use_fixed_power_law: bool = False,
+        amplitude_at_1hz: float = 1.0,
+    ) -> list[dict[str, float | str]]:
+        specs = resolve_reference_slope_specs(
+            self.get_selected_reference_slope_mode(),
+            is_psd=is_psd,
+            spectrum_type=spectrum_type,
+        )
+        for spec in specs:
+            slope = float(spec["slope"])
+            color = str(spec["color"])
+            short_label = str(spec["short_label"])
+            if use_fixed_power_law:
+                self.add_fixed_reference_power_law(
+                    ax,
+                    freq,
+                    slope=slope,
+                    amplitude_at_1hz=amplitude_at_1hz,
+                    label=short_label,
+                    color=color,
+                )
+            else:
+                self.add_reference_slope(
+                    ax,
+                    freq,
+                    density,
+                    slope,
+                    color=color,
+                    label=str(spec["label"]),
+                )
+        return specs
+
+    def compute_cross_spectrum_from_arrays_with_params(
+        self,
+        data1: np.ndarray,
+        data2: np.ndarray,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        *,
+        spectrum_type: str,
+        insufficient_message: str,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        return core.compute_cross_spectrum_from_arrays_with_params(
+            data1,
+            data2,
+            fs,
+            requested_nsegment,
+            overlap_ratio,
+            spectrum_type=spectrum_type,
+            insufficient_message=insufficient_message,
+        )
+
+    def spectral_analysis(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        col = self.selected_columns[0]
+        data = self.column_data[col]
+        return self.compute_psd_from_array(data)
+
+    def cross_spectral_analysis(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        selected_columns = list(self.selected_columns)
+        pair_info = core.resolve_target_cross_pair(selected_columns, self.current_comparison_metadata)
+        ordered_columns = list(pair_info["ordered_columns"]) if pair_info["ordered_columns"] else selected_columns
+        col1, col2 = ordered_columns
+        data1 = self.column_data[col1]
+        data2 = self.column_data[col2]
+        fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        spectrum_type = self.get_selected_cross_spectrum_type()
+        if bool(pair_info["uses_canonical_pair"]):
+            freq, details = core.compute_target_cross_complex_from_selected_implementation(
+                data1,
+                data2,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                implementation_id=core.TARGET_COSPECTRUM_IMPLEMENTATION_ID,
+                insufficient_message="当前数据不足以生成有效互谱/协谱结果。",
+            )
+        else:
+            freq, _values, details = self.compute_cross_spectrum_from_arrays_with_params(
+                data1,
+                data2,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                spectrum_type=spectrum_type,
+                insufficient_message="当前数据不足以生成有效协谱图。",
+            )
+        details = dict(details)
+        resolved_pair = pair_info.get("resolved_pair") if isinstance(pair_info.get("resolved_pair"), dict) else None
+        if bool(pair_info["uses_canonical_pair"]):
+            details["cross_execution_path"] = "target_spectral_canonical"
+        else:
+            details.update(core.describe_generic_default_cross_implementation())
+            details["alignment_strategy"] = core.GENERIC_SAME_FRAME_ALIGNMENT_STRATEGY
+            details["cross_reference_column"] = str(col1)
+            details["reference_column"] = str(col1)
+            details["target_column"] = str(col2)
+            details["cross_order"] = f"{col1} -> {col2}"
+        details["ordered_columns"] = ordered_columns
+        details["selected_columns"] = selected_columns
+        details["uses_canonical_pair"] = bool(pair_info["uses_canonical_pair"])
+        details["auto_reordered"] = bool(pair_info["auto_reordered"])
+        details["selection_warning"] = pair_info.get("warning")
+        if pair_info.get("context") is not None:
+            details["target_spectral_context"] = pair_info["context"]
+            if resolved_pair is not None and bool(pair_info["uses_canonical_pair"]):
+                details["reference_column"] = resolved_pair.get("summary_reference_column", ordered_columns[0])
+                details["cross_reference_column"] = resolved_pair.get("summary_reference_column", ordered_columns[0])
+                details["target_column"] = resolved_pair.get("summary_target_column", ordered_columns[1])
+                details["cross_order"] = resolved_pair.get("summary_cross_order", f"{ordered_columns[0]} -> {ordered_columns[1]}")
+                details["series_role"] = resolved_pair.get("series_role")
+                details["device_kind"] = resolved_pair.get("device_kind")
+                details["display_label"] = resolved_pair.get("display_label")
+            else:
+                details["reference_column"] = pair_info["context"].get("reference_column")
+                details["cross_reference_column"] = pair_info["context"].get("reference_column")
+                details["target_column"] = pair_info["context"].get("target_column")
+                details["cross_order"] = pair_info["context"].get("cross_order")
+        analysis_context = (
+            pair_info["context"].get("analysis_context")
+            if isinstance(pair_info.get("context"), dict)
+            else details.get("analysis_context")
+        )
+        values, _mask, details = core.resolve_cross_display_output(
+            freq,
+            details,
+            analysis_context=analysis_context,
+            cross_execution_path=details.get("cross_execution_path"),
+            spectrum_type=spectrum_type,
+            insufficient_message="当前数据不足以生成有效互谱/协谱结果。",
+        )
+        return freq, values, details
+
+    def resolve_compare_fs(self, parsed: ParsedFileResult, ui_fs: float) -> float:
+        manual_override = not math.isclose(ui_fs, DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
+        if manual_override:
+            return ui_fs
+        if parsed.profile_name.startswith("YGAS_MODE1"):
+            return DEFAULT_FS
+        estimated = estimate_fs_from_timestamp(parsed.dataframe, parsed.timestamp_col) if parsed.timestamp_col else None
+        return estimated or ui_fs
+
+    def compute_alignment_tolerance_seconds(self, timestamps_a: pd.Series, timestamps_b: pd.Series) -> float:
+        intervals: list[float] = []
+        for timestamps in (timestamps_a, timestamps_b):
+            sorted_values = parse_mixed_timestamp_series(pd.Series(timestamps)).dropna().sort_values()
+            deltas = sorted_values.diff().dropna().dt.total_seconds()
+            deltas = deltas[deltas > 0]
+            if not deltas.empty:
+                intervals.append(float(deltas.median()))
+        if not intervals:
+            return 1.0
+        return max(min(intervals) * 0.6, 0.001)
+
+    def estimate_resample_interval_seconds(self, timestamps_a: pd.Series, timestamps_b: pd.Series) -> float:
+        intervals: list[float] = []
+        for timestamps in (timestamps_a, timestamps_b):
+            sorted_values = parse_mixed_timestamp_series(pd.Series(timestamps)).dropna().sort_values()
+            deltas = sorted_values.diff().dropna().dt.total_seconds()
+            deltas = deltas[deltas > 0]
+            if not deltas.empty:
+                intervals.append(float(deltas.median()))
+        if not intervals:
+            return 1.0
+        return max(max(intervals), 0.001)
+
+    def get_match_tolerance_seconds(self, default_value: float | None = None) -> float:
+        try:
+            tolerance = float(self.match_tolerance_var.get())
+        except (TypeError, ValueError):
+            if default_value is not None:
+                return default_value
+            raise ValueError("匹配容差必须是大于 0 的数字。")
+        if tolerance <= 0:
+            raise ValueError("匹配容差必须大于 0。")
+        return tolerance
+
+    def get_alignment_strategy(self, compare_mode: str) -> str:
+        if compare_mode == "时间序列对比":
+            return "原始时间轴叠加"
+        return self.alignment_strategy_var.get().strip() or "最近邻 + 容差"
+
+    def resolve_plot_style(self, compare_mode: str) -> str:
+        style = self.plot_style_var.get().strip() or "自动"
+        if style != "自动":
+            return style
+        if compare_mode == "时间序列对比":
+            return "连线图"
+        if compare_mode in {"散点一致性对比", "时间段内 PSD 对比", "协谱图", "正交谱图"}:
+            return "散点图"
+        return "连线图"
+
+    def resolve_plot_layout(self, compare_mode: str) -> str:
+        layout = self.plot_layout_var.get().strip() or "叠加同图"
+        if compare_mode in {"散点一致性对比", "差值时间序列", "比值时间序列", "互谱幅值", "协谱图", "正交谱图"}:
+            return "叠加同图"
+        return layout
+
+    def get_plot_style_tag(self, style: str) -> str:
+        return {
+            "连线图": "line",
+            "散点图": "scatter",
+            "连线+散点": "line_scatter",
+        }.get(style, "auto")
+
+    def get_plot_layout_tag(self, layout: str) -> str:
+        return {
+            "叠加同图": "overlay",
+            "上下分图": "split_vertical",
+            "左右分图": "split_horizontal",
+            "分别生成两张图": "separate",
+        }.get(layout, "overlay")
+
+    def clear_separate_plot_windows(self) -> None:
+        for window in self.separate_plot_windows:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self.separate_plot_windows = []
+        self.separate_plot_entries = []
+
+    def reset_plot_output_state(self) -> None:
+        self.clear_separate_plot_windows()
+        self.current_plot_style_label = ""
+        self.current_plot_layout_label = ""
+        self.current_lazy_aligned_frames = []
+
+    def apply_series_style(
+        self,
+        ax: Any,
+        x: Any,
+        y: Any,
+        *,
+        color: str,
+        label: str,
+        style: str,
+        linewidth: float = 1.2,
+        marker_size: int = 22,
+        alpha: float = 0.8,
+        marker: str | None = None,
+        line_style: str | None = None,
+        zorder: float | None = None,
+    ) -> None:
+        if style in {"连线图", "连线+散点"}:
+            ax.plot(
+                x,
+                y,
+                color=color,
+                linewidth=linewidth,
+                linestyle=line_style or "-",
+                label=label,
+                alpha=alpha,
+                zorder=zorder,
+            )
+        if style in {"散点图", "连线+散点"}:
+            ax.scatter(
+                x,
+                y,
+                color=color,
+                s=marker_size,
+                alpha=alpha,
+                edgecolors="none",
+                marker=marker or "o",
+                label=label if style == "散点图" else None,
+                zorder=zorder,
+            )
+
+    def build_spectrum_plot_mask(
+        self,
+        freq: np.ndarray,
+        values: np.ndarray,
+        spectrum_type: str,
+        *,
+        display_semantics: str | None = None,
+    ) -> np.ndarray:
+        return core.build_spectrum_plot_mask(
+            freq,
+            values,
+            spectrum_type,
+            display_semantics=display_semantics,
+        )
+
+    def configure_cross_spectrum_axis(
+        self,
+        ax: Any,
+        freq: np.ndarray,
+        values: np.ndarray,
+        spectrum_type: str,
+        *,
+        display_semantics: str | None = None,
+        title: str,
+        style: str,
+        label: str,
+        color: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        resolved_display_semantics = str(display_semantics or "").strip() or None
+        mask = self.build_spectrum_plot_mask(
+            freq,
+            values,
+            spectrum_type,
+            display_semantics=resolved_display_semantics,
+        )
+        freq_plot = freq[mask]
+        values_plot = values[mask]
+        if len(freq_plot) == 0:
+            if resolved_display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or spectrum_type == CROSS_SPECTRUM_MAGNITUDE:
+                raise ValueError("当前所选列波动过小或为恒定列，无法生成有效谱图。")
+            raise ValueError("当前数据不足以生成有效协谱图。")
+
+        ax.set_xscale("log")
+        if resolved_display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or spectrum_type == CROSS_SPECTRUM_MAGNITUDE:
+            ax.set_yscale("log")
+        else:
+            max_abs = float(np.nanmax(np.abs(values_plot))) if len(values_plot) else 0.0
+            linthresh = max(max_abs * 1e-3, 1e-12)
+            ax.set_yscale("symlog", linthresh=linthresh)
+            ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1.0, alpha=0.8)
+
+        self.apply_series_style(ax, freq_plot, values_plot, color=color, label=label, style=style)
+        self.add_selected_reference_slopes(
+            ax,
+            freq_plot,
+            values_plot,
+            is_psd=False,
+            spectrum_type=spectrum_type,
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(self.get_cross_spectrum_display_meta(spectrum_type)["ylabel"])
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(loc="upper right")
+        return freq_plot, values_plot
+
+    def build_time_series_axis(
+        self,
+        ax: Any,
+        x: Any,
+        y: Any,
+        *,
+        color: str,
+        label: str,
+        style: str,
+        title: str,
+    ) -> None:
+        self.apply_series_style(ax, x, y, color=color, label=label, style=style)
+        ax.set_title(title)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Value")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(loc="upper right")
+
+    def build_psd_axis(
+        self,
+        ax: Any,
+        freq: np.ndarray,
+        density: np.ndarray,
+        *,
+        color: str,
+        label: str,
+        style: str,
+        title: str,
+        add_reference: bool = False,
+    ) -> None:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        self.apply_series_style(ax, freq, density, color=color, label=label, style=style)
+        if add_reference:
+            self.add_selected_reference_slopes(ax, freq, density, is_psd=True)
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Density")
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(loc="upper right")
+
+    def build_cross_export_frame(
+        self,
+        freq: np.ndarray,
+        details: dict[str, Any],
+        mask: np.ndarray,
+        *,
+        prefix: str | None = None,
+    ) -> pd.DataFrame:
+        return core.build_cross_spectrum_export_frame(
+            freq,
+            details,
+            mask,
+            prefix=prefix,
+            target_context=details.get("target_spectral_context"),
+        )
+
+    def merge_frequency_frames(self, frames: list[pd.DataFrame]) -> pd.DataFrame:
+        merged: pd.DataFrame | None = None
+        for frame in frames:
+            if merged is None:
+                merged = frame.copy()
+            else:
+                merged = merged.merge(frame, on="frequency_hz", how="outer")
+        if merged is None:
+            return pd.DataFrame(columns=["frequency_hz"])
+        return merged.sort_values("frequency_hz").reset_index(drop=True)
+
+    def register_plot_style_layout(self, style: str, layout: str) -> None:
+        self.current_plot_style_label = style
+        self.current_plot_layout_label = layout
+
+    def show_separate_plot_windows(self, entries: list[dict[str, Any]]) -> None:
+        self.clear_separate_plot_windows()
+        self.separate_plot_entries = entries
+        for entry in entries:
+            window = tk.Toplevel(self.root)
+            window.title(entry["title"])
+            window.geometry("780x520")
+            icon_image = apply_window_icon(window)
+            if icon_image is not None:
+                window._icon_image_ref = icon_image
+            canvas = FigureCanvasTkAgg(entry["figure"], master=window)
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            canvas.draw()
+            try:
+                window.lift()
+            except tk.TclError:
+                pass
+            try:
+                window.focus_force()
+            except tk.TclError:
+                pass
+            self.separate_plot_windows.append(window)
+
+    def render_separate_window_summary(
+        self,
+        *,
+        mode_title: str,
+        device_a_summary: str,
+        device_b_summary: str,
+        window_count: int,
+    ) -> None:
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.axis("off")
+        ax.text(0.5, 0.80, mode_title, ha="center", va="center", fontsize=16, color="#234e70", weight="bold", transform=ax.transAxes)
+        ax.text(0.08, 0.60, f"设备A：{device_a_summary}", ha="left", va="center", fontsize=13, color="#1f2937", transform=ax.transAxes)
+        ax.text(0.08, 0.46, f"设备B：{device_b_summary}", ha="left", va="center", fontsize=13, color="#1f2937", transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.24,
+            f"已弹出独立图窗口：{window_count} 个\n可在独立窗口中查看、缩放和保存图片",
+            ha="center",
+            va="center",
+            fontsize=13,
+            color="#4f5d75",
+            transform=ax.transAxes,
+        )
+        self.figure.tight_layout()
+        self.refresh_canvas(title=mode_title)
+
+    def resolve_compare_time_range(
+        self,
+        txt_summary: dict[str, Any],
+        dat_summary: dict[str, Any],
+    ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        strategy = self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"
+        if strategy == "手动输入时间范围":
+            return self.resolve_time_range_inputs()
+        if strategy == "使用 dat 时间范围":
+            if txt_summary["start"] > dat_summary["start"] or txt_summary["end"] < dat_summary["end"]:
+                raise ValueError("txt 覆盖不了 dat 时间段，请先自动补齐 txt 覆盖范围或改用共同时间范围。")
+            return dat_summary["start"], dat_summary["end"]
+        if strategy == "最近10分钟":
+            return dat_summary["end"] - pd.Timedelta(minutes=10), dat_summary["end"]
+        if strategy == "最近30分钟":
+            return dat_summary["end"] - pd.Timedelta(minutes=30), dat_summary["end"]
+        if strategy == "最近1小时":
+            return dat_summary["end"] - pd.Timedelta(hours=1), dat_summary["end"]
+
+        common_start = max(txt_summary["start"], dat_summary["start"])
+        common_end = min(txt_summary["end"], dat_summary["end"])
+        if common_start > common_end:
+            raise ValueError(self.build_no_common_time_range_message(txt_summary, dat_summary))
+        return common_start, common_end
+
+    def build_no_common_time_range_message(
+        self,
+        txt_summary: dict[str, Any],
+        dat_summary: dict[str, Any],
+    ) -> str:
+        return (
+            "当前没有共同时间范围。\n\n"
+            f"设备A开始时间：{txt_summary['start']}\n"
+            f"设备A结束时间：{txt_summary['end']}\n"
+            f"设备B开始时间：{dat_summary['start']}\n"
+            f"设备B结束时间：{dat_summary['end']}\n"
+            "共同时间范围：空\n\n"
+            "建议：请选择覆盖该 dat 时间段的更多半小时 txt/log 文件。"
+        )
+
+    def resolve_compare_time_range_for_strategy(
+        self,
+        strategy: str,
+        start_raw: str,
+        end_raw: str,
+        txt_summary: dict[str, Any] | None,
+        dat_summary: dict[str, Any] | None,
+    ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        if strategy == "手动输入时间范围":
+            start_dt = self.parse_time_input(start_raw)
+            end_dt = self.parse_time_input(end_raw)
+            if start_dt is not None and end_dt is not None and start_dt > end_dt:
+                raise ValueError("开始时间不能晚于结束时间。")
+            return start_dt, end_dt
+
+        if dat_summary is None:
+            return self.parse_time_input(start_raw), self.parse_time_input(end_raw)
+
+        if strategy == "使用 dat 时间范围":
+            if txt_summary is not None and (txt_summary["start"] > dat_summary["start"] or txt_summary["end"] < dat_summary["end"]):
+                raise ValueError("txt 覆盖不了 dat 时间段，请先自动补齐 txt 覆盖范围或改用共同时间范围。")
+            return dat_summary["start"], dat_summary["end"]
+
+        if strategy == "最近10分钟":
+            return dat_summary["end"] - pd.Timedelta(minutes=10), dat_summary["end"]
+        if strategy == "最近30分钟":
+            return dat_summary["end"] - pd.Timedelta(minutes=30), dat_summary["end"]
+        if strategy == "最近1小时":
+            return dat_summary["end"] - pd.Timedelta(hours=1), dat_summary["end"]
+
+        if txt_summary is None:
+            return dat_summary["start"], dat_summary["end"]
+        common_start = max(txt_summary["start"], dat_summary["start"])
+        common_end = min(txt_summary["end"], dat_summary["end"])
+        if common_start > common_end:
+            raise ValueError(self.build_no_common_time_range_message(txt_summary, dat_summary))
+        return common_start, common_end
+
+    def resolve_target_time_range_for_strategy(
+        self,
+        strategy: str,
+        start_raw: str,
+        end_raw: str,
+        txt_summary: dict[str, Any] | None,
+        dat_summary: dict[str, Any] | None,
+    ) -> tuple[pd.Timestamp | None, pd.Timestamp | None, str]:
+        if strategy == "手动输入时间范围":
+            start_dt = self.parse_time_input(start_raw)
+            end_dt = self.parse_time_input(end_raw)
+            if start_dt is not None and end_dt is not None and start_dt > end_dt:
+                raise ValueError("开始时间不能晚于结束时间。")
+            return start_dt, end_dt, "手动时间范围"
+
+        if dat_summary is None:
+            return self.parse_time_input(start_raw), self.parse_time_input(end_raw), strategy
+
+        if strategy == "使用 dat 时间范围":
+            return pd.Timestamp(dat_summary["start"]), pd.Timestamp(dat_summary["end"]), "使用 dat 时间范围"
+
+        if strategy == "最近10分钟":
+            return pd.Timestamp(dat_summary["end"]) - pd.Timedelta(minutes=10), pd.Timestamp(dat_summary["end"]), "最近10分钟"
+        if strategy == "最近30分钟":
+            return pd.Timestamp(dat_summary["end"]) - pd.Timedelta(minutes=30), pd.Timestamp(dat_summary["end"]), "最近30分钟"
+        if strategy == "最近1小时":
+            return pd.Timestamp(dat_summary["end"]) - pd.Timedelta(hours=1), pd.Timestamp(dat_summary["end"]), "最近1小时"
+
+        if txt_summary is None:
+            return pd.Timestamp(dat_summary["start"]), pd.Timestamp(dat_summary["end"]), "使用 dat 时间范围"
+
+        common_start = max(pd.Timestamp(txt_summary["start"]), pd.Timestamp(dat_summary["start"]))
+        common_end = min(pd.Timestamp(txt_summary["end"]), pd.Timestamp(dat_summary["end"]))
+        if common_start > common_end:
+            raise ValueError(self.build_no_common_time_range_message(txt_summary, dat_summary))
+        return common_start, common_end, "使用 txt+dat 共同时间范围"
+
+    def build_comparison_column_candidates(
+        self,
+        parsed: ParsedFileResult,
+        single_value: str,
+        multi_values: list[str],
+    ) -> list[str]:
+        ordered: list[str] = []
+        for value in [single_value, *multi_values, *parsed.suggested_columns]:
+            text = str(value).strip()
+            if not text or text not in parsed.dataframe.columns or text in ordered:
+                continue
+            ordered.append(text)
+        return ordered
+
+    def prepare_comparison_side_frame(
+        self,
+        parsed: ParsedFileResult,
+        columns: list[str],
+        prefix: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        if parsed.timestamp_col is None or parsed.timestamp_col not in parsed.dataframe.columns:
+            raise ValueError("未识别到时间列，无法生成对比汇总表。")
+
+        filtered = filter_by_time_range(parsed.dataframe, parsed.timestamp_col, start_dt, end_dt)
+        if filtered.empty:
+            raise ValueError("当前时间范围内没有数据，无法生成对比汇总表。")
+
+        frame = pd.DataFrame({"时间戳": parse_mixed_timestamp_series(filtered[parsed.timestamp_col])})
+        actual_columns: list[str] = []
+        for column in columns:
+            if column not in filtered.columns:
+                continue
+            prefixed = f"{prefix}_{column}"
+            frame[prefixed] = pd.to_numeric(filtered[column], errors="coerce")
+            actual_columns.append(column)
+
+        frame = frame.dropna(subset=["时间戳"]).sort_values("时间戳").drop_duplicates("时间戳", keep="first").reset_index(drop=True)
+        if frame.empty:
+            raise ValueError("当前时间范围内没有有效时间戳，无法生成对比汇总表。")
+        return frame, actual_columns
+
+    def build_comparison_dataframe(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+        a_columns: list[str],
+        b_columns: list[str],
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        alignment_strategy: str,
+        tolerance_seconds: float,
+        target_context: dict[str, Any] | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        frame_a, actual_a_columns = self.prepare_comparison_side_frame(parsed_a, a_columns, "A", start_dt, end_dt)
+        frame_b, actual_b_columns = self.prepare_comparison_side_frame(parsed_b, b_columns, "B", start_dt, end_dt)
+
+        if alignment_strategy == "重采样后对齐":
+            interval_seconds = self.estimate_resample_interval_seconds(frame_a["时间戳"], frame_b["时间戳"])
+            interval_ms = max(int(round(interval_seconds * 1000.0)), 1)
+            rule = f"{interval_ms}ms"
+            resampled_a = (
+                frame_a.set_index("时间戳")
+                .sort_index()
+                .resample(rule)
+                .mean()
+                .interpolate(method="time")
+                .dropna(how="all")
+            )
+            resampled_b = (
+                frame_b.set_index("时间戳")
+                .sort_index()
+                .resample(rule)
+                .mean()
+                .interpolate(method="time")
+                .dropna(how="all")
+            )
+            comparison = resampled_a.join(resampled_b, how="inner").reset_index()
+            comparison["匹配时间差_s"] = 0.0
+        else:
+            frame_b_aligned = frame_b.rename(columns={"时间戳": "B_匹配时间戳"})
+            merge_kwargs: dict[str, Any] = {
+                "left_on": "时间戳",
+                "right_on": "B_匹配时间戳",
+                "direction": "nearest",
+            }
+            if alignment_strategy == "最近邻 + 容差":
+                merge_kwargs["tolerance"] = pd.to_timedelta(tolerance_seconds, unit="s")
+            comparison = pd.merge_asof(
+                frame_a.sort_values("时间戳"),
+                frame_b_aligned.sort_values("B_匹配时间戳"),
+                **merge_kwargs,
+            ).dropna(subset=["B_匹配时间戳"])
+            comparison["匹配时间差_s"] = (
+                (comparison["时间戳"] - comparison["B_匹配时间戳"]).abs().dt.total_seconds()
+            )
+
+        a_prefixed = [f"A_{column}" for column in actual_a_columns if f"A_{column}" in comparison.columns]
+        b_prefixed = [f"B_{column}" for column in actual_b_columns if f"B_{column}" in comparison.columns]
+        if a_prefixed:
+            comparison = comparison.loc[~comparison[a_prefixed].isna().all(axis=1)]
+        if b_prefixed:
+            comparison = comparison.loc[~comparison[b_prefixed].isna().all(axis=1)]
+        comparison = comparison.sort_values("时间戳").reset_index(drop=True)
+        if comparison.empty:
+            raise ValueError("时间对齐后没有可用数据，无法生成对比汇总表。")
+
+        start_text = pd.Timestamp(comparison["时间戳"].min()).strftime("%Y-%m-%d %H:%M:%S")
+        end_text = pd.Timestamp(comparison["时间戳"].max()).strftime("%Y-%m-%d %H:%M:%S")
+        metadata = {
+            "alignment_strategy": alignment_strategy,
+            "time_range_label": f"{start_text} ~ {end_text}",
+            "start": pd.Timestamp(comparison["时间戳"].min()),
+            "end": pd.Timestamp(comparison["时间戳"].max()),
+            "rows": int(len(comparison)),
+            "columns": int(len(comparison.columns)),
+            "a_columns": actual_a_columns,
+            "b_columns": actual_b_columns,
+        }
+        resolved_target_context = core.get_target_spectral_context(target_context)
+        if resolved_target_context is not None:
+            metadata.update(resolved_target_context)
+            metadata["target_spectral_context"] = resolved_target_context
+            ordered_columns: list[str] = ["时间戳"]
+            for column in [
+                str(resolved_target_context.get("summary_ygas_target_column") or resolved_target_context.get("summary_target_column") or ""),
+                str(resolved_target_context.get("summary_dat_target_column") or ""),
+                str(resolved_target_context.get("summary_reference_column") or ""),
+            ]:
+                if column and column in comparison.columns and column not in ordered_columns:
+                    ordered_columns.append(column)
+            for column in comparison.columns:
+                if column in {"时间戳", "B_匹配时间戳", "匹配时间差_s"} or column in ordered_columns:
+                    continue
+                ordered_columns.append(column)
+            for column in ["B_匹配时间戳", "匹配时间差_s"]:
+                if column in comparison.columns:
+                    ordered_columns.append(column)
+            comparison = comparison.loc[:, ordered_columns]
+        return comparison, metadata
+
+    def classify_comparison_analysis_frame(
+        self,
+        comparison_frame: pd.DataFrame,
+        *,
+        metadata: dict[str, Any] | None,
+        excluded_columns: set[str],
+    ) -> tuple[dict[str, np.ndarray], set[str], set[str]]:
+        target_context = core.get_target_spectral_context(metadata)
+        ordered_columns: list[str] = []
+        if target_context is not None:
+            for column in [
+                str(target_context.get("summary_ygas_target_column") or target_context.get("summary_target_column") or ""),
+                str(target_context.get("summary_dat_target_column") or ""),
+                str(target_context.get("summary_reference_column") or ""),
+            ]:
+                if column and column in comparison_frame.columns and column not in excluded_columns and column not in ordered_columns:
+                    ordered_columns.append(column)
+        for column in comparison_frame.columns:
+            if column in excluded_columns or column in ordered_columns:
+                continue
+            ordered_columns.append(column)
+
+        column_data: dict[str, np.ndarray] = {}
+        non_numeric_cols: set[str] = set()
+        unsuitable_spectrum_cols: set[str] = set()
+        for column in ordered_columns:
+            numeric = pd.to_numeric(comparison_frame[column], errors="coerce")
+            if int(numeric.notna().sum()) == 0:
+                non_numeric_cols.add(column)
+                continue
+            values = numeric.to_numpy(dtype=float)
+            column_data[column] = values
+            finite = np.isfinite(values)
+            if int(np.count_nonzero(finite)) < 2 or float(np.nanstd(values[finite])) <= 1e-12:
+                unsuitable_spectrum_cols.add(column)
+        return column_data, non_numeric_cols, unsuitable_spectrum_cols
+
+    def prepare_comparison_summary_payload(
+        self,
+        *,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        selected_paths: list[Path],
+        strategy: str,
+        start_raw: str,
+        end_raw: str,
+        alignment_strategy: str,
+        tolerance_seconds: float,
+        a_single: str,
+        b_single: str,
+        a_multi: list[str],
+        b_multi: list[str],
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        compare_payload = self.prepare_dual_compare_payload(
+            ygas_paths=ygas_paths,
+            dat_path=dat_path,
+            selected_paths=selected_paths,
+            compare_mode="时间序列对比",
+            start_dt=None,
+            end_dt=None,
+            reporter=reporter,
+        )
+        parsed_a = compare_payload["parsed_a"]
+        parsed_b = compare_payload["parsed_b"]
+        label_a = str(compare_payload["label_a"])
+        label_b = str(compare_payload["label_b"])
+        selection_meta = dict(compare_payload["selection_meta"])
+
+        actual_start, actual_end = self.resolve_compare_time_range_for_strategy(
+            strategy,
+            start_raw,
+            end_raw,
+            selection_meta.get("txt_summary"),
+            selection_meta.get("dat_summary"),
+        )
+
+        if reporter is not None:
+            reporter("正在时间对齐并生成对比汇总表…")
+
+        target_context = self.resolve_target_spectral_context_for_parsed(
+            parsed_a,
+            parsed_b,
+            spectrum_mode=self.compare_mode_var.get().strip() or None,
+            comparison_is_target_spectral=True,
+        )
+        a_columns = self.build_comparison_column_candidates(parsed_a, a_single, a_multi)
+        b_columns = self.build_comparison_column_candidates(parsed_b, b_single, b_multi)
+        if target_context is not None:
+            canonical_target = str(target_context.get("ygas_target_column") or target_context.get("target_column") or "")
+            canonical_reference = str(target_context["reference_column"])
+            canonical_dat_target = str(target_context.get("dat_target_column") or "")
+            a_columns = [canonical_target, *[column for column in a_columns if column != canonical_target]]
+            b_ordered = []
+            if canonical_dat_target:
+                b_ordered.append(canonical_dat_target)
+            b_ordered.append(canonical_reference)
+            b_columns = b_ordered + [column for column in b_columns if column not in b_ordered]
+        comparison_frame, comparison_metadata = self.build_comparison_dataframe(
+            parsed_a,
+            parsed_b,
+            a_columns,
+            b_columns,
+            actual_start,
+            actual_end,
+            alignment_strategy,
+            tolerance_seconds,
+            target_context=target_context,
+        )
+        comparison_metadata["label_a"] = label_a
+        comparison_metadata["label_b"] = label_b
+        comparison_metadata["txt_summary"] = selection_meta.get("txt_summary")
+        comparison_metadata["dat_summary"] = selection_meta.get("dat_summary")
+        return {
+            "comparison_frame": comparison_frame,
+            "comparison_metadata": comparison_metadata,
+            "parsed_a": parsed_a,
+            "parsed_b": parsed_b,
+            "label_a": label_a,
+            "label_b": label_b,
+        }
+
+    def generate_comparison_summary(self) -> None:
+        ygas_paths, dat_path, _other = self.classify_selected_compare_files()
+        try:
+            if dat_path is None:
+                raise ValueError("请先选择 1 个 dat 文件，再生成对比汇总表。")
+            if not ygas_paths:
+                raise ValueError("请先选择 1 个或多个 txt/log 文件作为设备A。")
+
+            selected_paths = self.get_selected_file_paths()
+            strategy = self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"
+            alignment_strategy = self.get_alignment_strategy("散点一致性对比")
+            tolerance_seconds = self.get_match_tolerance_seconds(default_value=0.2)
+            a_single = self.device_a_column_var.get().strip()
+            b_single = self.device_b_column_var.get().strip()
+            a_multi = self.get_listbox_selected_values(self.device_a_multi_listbox)
+            b_multi = self.get_listbox_selected_values(self.device_b_multi_listbox)
+
+            self.start_background_task(
+                status_text="正在生成对比汇总表…",
+                worker=lambda reporter: self.prepare_comparison_summary_payload(
+                    ygas_paths=ygas_paths,
+                    dat_path=dat_path,
+                    selected_paths=selected_paths,
+                    strategy=strategy,
+                    start_raw=self.time_start_var.get().strip(),
+                    end_raw=self.time_end_var.get().strip(),
+                    alignment_strategy=alignment_strategy,
+                    tolerance_seconds=tolerance_seconds,
+                    a_single=a_single,
+                    b_single=b_single,
+                    a_multi=a_multi,
+                    b_multi=b_multi,
+                    reporter=reporter,
+                ),
+                on_success=self.on_comparison_summary_ready,
+                error_title="生成对比汇总表",
+            )
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"生成对比汇总表失败：{message}")
+            self.update_diagnostic_info(layout="对比汇总表")
+            self.render_plot_message(message, level="warning")
+            messagebox.showerror("生成对比汇总表失败", message)
+
+    def on_comparison_summary_ready(self, payload: dict[str, Any]) -> None:
+        comparison_frame = payload["comparison_frame"].copy()
+        comparison_metadata = dict(payload["comparison_metadata"])
+        parsed_a = payload["parsed_a"]
+        parsed_b = payload["parsed_b"]
+        label_a = str(payload["label_a"])
+        label_b = str(payload["label_b"])
+
+        self.update_compare_column_values(self.device_a_combo, self.device_a_column_var, parsed_a.suggested_columns)
+        self.update_compare_column_values(self.device_b_combo, self.device_b_column_var, parsed_b.suggested_columns)
+        hit_a, hit_b, mapping_name = self.apply_element_mapping(parsed_a, parsed_b)
+        self.compare_file_info_var.set(
+            f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 映射={mapping_name}"
+        )
+        if self.mapping_mode_var.get() == "预设映射" and (hit_a is None or hit_b is None):
+            self.compare_file_info_var.set(
+                f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 预设“{mapping_name}”未完全命中"
+            )
+        self.update_compare_summaries(
+            comparison_metadata.get("txt_summary"),
+            comparison_metadata.get("dat_summary"),
+        )
+
+        comparison_metadata["mapping_name"] = mapping_name
+        self.current_comparison_frame = comparison_frame
+        self.current_comparison_metadata = comparison_metadata
+        self.preview_data = comparison_frame
+        self.current_data_source_kind = "comparison_preview"
+        self.current_data_source_label = "对比汇总表预览"
+        self.page_index = 0
+        self.current_layout_label = "对比汇总表"
+        self.update_table_view()
+        self.show_table_tab()
+
+        extra_items = [
+            f"设备A列数={len(comparison_metadata.get('a_columns', []))}",
+            f"设备B列数={len(comparison_metadata.get('b_columns', []))}",
+            f"当前要素映射={mapping_name}",
+        ]
+        target_context = core.get_target_spectral_context(comparison_metadata)
+        if target_context is not None:
+            extra_items.extend(
+                [
+                    f"reference_column={target_context.get('reference_column')}",
+                    f"ygas_target_column={target_context.get('ygas_target_column', target_context.get('target_column'))}",
+                    f"dat_target_column={target_context.get('dat_target_column')}",
+                    "canonical_cross_pairs="
+                    + " | ".join(str(item) for item in (target_context.get("canonical_cross_pairs") or [])),
+                ]
+            )
+        self.update_diagnostic_info(
+            layout="对比汇总表",
+            extra_items=extra_items,
+        )
+        self.status_var.set(
+            f"已生成对比汇总表：{len(comparison_frame)} 行，{len(comparison_frame.columns)} 列"
+        )
+
+    def use_comparison_summary_for_analysis(self) -> None:
+        if self.current_comparison_frame is None or self.current_comparison_frame.empty:
+            messagebox.showwarning("警告", "当前没有可用的对比汇总表，请先点击“生成对比汇总表”。")
+            return
+
+        comparison_frame = self.current_comparison_frame.copy()
+        excluded_columns = {"时间戳", "B_匹配时间戳", "匹配时间差_s"}
+        target_context = core.get_target_spectral_context(self.current_comparison_metadata)
+        self.raw_data = comparison_frame
+        self.preview_data = None
+        self.current_data_source_kind = "comparison_analysis"
+        self.current_data_source_label = "对比汇总表"
+        self.current_layout_label = "对比汇总表"
+        self.current_used_mode1_template = False
+        self.excluded_analysis_cols = excluded_columns
+        self.column_data, self.non_numeric_cols, self.unsuitable_spectrum_cols = self.classify_comparison_analysis_frame(
+            comparison_frame,
+            metadata=self.current_comparison_metadata,
+            excluded_columns=excluded_columns,
+        )
+        self.current_plot_kind = None
+        self.current_plot_columns = []
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_result_frame = None
+        self.page_index = 0
+        self.create_column_selector()
+        self.update_table_view()
+        if self.left_workflow_notebook is not None and self.single_analysis_tab is not None:
+            self.left_workflow_notebook.select(self.single_analysis_tab)
+        self.show_table_tab()
+        self.update_diagnostic_info(layout="对比汇总表")
+        self.status_var.set(
+            f"已将对比汇总表载入分析区：{len(comparison_frame)} 行，{len(comparison_frame.columns)} 列 | 下一步请勾选 1 列或 2 列进行分析"
+        )
+        if target_context is not None:
+            self.status_var.set(
+                "已载入目标频谱上下文汇总表：canonical pairs = "
+                + "；".join(str(item) for item in (target_context.get("canonical_cross_pairs") or []))
+            )
+
+    def export_comparison_summary(self) -> None:
+        if self.current_comparison_frame is None or self.current_comparison_frame.empty:
+            messagebox.showwarning("警告", "当前没有可导出的对比汇总表。")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="导出汇总表",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            initialfile=f"{self.build_comparison_base_name()}.csv",
+        )
+        if not path:
+            return
+
+        self.current_comparison_frame.to_csv(path, index=False, encoding="utf-8-sig")
+        self.status_var.set(f"对比汇总表已导出到：{path}")
+
+    def resolve_target_element_name(self) -> str:
+        element_name = self.element_preset_var.get().strip() or "CO2"
+        if element_name not in ELEMENT_PRESETS:
+            return "CO2"
+        return element_name
+
+    def select_target_element_column(
+        self,
+        parsed: ParsedFileResult,
+        *,
+        device_key: str,
+        target_element: str,
+    ) -> str | None:
+        return core.select_target_element_column(
+            parsed,
+            device_key=device_key,
+            target_element=target_element,
+        )
+        preset = ELEMENT_PRESETS.get(target_element, {})
+        candidates = list(preset.get(device_key, []))
+        for columns in (parsed.suggested_columns, parsed.available_columns):
+            match = self.select_first_matching_column(columns, candidates)
+            if match:
+                return match
+        return None
+
+    def build_target_source_hint(self, path: Path, default: str) -> str:
+        return core.build_target_source_hint(path, default)
+
+    def build_legacy_group_labels(
+        self,
+        *,
+        target_element: str,
+        window_start: pd.Timestamp,
+        ygas_path: Path,
+    ) -> dict[str, str]:
+        return core.build_legacy_group_labels(
+            target_element=target_element,
+            window_start=window_start,
+            ygas_path=ygas_path,
+        )
+
+    def get_legacy_target_series_style(
+        self,
+        group_index: int,
+        device_kind: str,
+        *,
+        spectrum_mode: str = core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+    ) -> dict[str, Any]:
+        marker = LEGACY_TARGET_MARKERS[group_index % len(LEGACY_TARGET_MARKERS)]
+        line_style = LEGACY_TARGET_LINESTYLES[group_index % len(LEGACY_TARGET_LINESTYLES)]
+        color_mode = self.legacy_target_color_mode_var.get().strip() or LEGACY_TARGET_COLOR_MODE_BY_DEVICE
+        custom_cross_color = None if spectrum_mode == core.LEGACY_TARGET_SPECTRUM_MODE_PSD else self.resolve_target_cross_series_color(device_kind, group_index)
+        if spectrum_mode == core.LEGACY_TARGET_SPECTRUM_MODE_PSD and color_mode == LEGACY_TARGET_COLOR_MODE_BY_DEVICE:
+            color = LEGACY_TARGET_DEVICE_COLORS["dat" if device_kind == "dat" else "ygas"]
+            return {
+                "color": color,
+                "alpha": 0.84 if device_kind == "dat" else 0.9,
+                "size": 20 if device_kind == "dat" else 24,
+                "zorder": 2 if device_kind == "dat" else 3,
+                "marker": marker,
+                "linestyle": line_style,
+            }
+
+        if custom_cross_color is not None:
+            return {
+                "color": custom_cross_color,
+                "alpha": 0.78 if device_kind == "cross_dat" else 0.86,
+                "size": 20 if device_kind == "cross_dat" else 24,
+                "zorder": 2 if device_kind == "cross_dat" else 3,
+                "marker": marker,
+                "linestyle": line_style,
+            }
+
+        pair = LEGACY_TARGET_COLOR_PAIRS[group_index % len(LEGACY_TARGET_COLOR_PAIRS)]
+        if device_kind in {"dat", "cross_dat"}:
+            return {
+                "color": pair["dat"],
+                "alpha": 0.78,
+                "size": 20,
+                "zorder": 2,
+                "marker": marker,
+                "linestyle": line_style,
+            }
+        if device_kind in {"cross", "cross_ygas"}:
+            return {
+                "color": pair["ygas"],
+                "alpha": 0.86,
+                "size": 24,
+                "zorder": 3,
+                "marker": marker,
+                "linestyle": line_style,
+            }
+        return {
+            "color": pair["ygas"],
+            "alpha": 0.88,
+            "size": 24,
+            "zorder": 3,
+            "marker": marker,
+            "linestyle": line_style,
+        }
+
+    def build_target_window_label(
+        self,
+        *,
+        device_kind: str,
+        target_element: str,
+        window_start: pd.Timestamp,
+        source_path: Path,
+    ) -> str:
+        labels = self.build_legacy_group_labels(
+            target_element=target_element,
+            window_start=window_start,
+            ygas_path=source_path,
+        )
+        return labels["ygas_label"] if device_kind == "ygas" else labels["dat_label"]
+
+    def build_target_window_series(
+        self,
+        parsed: ParsedFileResult,
+        value_column: str,
+        start_dt: pd.Timestamp,
+        end_dt: pd.Timestamp,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        frame, meta = core.build_target_window_series(parsed, value_column, start_dt, end_dt)
+        return frame.rename(columns={core.TIMESTAMP_COL: "时间戳", "value": "数值"}), meta
+
+    def build_target_group_key(self, source_path: Path, window_start: pd.Timestamp) -> str:
+        return core.build_target_group_key(source_path, window_start)
+
+    def normalize_hex_color(self, value: str) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if not text.startswith("#") and len(text) == 6:
+            text = f"#{text}"
+        if HEX_COLOR_PATTERN.fullmatch(text):
+            return text.lower()
+        return None
+
+    def choose_target_cross_color(self, device_kind: str) -> None:
+        if device_kind == "cross_dat":
+            variable = self.target_cross_dat_color_var
+            title = "选择 dat 协谱颜色"
+            fallback = LEGACY_TARGET_COLOR_PAIRS[0]["dat"]
+        else:
+            variable = self.target_cross_ygas_color_var
+            title = "选择 ygas 协谱颜色"
+            fallback = LEGACY_TARGET_COLOR_PAIRS[0]["ygas"]
+        current = self.normalize_hex_color(variable.get()) or fallback
+        _rgb, hex_color = colorchooser.askcolor(color=current, title=title)
+        if hex_color:
+            variable.set(str(hex_color).lower())
+
+    def resolve_target_cross_series_color(self, device_kind: str, group_index: int) -> str | None:
+        if device_kind in {"cross", "cross_ygas"}:
+            custom = self.normalize_hex_color(self.target_cross_ygas_color_var.get())
+            if custom:
+                return custom
+            return LEGACY_TARGET_COLOR_PAIRS[group_index % len(LEGACY_TARGET_COLOR_PAIRS)]["ygas"]
+        if device_kind == "cross_dat":
+            custom = self.normalize_hex_color(self.target_cross_dat_color_var.get())
+            if custom:
+                return custom
+            return LEGACY_TARGET_COLOR_PAIRS[group_index % len(LEGACY_TARGET_COLOR_PAIRS)]["dat"]
+        return None
+
+    def evaluate_legacy_target_group_quality(
+        self,
+        group_payload: dict[str, Any],
+        *,
+        device_reference: dict[str, dict[str, float | None]],
+        requested_nsegment: int,
+        forced_include_keys: set[str],
+    ) -> dict[str, Any]:
+        return core.evaluate_legacy_target_group_quality(
+            group_payload,
+            device_reference=device_reference,
+            requested_nsegment=requested_nsegment,
+            forced_include_keys=forced_include_keys,
+        )
+
+    def evaluate_target_group_quality(
+        self,
+        group_payload: dict[str, Any],
+        *,
+        device_reference: dict[str, dict[str, float | None]],
+        requested_nsegment: int,
+        forced_include_keys: set[str],
+    ) -> dict[str, Any]:
+        return self.evaluate_legacy_target_group_quality(
+            group_payload,
+            device_reference=device_reference,
+            requested_nsegment=requested_nsegment,
+            forced_include_keys=forced_include_keys,
+        )
+
+    def build_legacy_target_group_preview_frame(self, group_records: list[dict[str, Any]]) -> pd.DataFrame:
+        return core.build_legacy_target_group_preview_frame(group_records)
+
+    def build_target_group_preview_frame(self, group_records: list[dict[str, Any]]) -> pd.DataFrame:
+        return self.build_legacy_target_group_preview_frame(group_records)
+
+    def build_target_group_qc_export_frame(self, group_records: list[dict[str, Any]]) -> pd.DataFrame:
+        return core.build_legacy_target_group_qc_export_frame(group_records)
+
+    def prepare_legacy_target_payload_core(
+        self,
+        *,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        fs_ui: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        time_range_strategy: str,
+        start_raw: str,
+        end_raw: str,
+        grouping_mode: str,
+        legacy_target_spectrum_mode: str = core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+        use_requested_nsegment: bool = False,
+        forced_include_group_keys: set[str] | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        target_element = self.resolve_target_element_name()
+        ygas_required_columns = self.build_target_required_columns(
+            target_element=target_element,
+            device_kind="ygas",
+        )
+        dat_required_columns = self.build_target_required_columns(
+            target_element=target_element,
+            device_kind="dat",
+            include_reference=legacy_target_spectrum_mode != core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+        )
+
+        def _resolve_fs(
+            parsed: ParsedFileResult,
+            frame: pd.DataFrame,
+            ui_fs: float,
+            device_kind: str,
+        ) -> float:
+            manual_override = not math.isclose(ui_fs, DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
+            if manual_override:
+                return float(ui_fs)
+            estimated = core.estimate_fs_from_timestamp(frame, core.TIMESTAMP_COL)
+            if estimated:
+                return float(estimated)
+            if device_kind == "dat":
+                return float(self.resolve_compare_fs(parsed, ui_fs))
+            return float(DEFAULT_FS)
+
+        return core.prepare_legacy_target_payload(
+            ygas_paths=ygas_paths,
+            dat_path=dat_path,
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            target_element=target_element,
+            time_range_strategy=time_range_strategy,
+            start_raw=start_raw,
+            end_raw=end_raw,
+            grouping_mode=grouping_mode,
+            legacy_target_spectrum_mode=legacy_target_spectrum_mode,
+            parse_ygas=lambda path: self.parse_target_profiled_file(
+                path,
+                device_kind="ygas",
+                required_columns=ygas_required_columns,
+            ),
+            parse_dat=lambda path: self.parse_target_profiled_file(
+                path,
+                device_kind="dat",
+                required_columns=dat_required_columns,
+            ),
+            resolve_time_range=self.resolve_target_time_range_for_strategy,
+            resolve_fs=_resolve_fs,
+            use_requested_nsegment=use_requested_nsegment,
+            forced_include_group_keys=forced_include_group_keys,
+            reporter=reporter,
+        )
+
+    def prepare_legacy_target_payload(
+        self,
+        *,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        fs_ui: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        time_range_strategy: str,
+        start_raw: str,
+        end_raw: str,
+        grouping_mode: str,
+        legacy_target_spectrum_mode: str = core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+        use_requested_nsegment: bool = False,
+        forced_include_group_keys: set[str] | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        return self.prepare_legacy_target_payload_core(
+            ygas_paths=ygas_paths,
+            dat_path=dat_path,
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            time_range_strategy=time_range_strategy,
+            start_raw=start_raw,
+            end_raw=end_raw,
+            grouping_mode=grouping_mode,
+            legacy_target_spectrum_mode=legacy_target_spectrum_mode,
+            use_requested_nsegment=use_requested_nsegment,
+            forced_include_group_keys=forced_include_group_keys,
+            reporter=reporter,
+        )
+
+    def prepare_target_spectrum_payload(
+        self,
+        *,
+        ygas_paths: list[Path],
+        dat_path: Path | None,
+        fs_ui: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        time_range_strategy: str,
+        start_raw: str,
+        end_raw: str,
+        grouping_mode: str,
+        legacy_target_spectrum_mode: str = core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+        use_requested_nsegment: bool = False,
+        forced_include_group_keys: set[str] | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        return self.prepare_legacy_target_payload_core(
+            ygas_paths=ygas_paths,
+            dat_path=dat_path,
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            time_range_strategy=time_range_strategy,
+            start_raw=start_raw,
+            end_raw=end_raw,
+            grouping_mode=grouping_mode,
+            legacy_target_spectrum_mode=legacy_target_spectrum_mode,
+            use_requested_nsegment=use_requested_nsegment,
+            forced_include_group_keys=forced_include_group_keys,
+            reporter=reporter,
+        )
+
+    def generate_legacy_compatible_target_plot(self) -> None:
+        ygas_paths, dat_path, other_paths = self.classify_selected_compare_files()
+        try:
+            self.ensure_legacy_target_selection_valid(ygas_paths, dat_path, other_paths)
+
+            fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
+            use_requested_nsegment = bool(self.legacy_target_use_analysis_params_var.get())
+            legacy_target_spectrum_mode = (
+                self.legacy_target_spectrum_mode_var.get().strip() or core.LEGACY_TARGET_SPECTRUM_MODE_PSD
+            )
+            forced_include_group_keys = self.get_selected_target_group_overrides()
+            time_range_strategy = self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"
+            grouping_mode = "每个 ygas 文件视为一个组"
+
+            self.current_target_plot_metadata = {}
+            self.current_target_group_preview_frame = None
+            self.current_result_frame = None
+            self.current_result_freq = None
+            self.current_result_values = None
+            self.current_compare_files = []
+            self.current_plot_kind = None
+            self.current_plot_columns = []
+            self.update_target_group_qc_panel(None)
+            self.reset_plot_output_state()
+            self.render_plot_message("正在生成目标谱图...", level="info")
+
+            self.start_background_task(
+                status_text="正在生成目标谱图…",
+                worker=lambda reporter: self.prepare_legacy_target_payload_core(
+                    ygas_paths=ygas_paths,
+                    dat_path=dat_path,
+                    fs_ui=fs_ui,
+                    requested_nsegment=requested_nsegment,
+                    overlap_ratio=overlap_ratio,
+                    time_range_strategy=time_range_strategy,
+                    start_raw=self.time_start_var.get().strip(),
+                    end_raw=self.time_end_var.get().strip(),
+                    grouping_mode=grouping_mode,
+                    legacy_target_spectrum_mode=legacy_target_spectrum_mode,
+                    use_requested_nsegment=use_requested_nsegment,
+                    forced_include_group_keys=forced_include_group_keys,
+                    reporter=reporter,
+                ),
+                on_success=self.on_legacy_target_plot_ready,
+                error_title="目标谱图",
+            )
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"目标谱图生成失败：{message}")
+            self.update_diagnostic_info(layout="目标谱图")
+            self.render_plot_message(message, level="warning")
+            messagebox.showerror("目标谱图生成失败", message)
+
+    def generate_target_spectrum_plot(self) -> None:
+        self.generate_legacy_compatible_target_plot()
+
+    def on_legacy_target_plot_ready(self, payload: dict[str, Any]) -> None:
+        self.on_target_spectrum_ready(payload)
+
+    def on_target_spectrum_ready(self, payload: dict[str, Any]) -> None:
+        target_metadata = dict(payload["target_metadata"])
+        self.current_data_source_kind = "legacy_target_spectrum"
+        self.current_data_source_label = str(target_metadata.get("mode_label", "目标谱图"))
+        self.current_target_plot_metadata = target_metadata
+        preview_frame = target_metadata.get("group_preview_frame")
+        self.current_target_group_preview_frame = preview_frame.copy() if isinstance(preview_frame, pd.DataFrame) else None
+        self.update_target_group_qc_panel(self.current_target_plot_metadata)
+        self.plot_legacy_compatible_target_results(
+            str(payload["target_element"]),
+            list(payload["series_results"]),
+            list(target_metadata.get("skipped_windows", [])),
+        )
+
+    def plot_legacy_compatible_target_results(
+        self,
+        target_element: str,
+        series_results: list[dict[str, Any]],
+        skipped_windows: list[str],
+    ) -> None:
+        self.plot_target_spectrum_results(target_element, series_results, skipped_windows)
+
+    def plot_target_spectrum_results(
+        self,
+        target_element: str,
+        series_results: list[dict[str, Any]],
+        skipped_windows: list[str],
+    ) -> None:
+        target_metadata = dict(self.current_target_plot_metadata)
+        spectrum_mode = str(target_metadata.get("spectrum_mode", core.LEGACY_TARGET_SPECTRUM_MODE_PSD))
+        spectrum_type = core.resolve_legacy_target_cross_spectrum_type(spectrum_mode)
+        is_psd_mode = spectrum_type is None
+        if not series_results:
+            raise ValueError(f"没有可用于绘制“{target_element}”目标谱图的有效系列。")
+        display_semantics = (
+            None
+            if is_psd_mode
+            else str(target_metadata.get("display_semantics") or series_results[0].get("details", {}).get("display_semantics") or "")
+        )
+
+        if is_psd_mode:
+            series_results = sorted(
+                series_results,
+                key=lambda item: (0 if str(item.get("device_kind")) == "ygas" else 1, int(item.get("group_index", 0))),
+            )
+            plot_style_context = "时间段内 PSD 对比"
+        else:
+            role_order = {"cross_ygas": 0, "cross_dat": 1, "cross": 2}
+            series_results = sorted(
+                series_results,
+                key=lambda item: (
+                    int(item.get("group_index", 0)),
+                    role_order.get(str(item.get("device_kind")), 99),
+                ),
+            )
+            if spectrum_type == CROSS_SPECTRUM_REAL:
+                plot_style_context = "协谱图"
+            elif spectrum_type == CROSS_SPECTRUM_IMAG:
+                plot_style_context = "正交谱图"
+            else:
+                plot_style_context = "互谱幅值"
+        plot_style = self.resolve_plot_style(plot_style_context)
+        color_mode = self.legacy_target_color_mode_var.get().strip() or LEGACY_TARGET_COLOR_MODE_BY_DEVICE
+
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.set_xscale("log")
+
+        combined_freq: list[np.ndarray] = []
+        combined_values: list[np.ndarray] = []
+        point_summaries: list[str] = []
+        aligned_frames: list[pd.DataFrame] = []
+
+        for index, item in enumerate(series_results):
+            group_index = int(item.get("group_index", index))
+            device_kind = str(item.get("device_kind", "ygas"))
+            style = self.get_legacy_target_series_style(
+                group_index,
+                device_kind,
+                spectrum_mode=spectrum_mode,
+            )
+            y_values = np.asarray(item.get("density", item.get("values")), dtype=float)
+            freq_values = np.asarray(item["freq"], dtype=float)
+            mask_type = CROSS_SPECTRUM_MAGNITUDE if is_psd_mode else spectrum_type
+            item_display_semantics = None if is_psd_mode else str(item.get("details", {}).get("display_semantics") or display_semantics or "")
+            mask = self.build_spectrum_plot_mask(
+                freq_values,
+                y_values,
+                mask_type,
+                display_semantics=item_display_semantics or None,
+            )
+            freq_plot = freq_values[mask]
+            values_plot = y_values[mask]
+            if len(freq_plot) == 0:
+                continue
+
+            self.apply_series_style(
+                ax,
+                freq_plot,
+                values_plot,
+                color=str(style["color"]),
+                label=str(item["label"]),
+                style=plot_style,
+                linewidth=1.5,
+                marker_size=int(style["size"]),
+                alpha=float(style["alpha"]),
+                marker=str(style["marker"]),
+                line_style=str(style["linestyle"]),
+                zorder=float(style["zorder"]),
+            )
+            combined_freq.append(freq_plot)
+            combined_values.append(values_plot)
+            if is_psd_mode:
+                point_summaries.append(
+                    f"{item['label']}={item['valid_points']}点/{item['valid_freq_points']}频点"
+                )
+            else:
+                matched_count = item.get("details", {}).get("matched_count", item.get("valid_points"))
+                point_summaries.append(
+                    f"{item['label']}=matched {matched_count}/{item['valid_freq_points']}频点"
+                )
+                aligned_frame = item.get("aligned_frame")
+                if isinstance(aligned_frame, pd.DataFrame) and not aligned_frame.empty:
+                    aligned_frames.append(aligned_frame)
+
+        if not combined_freq:
+            raise ValueError(f"没有可用于绘制“{target_element}”目标谱图的有效频点。")
+
+        all_freq = np.concatenate(combined_freq)
+        all_values = np.concatenate(combined_values)
+        if is_psd_mode or display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or spectrum_type == CROSS_SPECTRUM_MAGNITUDE:
+            ax.set_yscale("log")
+        else:
+            max_abs = float(np.nanmax(np.abs(all_values))) if len(all_values) else 0.0
+            linthresh = max(max_abs * 1e-3, 1e-12)
+            ax.set_yscale("symlog", linthresh=linthresh)
+            ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1.0, alpha=0.8, zorder=1)
+
+        if is_psd_mode:
+            self.add_selected_reference_slopes(
+                ax,
+                all_freq,
+                all_values,
+                is_psd=True,
+                use_fixed_power_law=True,
+                amplitude_at_1hz=1.0,
+            )
+            title = build_legacy_target_plot_title(target_element)
+            ylabel = "Density"
+        else:
+            display_meta = self.get_cross_spectrum_display_meta(spectrum_type)
+            reference_label = str(target_metadata.get("cross_reference_column") or "Uz")
+            title = f"{display_meta['title_prefix']}：{reference_label} vs {target_element}"
+            ylabel = display_meta["ylabel"]
+            self.add_selected_reference_slopes(
+                ax,
+                all_freq,
+                all_values,
+                is_psd=False,
+                spectrum_type=spectrum_type,
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            ax.legend(handles, labels, loc="upper right")
+        self.figure.tight_layout()
+        self.register_plot_style_layout(plot_style, "目标谱图叠加")
+        self.refresh_canvas(title=title)
+
+        self.current_plot_kind = "target_spectrum"
+        if is_psd_mode:
+            self.current_plot_columns = [target_element]
+        else:
+            self.current_plot_columns = [
+                str(target_metadata.get("reference_column") or target_metadata.get("cross_reference_column") or "Uz"),
+                str(target_element),
+            ]
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_result_frame = self.build_overlay_export_frame(series_results)
+        self.current_aligned_frame = None
+        if aligned_frames:
+            self.current_target_plot_metadata["aligned_frames"] = aligned_frames
+        else:
+            self.current_target_plot_metadata.pop("aligned_frames", None)
+        self.current_aligned_metadata = {
+            "spectrum_mode": spectrum_mode,
+            "alignment_strategy": target_metadata.get("alignment_strategy"),
+        }
+        if display_semantics:
+            self.current_aligned_metadata["display_semantics"] = display_semantics
+        if not is_psd_mode:
+            self.current_aligned_metadata.update(
+                {
+                    "reference_column": str(target_metadata.get("reference_column") or target_metadata.get("cross_reference_column") or "Uz"),
+                    "ygas_target_column": str(target_metadata.get("ygas_target_column") or ""),
+                    "dat_target_column": str(target_metadata.get("dat_target_column") or ""),
+                    "canonical_cross_pairs": " | ".join(str(item) for item in (target_metadata.get("canonical_cross_pairs") or [])),
+                    "generated_cross_series_count": int(target_metadata.get("generated_cross_series_count", len(series_results))),
+                    "generated_cross_series_roles": " | ".join(
+                        str(item)
+                        for item in (target_metadata.get("generated_cross_series_roles") or [])
+                        if str(item).strip()
+                    ),
+                }
+            )
+        self.current_compare_files = [str(item["label"]) for item in series_results]
+
+        first_details = dict(series_results[0]["details"])
+        mode_label = str(target_metadata.get("mode_label", "目标谱图"))
+        group_records = list(target_metadata.get("group_records", []))
+        kept_group_count = int(
+            target_metadata.get(
+                "kept_group_count",
+                sum(1 for record in group_records if record.get("status") in {"保留", "手动保留"}),
+            )
+        )
+        skipped_group_count = int(
+            target_metadata.get(
+                "skipped_group_count",
+                sum(1 for record in group_records if record.get("status") == "跳过"),
+            )
+        )
+        total_group_count = int(target_metadata.get("total_group_count", len(group_records)))
+        expected_series_count = int(target_metadata.get("expected_series_count", len(series_results)))
+        actual_series_count = int(target_metadata.get("actual_series_count", len(series_results)))
+        requested_nsegment_ui = int(
+            target_metadata.get(
+                "requested_nsegment",
+                first_details.get("requested_nsegment", first_details.get("nsegment", 0)),
+            )
+        )
+        effective_nsegment_values = [
+            int(value)
+            for value in target_metadata.get("effective_nsegment_values", [])
+            if value is not None
+        ]
+        positive_freq_points_min = target_metadata.get("positive_freq_points_min")
+        positive_freq_points_max = target_metadata.get("positive_freq_points_max")
+        first_positive_freq_min = target_metadata.get("first_positive_freq_min")
+        first_positive_freq_max = target_metadata.get("first_positive_freq_max")
+        kept_group_summaries: list[str] = []
+        skipped_group_summaries = [
+            f"{record.get('group_label', record.get('group_key', record.get('window_label', '未知组')))}({record.get('reason', '未知原因')})"
+            for record in group_records
+            if record.get("status") == "跳过"
+        ]
+
+        for record in group_records:
+            group_name = record.get("group_label", record.get("group_key", record.get("window_label", "未知组")))
+            if record.get("status") not in {"保留", "手动保留"}:
+                continue
+            if is_psd_mode:
+                kept_group_summaries.append(
+                    f"{group_name}: "
+                    f"ygas={record.get('ygas_effective_nsegment')}/{record.get('ygas_positive_freq_points')}频点, "
+                    f"dat={record.get('dat_effective_nsegment')}/{record.get('dat_positive_freq_points')}频点"
+                )
+            else:
+                kept_group_summaries.append(
+                    f"{group_name}: "
+                    f"matched={record.get('matched_count')} "
+                    f"effective_nsegment={record.get('cross_effective_nsegment')} "
+                    f"positive_freq_points={record.get('cross_positive_freq_points')}"
+                )
+
+        extra_items = [
+            f"当前模式={mode_label}",
+            f"spectrum_mode={spectrum_mode}",
+            f"plot_style={plot_style}",
+            f"color_mode={color_mode}",
+            f"当前目标要素={target_element}",
+            f"总组数={total_group_count}",
+            f"保留组数={kept_group_count}",
+            f"跳过组数={skipped_group_count}",
+            f"预期系列数={expected_series_count}",
+            f"实际系列数={actual_series_count}",
+            f"目标谱图沿用当前分析参数={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
+            f"requested_nsegment={requested_nsegment_ui}",
+            f"系列有效点数={'；'.join(point_summaries)}",
+        ]
+        if effective_nsegment_values:
+            extra_items.append(f"effective_nsegment={'/'.join(str(value) for value in effective_nsegment_values)}")
+        if positive_freq_points_min is not None and positive_freq_points_max is not None:
+            extra_items.append(f"positive_freq_points范围={positive_freq_points_min} ~ {positive_freq_points_max}")
+        if first_positive_freq_min is not None and first_positive_freq_max is not None:
+            extra_items.append(
+                f"first_positive_freq范围={float(first_positive_freq_min):.12g} ~ {float(first_positive_freq_max):.12g} Hz"
+            )
+        extra_items.extend(
+            self.build_reference_slope_diagnostic_items(
+                is_psd=is_psd_mode,
+                spectrum_type=None if is_psd_mode else spectrum_type,
+            )
+        )
+        if is_psd_mode:
+            extra_items.extend(
+                [
+                    f"psd_kernel={target_metadata.get('legacy_psd_kernel', first_details.get('psd_kernel'))}",
+                    f"reference_line_mode={target_metadata.get('reference_line_mode', 'fixed_f_pow_-2_3')}",
+                    f"reference_line_at_1hz={target_metadata.get('reference_line_at_1hz', 1.0)}",
+                ]
+            )
+        else:
+            matched_count_min = target_metadata.get("matched_count_min")
+            matched_count_max = target_metadata.get("matched_count_max")
+            tolerance_seconds_min = target_metadata.get("tolerance_seconds_min")
+            tolerance_seconds_max = target_metadata.get("tolerance_seconds_max")
+            extra_items.extend(
+                [
+                    f"cross_execution_path={target_metadata.get('cross_execution_path', first_details.get('cross_execution_path', 'target_spectral_canonical'))}",
+                    f"cross_implementation_id={target_metadata.get('cross_implementation_id', first_details.get('cross_implementation_id'))}",
+                    f"cross_implementation_label={target_metadata.get('cross_implementation_label', first_details.get('cross_implementation_label'))}",
+                    f"alignment_strategy={target_metadata.get('alignment_strategy', '最近邻 + 容差')}",
+                    f"cross_kernel={target_metadata.get('cross_kernel', first_details.get('cross_kernel'))}",
+                    f"cross_reference_column={target_metadata.get('cross_reference_column', first_details.get('cross_reference_column', 'Uz'))}",
+                    f"reference_column={target_metadata.get('reference_column', target_metadata.get('cross_reference_column', first_details.get('reference_column', 'Uz')))}",
+                    f"ygas_target_column={target_metadata.get('ygas_target_column', first_details.get('ygas_target_column'))}",
+                    f"dat_target_column={target_metadata.get('dat_target_column', first_details.get('dat_target_column'))}",
+                    "canonical_cross_pairs="
+                    + " | ".join(str(item) for item in (target_metadata.get("canonical_cross_pairs") or [])),
+                    f"generated_cross_series_count={target_metadata.get('generated_cross_series_count', len(series_results))}",
+                    "generated_cross_series_roles="
+                    + " | ".join(
+                        str(item)
+                        for item in (target_metadata.get("generated_cross_series_roles") or [])
+                        if str(item).strip()
+                    ),
+                    f"display_semantics={target_metadata.get('display_semantics', first_details.get('display_semantics'))}",
+                    f"display_value_source={target_metadata.get('display_value_source', first_details.get('display_value_source'))}",
+                ]
+            )
+            if spectrum_type in CROSS_SPECTRUM_OPTIONS:
+                for key in ("window", "detrend", "scaling", "return_onesided", "average"):
+                    value = target_metadata.get(key, first_details.get(key))
+                    if value is not None:
+                        extra_items.append(f"{key}={value}")
+            if matched_count_min is not None and matched_count_max is not None:
+                extra_items.append(f"matched_count范围={matched_count_min} ~ {matched_count_max}")
+            if tolerance_seconds_min is not None and tolerance_seconds_max is not None:
+                extra_items.append(
+                    f"tolerance_seconds范围={float(tolerance_seconds_min):.6g} ~ {float(tolerance_seconds_max):.6g}"
+                )
+        if kept_group_summaries:
+            extra_items.append(
+                f"保留组摘要={'；'.join(kept_group_summaries[:4])}{' 等' if len(kept_group_summaries) > 4 else ''}"
+            )
+        if actual_series_count != expected_series_count:
+            extra_items.append("某些组已被自动跳过，请查看组级质控列表。")
+        if skipped_group_summaries:
+            extra_items.append(
+                f"跳过原因列表={'；'.join(skipped_group_summaries[:4])}{' 等' if len(skipped_group_summaries) > 4 else ''}"
+            )
+        elif skipped_windows:
+            extra_items.append(
+                f"被跳过组={'；'.join(skipped_windows[:4])}{' 等' if len(skipped_windows) > 4 else ''}"
+            )
+
+        self.update_diagnostic_info(
+            layout=mode_label,
+            analysis_label=target_element,
+            fs=float(first_details.get("effective_fs", first_details.get("fs", 0.0))),
+            nsegment=int(first_details.get("effective_nsegment", first_details["nsegment"])),
+            overlap_ratio=float(first_details["overlap_ratio"]),
+            nperseg=int(first_details["nperseg"]),
+            noverlap=int(first_details["noverlap"]),
+            batch_success=kept_group_count,
+            batch_skips=skipped_group_count,
+            extra_items=extra_items,
+        )
+        status_text = f"{mode_label}已生成：保留 {kept_group_count}/{total_group_count} 组 | 输出 {actual_series_count} 条系列"
+        if skipped_group_count:
+            status_text += f" | 已自动跳过 {skipped_group_count} 组"
+        self.status_var.set(status_text)
+
+    def prepare_compare_series(
+        self,
+        parsed: ParsedFileResult,
+        value_column: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        prefix: str,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        if parsed.timestamp_col is None or parsed.timestamp_col not in parsed.dataframe.columns:
+            raise ValueError("未识别时间列，无法进行双设备时间对齐。")
+        if value_column not in parsed.dataframe.columns:
+            raise ValueError(f"目标列不存在：{value_column}")
+
+        original_count = len(parsed.dataframe)
+        filtered = filter_by_time_range(parsed.dataframe, parsed.timestamp_col, start_dt, end_dt)
+        time_filtered_count = len(filtered)
+        if filtered.empty:
+            raise ValueError("时间段没有数据，请调整开始时间和结束时间。")
+
+        value_name = f"{prefix}_{value_column}"
+        prepared = pd.DataFrame(
+            {
+                "时间戳": parse_mixed_timestamp_series(filtered[parsed.timestamp_col]),
+                value_name: pd.to_numeric(filtered[value_column], errors="coerce"),
+            }
+        ).dropna()
+        prepared = prepared.sort_values("时间戳").drop_duplicates("时间戳", keep="first")
+        if len(prepared) < 2:
+            raise ValueError("时间段内有效数据点不足，无法继续分析。")
+
+        return prepared, {
+            "value_name": value_name,
+            "original_count": original_count,
+            "time_filtered_count": time_filtered_count,
+            "valid_count": len(prepared),
+            "source_row_count": int(parsed.source_row_count or original_count),
+            "timestamp_valid_count": int(parsed.timestamp_valid_count),
+            "timestamp_valid_ratio": float(parsed.timestamp_valid_ratio),
+            "timestamp_warning": parsed.timestamp_warning,
+            "actual_start": pd.Timestamp(prepared["时间戳"].min()),
+            "actual_end": pd.Timestamp(prepared["时间戳"].max()),
+        }
+
+    def align_compare_frames(
+        self,
+        parsed_a: ParsedFileResult,
+        col_a: str,
+        parsed_b: ParsedFileResult,
+        col_b: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        tolerance_seconds: float | None = None,
+        alignment_strategy: str | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        series_a, meta_a = self.prepare_compare_series(parsed_a, col_a, start_dt, end_dt, "设备A")
+        series_b, meta_b = self.prepare_compare_series(parsed_b, col_b, start_dt, end_dt, "设备B")
+
+        alignment_strategy = alignment_strategy or "最近邻 + 容差"
+        if alignment_strategy == "重采样后对齐":
+            interval_seconds = self.estimate_resample_interval_seconds(series_a["时间戳"], series_b["时间戳"])
+            interval_ms = max(int(round(interval_seconds * 1000.0)), 1)
+            rule = f"{interval_ms}ms"
+            a_name = meta_a["value_name"]
+            b_name = meta_b["value_name"]
+            resampled_a = (
+                series_a.set_index("时间戳")[[a_name]]
+                .sort_index()
+                .resample(rule)
+                .mean()
+                .interpolate(method="time")
+                .dropna()
+            )
+            resampled_b = (
+                series_b.set_index("时间戳")[[b_name]]
+                .sort_index()
+                .resample(rule)
+                .mean()
+                .interpolate(method="time")
+                .dropna()
+            )
+            aligned = resampled_a.join(resampled_b, how="inner").reset_index()
+            tolerance_seconds = interval_seconds
+        else:
+            if tolerance_seconds is None:
+                tolerance_seconds = self.compute_alignment_tolerance_seconds(series_a["时间戳"], series_b["时间戳"])
+            merge_kwargs: dict[str, Any] = {
+                "on": "时间戳",
+                "direction": "nearest",
+            }
+            if alignment_strategy == "最近邻 + 容差":
+                merge_kwargs["tolerance"] = pd.to_timedelta(tolerance_seconds, unit="s")
+            aligned = pd.merge_asof(
+                series_a.sort_values("时间戳"),
+                series_b.sort_values("时间戳"),
+                **merge_kwargs,
+            ).dropna()
+        if len(aligned) < 2:
+            raise ValueError("两设备共同时间点不足，无法生成有效对齐结果。")
+
+        return aligned, {
+            "series_a": series_a,
+            "series_b": series_b,
+            "meta_a": meta_a,
+            "meta_b": meta_b,
+            "matched_count": len(aligned),
+            "actual_start": pd.Timestamp(aligned["时间戳"].min()),
+            "actual_end": pd.Timestamp(aligned["时间戳"].max()),
+            "tolerance_seconds": tolerance_seconds,
+            "alignment_strategy": alignment_strategy,
+        }
+
+    def run_dual_device_compare(self) -> None:
+        ygas_paths, dat_path, _other = self.classify_selected_compare_files()
+        try:
+            selected_paths = self.get_compare_file_paths()
+            if dat_path is None and len(selected_paths) < 2:
+                raise ValueError("请先选择两个文件，或选择多个 txt/log 加 1 个 dat 文件。")
+            mode = self.compare_mode_var.get().strip() or "时间序列对比"
+            start_dt, end_dt = self.resolve_time_range_inputs()
+            self.start_background_task(
+                status_text="正在解析文件并准备双设备比对…",
+                worker=lambda reporter: self.prepare_dual_compare_payload(
+                    ygas_paths=ygas_paths,
+                    dat_path=dat_path,
+                    selected_paths=selected_paths,
+                    compare_mode=mode,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    reporter=reporter,
+                ),
+                on_success=self.on_dual_compare_payload_ready,
+                error_title="双设备比对",
+            )
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"双设备比对失败：{message}")
+            self.update_diagnostic_info(layout="双设备比对")
+            self.render_plot_message(message, level="warning")
+            messagebox.showerror("比对失败", message)
+
+    def format_source_label(self, source: str | Path) -> str:
+        if isinstance(source, Path):
+            return source.name
+        return str(source)
+
+    def merge_timestamp_frames(self, frames: list[pd.DataFrame]) -> pd.DataFrame:
+        merged: pd.DataFrame | None = None
+        for frame in frames:
+            if merged is None:
+                merged = frame.copy()
+            else:
+                merged = merged.merge(frame, on="时间戳", how="outer")
+        if merged is None:
+            return pd.DataFrame(columns=["时间戳"])
+        return merged.sort_values("时间戳").reset_index(drop=True)
+
+    def render_psd_compare_series(
+        self,
+        label_a: str,
+        label_b: str,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+        series_results: list[dict[str, Any]],
+        *,
+        mapping_name: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        txt_points: int,
+        dat_points: int,
+        fs_a_last: float,
+        fs_b_last: float,
+    ) -> None:
+        if not series_results:
+            raise ValueError("时间段内 PSD 对比没有得到可用的有效谱值。")
+
+        style = self.resolve_plot_style("时间段内 PSD 对比")
+        layout = self.resolve_plot_layout("时间段内 PSD 对比")
+        self.reset_plot_output_state()
+
+        txt_series = [item for item in series_results if item["side"] == "txt"]
+        dat_series = [item for item in series_results if item["side"] == "dat"]
+        valid_freq_points = int(sum(len(item["freq"]) for item in series_results))
+        quality_warnings: list[str] = []
+        if valid_freq_points < 10:
+            quality_warnings.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
+        if txt_points < 32 or dat_points < 32:
+            quality_warnings.append("有效点数偏少，当前 PSD 结果可能不稳定。")
+        if start_dt is not None and end_dt is not None:
+            span_seconds = (pd.Timestamp(end_dt) - pd.Timestamp(start_dt)).total_seconds()
+            if span_seconds < 60:
+                quality_warnings.append("当前时间范围较窄，谱图只能反映很短时间窗内的变化。")
+
+        if layout == "叠加同图":
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            for index, item in enumerate(series_results):
+                color = SERIES_COLORS[index % len(SERIES_COLORS)]
+                self.apply_series_style(ax, item["freq"], item["density"], color=color, label=item["label"], style=style)
+            self.add_selected_reference_slopes(
+                ax,
+                np.concatenate([item["freq"] for item in series_results]),
+                np.concatenate([item["density"] for item in series_results]),
+                is_psd=True,
+            )
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_title("时间段内 PSD 对比")
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel("Density")
+            ax.grid(True, which="both", linestyle="--", alpha=0.3)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc="upper right")
+            self.figure.tight_layout()
+            self.refresh_canvas()
+        else:
+            vertical_main_preview = layout in {"上下分图", "分别生成两张图"}
+            self.figure.clear()
+            axes = self.figure.subplots(2, 1) if vertical_main_preview else self.figure.subplots(1, 2)
+            ax_a, ax_b = axes[0], axes[1]
+            for index, item in enumerate(txt_series):
+                color = SERIES_COLORS[index % len(SERIES_COLORS)]
+                self.apply_series_style(ax_a, item["freq"], item["density"], color=color, label=item["label"], style=style)
+            for index, item in enumerate(dat_series):
+                color = SERIES_COLORS[(index + len(txt_series)) % len(SERIES_COLORS)]
+                self.apply_series_style(ax_b, item["freq"], item["density"], color=color, label=item["label"], style=style)
+            if txt_series:
+                self.add_selected_reference_slopes(
+                    ax_a,
+                    np.concatenate([item["freq"] for item in txt_series]),
+                    np.concatenate([item["density"] for item in txt_series]),
+                    is_psd=True,
+                )
+            if dat_series:
+                self.add_selected_reference_slopes(
+                    ax_b,
+                    np.concatenate([item["freq"] for item in dat_series]),
+                    np.concatenate([item["density"] for item in dat_series]),
+                    is_psd=True,
+                )
+            for ax, title in (
+                (ax_a, f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}"),
+                (ax_b, f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}"),
+            ):
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                ax.set_title(title)
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("Density")
+                ax.grid(True, which="both", linestyle="--", alpha=0.3)
+                if ax.get_legend_handles_labels()[1]:
+                    ax.legend(loc="upper right")
+            self.figure.tight_layout()
+            overview_title = "图形结果：主页面总览图" if layout == "分别生成两张图" else None
+            self.refresh_canvas(title=overview_title)
+
+            if layout == "分别生成两张图" and self.use_separate_zoom_windows_var.get():
+                entries: list[dict[str, Any]] = []
+                fig_a = Figure(figsize=(6, 4), dpi=100)
+                ax_zoom_a = fig_a.add_subplot(111)
+                for index, item in enumerate(txt_series):
+                    color = SERIES_COLORS[index % len(SERIES_COLORS)]
+                    self.apply_series_style(ax_zoom_a, item["freq"], item["density"], color=color, label=item["label"], style=style)
+                if txt_series:
+                    self.add_selected_reference_slopes(
+                        ax_zoom_a,
+                        np.concatenate([item["freq"] for item in txt_series]),
+                        np.concatenate([item["density"] for item in txt_series]),
+                        is_psd=True,
+                    )
+                ax_zoom_a.set_xscale("log")
+                ax_zoom_a.set_yscale("log")
+                ax_zoom_a.set_title(f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}")
+                ax_zoom_a.set_xlabel("Frequency (Hz)")
+                ax_zoom_a.set_ylabel("Density")
+                ax_zoom_a.grid(True, which="both", linestyle="--", alpha=0.3)
+                if ax_zoom_a.get_legend_handles_labels()[1]:
+                    ax_zoom_a.legend(loc="upper right")
+                fig_a.tight_layout()
+                entries.append(
+                    {
+                        "figure": fig_a,
+                        "title": "设备A - PSD 对比",
+                        "filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}.png",
+                    }
+                )
+
+                fig_b = Figure(figsize=(6, 4), dpi=100)
+                ax_zoom_b = fig_b.add_subplot(111)
+                for index, item in enumerate(dat_series):
+                    color = SERIES_COLORS[index % len(SERIES_COLORS)]
+                    self.apply_series_style(ax_zoom_b, item["freq"], item["density"], color=color, label=item["label"], style=style)
+                if dat_series:
+                    self.add_selected_reference_slopes(
+                        ax_zoom_b,
+                        np.concatenate([item["freq"] for item in dat_series]),
+                        np.concatenate([item["density"] for item in dat_series]),
+                        is_psd=True,
+                    )
+                ax_zoom_b.set_xscale("log")
+                ax_zoom_b.set_yscale("log")
+                ax_zoom_b.set_title(f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}")
+                ax_zoom_b.set_xlabel("Frequency (Hz)")
+                ax_zoom_b.set_ylabel("Density")
+                ax_zoom_b.grid(True, which="both", linestyle="--", alpha=0.3)
+                if ax_zoom_b.get_legend_handles_labels()[1]:
+                    ax_zoom_b.legend(loc="upper right")
+                fig_b.tight_layout()
+                entries.append(
+                    {
+                        "figure": fig_b,
+                        "title": "设备B - PSD 对比",
+                        "filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}.png",
+                    }
+                )
+                self.show_separate_plot_windows(entries)
+
+        self.current_plot_kind = "dual_psd_compare"
+        self.current_plot_columns = [item["label"] for item in series_results]
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_aligned_frame = None
+        self.current_aligned_metadata = {}
+        self.current_compare_files = [label_a, label_b]
+        self.current_result_frame = self.build_overlay_export_frame(series_results)
+        self.register_plot_style_layout(style, layout)
+        extra_items = [
+            f"当前要素映射={mapping_name}",
+            f"当前谱类型=PSD",
+            f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
+            f"实际命中设备B列={','.join(sorted({item['column'] for item in dat_series}))}",
+            "对齐策略=时间窗裁切后独立PSD",
+            f"出图样式={style}",
+            f"出图布局={layout}",
+            f"时间范围={start_dt or '自动'} ~ {end_dt or '自动'}",
+            f"txt 合并后点数={txt_points}",
+            f"dat 裁切后点数={dat_points}",
+            f"txt_FS={fs_a_last:g}",
+            f"dat_FS={fs_b_last:g}",
+            f"有效频点数={valid_freq_points}",
+            f"成功系列数={len(series_results)}",
+        ] + self.build_timestamp_quality_items(parsed_a, parsed_b)
+        extra_items.extend(quality_warnings)
+        self.update_diagnostic_info(
+            layout=f"{parsed_a.profile_name} / {parsed_b.profile_name}",
+            analysis_label="；".join(item["label"] for item in series_results),
+            extra_items=extra_items,
+        )
+        status = f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(series_results)}"
+        if layout == "分别生成两张图":
+            if self.separate_plot_windows:
+                status += f" | 已生成独立图窗口：{len(self.separate_plot_windows)} 个"
+            else:
+                status += " | 主页面保留总览，未弹出独立窗口"
+        self.status_var.set(status)
+
+    def plot_scatter_consistency_compare(
+        self,
+        paths: list[Path | str],
+        parsed_a: ParsedFileResult,
+        col_a: str,
+        parsed_b: ParsedFileResult,
+        col_b: str,
+        aligned: pd.DataFrame,
+        meta: dict[str, Any],
+    ) -> None:
+        value_a = meta["meta_a"]["value_name"]
+        value_b = meta["meta_b"]["value_name"]
+        label_a = self.format_source_label(paths[0])
+        label_b = self.format_source_label(paths[1])
+        mapping_name = self.element_preset_var.get().strip() if self.mapping_mode_var.get() == "预设映射" else "手动映射"
+        style = self.resolve_plot_style("散点一致性对比")
+        layout = "叠加同图"
+        diff = aligned[value_a] - aligned[value_b]
+        rmse = float(np.sqrt(np.mean(np.square(diff))))
+        mean_diff = float(diff.mean())
+        corr = float(aligned[value_a].corr(aligned[value_b]))
+        quality_warnings: list[str] = []
+        if meta["matched_count"] < 20:
+            quality_warnings.append("匹配点数偏少，散点一致性结果可能不稳定。")
+        coverage_ratio = meta["matched_count"] / max(1, min(meta["meta_a"]["valid_count"], meta["meta_b"]["valid_count"]))
+        if coverage_ratio < 0.3:
+            quality_warnings.append("A/B 时间覆盖较弱，请检查时间范围或补齐更多文件。")
+
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        self.apply_series_style(ax, aligned[value_a], aligned[value_b], color=SERIES_COLORS[0], label=f"{col_a} vs {col_b}", style=style)
+        min_val = float(min(aligned[value_a].min(), aligned[value_b].min()))
+        max_val = float(max(aligned[value_a].max(), aligned[value_b].max()))
+        if math.isfinite(min_val) and math.isfinite(max_val) and min_val < max_val:
+            ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="#666666", linewidth=1.0, label="y = x")
+            ax.legend(loc="upper right")
+        ax.set_title(f"散点一致性对比 - {col_a} vs {col_b}")
+        ax.set_xlabel(f"{label_a} - {col_a}")
+        ax.set_ylabel(f"{label_b} - {col_b}")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = "aligned_scatter"
+        self.current_plot_columns = [col_a, col_b]
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_result_frame = None
+        export_frame = aligned[["时间戳", value_a, value_b]].copy()
+        export_frame.columns = ["时间戳", "txt值" if "txt" in label_a.lower() else "设备A值", "dat值" if "dat" in label_b.lower() else "设备B值"]
+        self.current_aligned_frame = export_frame
+        self.current_compare_files = [label_a, label_b]
+        self.register_plot_style_layout(style, layout)
+        self.current_aligned_metadata = {
+            "方案名": self.scheme_name_var.get().strip() or "默认方案",
+            "映射名称": mapping_name,
+            "对齐策略": meta.get("alignment_strategy", self.get_alignment_strategy("散点一致性对比")),
+            "时间范围": f"{meta['actual_start']} ~ {meta['actual_end']}",
+            "匹配点数": meta["matched_count"],
+            "成功系列数": 1,
+            "出图样式": style,
+            "出图布局": layout,
+        }
+
+        self.update_diagnostic_info(
+            layout=f"{parsed_a.profile_name} / {parsed_b.profile_name}",
+            analysis_label=f"{col_a} vs {col_b}",
+            extra_items=[
+                f"当前要素映射={mapping_name}",
+                f"实际命中设备A列={col_a}",
+                f"实际命中设备B列={col_b}",
+                f"对齐策略={meta.get('alignment_strategy', self.get_alignment_strategy('散点一致性对比'))}",
+                f"出图样式={style}",
+                f"出图布局={layout}",
+                f"成功系列数=1",
+                f"当前时间窗={meta['actual_start']} ~ {meta['actual_end']}",
+                f"txt 合并后点数={meta['meta_a']['valid_count']}",
+                f"dat 裁切后点数={meta['meta_b']['valid_count']}",
+                f"匹配点数={meta['matched_count']}",
+                f"均值差={mean_diff:.4g}",
+                f"RMSE={rmse:.4g}",
+                f"相关系数r={corr:.4g}",
+                f"匹配容差={meta['tolerance_seconds']:.3f}s",
+            ] + self.build_timestamp_quality_items(parsed_a, parsed_b) + quality_warnings,
+        )
+        self.status_var.set(f"图已生成：散点一致性对比 / {col_a} vs {col_b}")
+
+    def plot_results(
+        self,
+        analysis_type: str,
+        freq: np.ndarray,
+        density: np.ndarray,
+        columns: list[str],
+        details: dict[str, Any],
+    ) -> None:
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ordered_columns = list(details.get("ordered_columns", columns))
+        target_context = core.get_target_spectral_context(details.get("target_spectral_context"))
+        series_label = ordered_columns[0] if analysis_type == "spectral" else f"{ordered_columns[0]} vs {ordered_columns[1]}"
+        quality_items: list[str] = []
+        display_meta: dict[str, str] | None = None
+
+        if analysis_type == "spectral":
+            positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
+            freq = freq[positive]
+            density = density[positive]
+            if len(freq) == 0:
+                raise ValueError("当前所选列波动过小或为恒定列，无法生成有效谱图。")
+            quality_items.append("当前谱类型=PSD")
+            quality_items.append(f"有效频点数={len(freq)}")
+            if len(freq) < 10:
+                quality_items.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.scatter(
+                freq,
+                density,
+                color=SERIES_COLORS[0],
+                label=series_label,
+                s=22,
+                alpha=0.8,
+                edgecolors="none",
+            )
+            title = f"功率谱密度：{columns[0]}"
+            ylabel = "Power Spectral Density"
+            self.add_selected_reference_slopes(ax, freq, density, is_psd=True)
+        else:
+            spectrum_type = str(details.get("spectrum_type", CROSS_SPECTRUM_MAGNITUDE))
+            display_meta = self.get_cross_spectrum_display_meta(spectrum_type)
+            display_semantics = str(details.get("display_semantics") or "")
+            title_prefix = display_meta["title_prefix"]
+            if target_context is not None and details.get("uses_canonical_pair"):
+                title = f"{title_prefix}：{target_context['reference_column']} vs {target_context['display_target_label']}"
+                series_label = f"{target_context['reference_column']} vs {target_context['display_target_label']}"
+            else:
+                title = f"{title_prefix}：{ordered_columns[0]} vs {ordered_columns[1]}"
+            raw_freq = freq
+            raw_density = density
+            freq, density = self.configure_cross_spectrum_axis(
+                ax,
+                raw_freq,
+                raw_density,
+                spectrum_type,
+                display_semantics=display_semantics or None,
+                title=title,
+                style="散点图",
+                label=series_label,
+                color=SERIES_COLORS[0],
+            )
+            ylabel = self.get_cross_spectrum_display_meta(spectrum_type)["ylabel"]
+            quality_items.append(f"当前谱类型={spectrum_type}")
+            quality_items.append(f"有效频点数={len(freq)}")
+            if details.get("cross_execution_path") is not None:
+                quality_items.append(f"cross_execution_path={details.get('cross_execution_path')}")
+            if details.get("cross_implementation_id") is not None:
+                quality_items.append(f"cross_implementation_id={details.get('cross_implementation_id')}")
+            if details.get("cross_implementation_label") is not None:
+                quality_items.append(f"cross_implementation_label={details.get('cross_implementation_label')}")
+            if details.get("alignment_strategy") is not None:
+                quality_items.append(f"alignment_strategy={details.get('alignment_strategy')}")
+            if details.get("display_semantics") is not None:
+                quality_items.append(f"display_semantics={details.get('display_semantics')}")
+            if details.get("display_value_source") is not None:
+                quality_items.append(f"display_value_source={details.get('display_value_source')}")
+            if len(freq) < 10:
+                quality_items.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
+            if display_semantics != core.CROSS_DISPLAY_SEMANTICS_ABS and len(density) > 0:
+                near_zero_ratio = float(np.mean(np.abs(density) <= 1e-12))
+                if near_zero_ratio >= 0.8:
+                    quality_items.append("协谱/正交谱大部分点接近 0，请确认列选择和时间范围。")
+        quality_items.extend(
+            self.build_reference_slope_diagnostic_items(
+                is_psd=analysis_type == "spectral",
+                spectrum_type=None if analysis_type == "spectral" else str(details.get("spectrum_type", CROSS_SPECTRUM_MAGNITUDE)),
+            )
+        )
+        if target_context is not None:
+            quality_items.extend(
+                [
+                    f"cross_execution_path={details.get('cross_execution_path')}",
+                    f"cross_implementation_id={details.get('cross_implementation_id')}",
+                    f"cross_implementation_label={details.get('cross_implementation_label')}",
+                    f"cross_reference_column={details.get('cross_reference_column', target_context['reference_column'])}",
+                    f"reference_column={details.get('reference_column', target_context['reference_column'])}",
+                    f"ygas_target_column={target_context.get('ygas_target_column', target_context.get('target_column'))}",
+                    f"dat_target_column={target_context.get('dat_target_column')}",
+                    "canonical_cross_pairs="
+                    + " | ".join(str(item) for item in (target_context.get("canonical_cross_pairs") or [])),
+                    f"target_column={details.get('target_column')}",
+                    f"cross_order={details.get('cross_order', target_context['cross_order'])}",
+                    f"display_semantics={details.get('display_semantics')}",
+                    f"display_value_source={details.get('display_value_source')}",
+                ]
+            )
+            if spectrum_type in CROSS_SPECTRUM_OPTIONS:
+                for key in ("cross_kernel", "window", "detrend", "scaling", "return_onesided", "average"):
+                    if details.get(key) is not None:
+                        quality_items.append(f"{key}={details[key]}")
+            if details.get("auto_reordered"):
+                quality_items.append("已自动修正列顺序为 Uz -> target")
+            warning_message = str(details.get("selection_warning") or "").strip()
+            if warning_message:
+                quality_items.append(warning_message)
+
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(ylabel)
+        if analysis_type == "spectral":
+            ax.grid(True, which="both", linestyle="--", alpha=0.3)
+            ax.legend(loc="upper right")
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = analysis_type
+        if target_context is not None and details.get("uses_canonical_pair"):
+            self.current_plot_columns = [str(target_context["reference_column"]), str(target_context["display_target_label"])]
+        else:
+            self.current_plot_columns = list(ordered_columns)
+        self.current_result_freq = freq.copy()
+        self.current_result_values = density.copy()
+        self.current_aligned_frame = None
+        self.current_lazy_aligned_frames = []
+        self.current_aligned_metadata = {}
+        self.current_compare_files = []
+        if analysis_type == "spectral":
+            self.current_result_frame = pd.DataFrame(
+                {
+                    "frequency_hz": self.current_result_freq,
+                    "psd": self.current_result_values,
+                }
+            )
+        else:
+            export_mask = self.build_spectrum_plot_mask(
+                raw_freq,
+                raw_density,
+                str(details.get("spectrum_type", CROSS_SPECTRUM_MAGNITUDE)),
+                display_semantics=str(details.get("display_semantics") or "") or None,
+            )
+            self.current_result_frame = self.build_cross_export_frame(
+                raw_freq,
+                details,
+                export_mask,
+            )
+        self.update_diagnostic_info(
+            layout=self.current_layout_label,
+            analysis_label=series_label,
+            valid_points=int(details["valid_points"]),
+            fs=float(details["fs"]),
+            nsegment=int(details["nsegment"]),
+            overlap_ratio=float(details["overlap_ratio"]),
+            nperseg=int(details["nperseg"]),
+            noverlap=int(details["noverlap"]),
+            extra_items=quality_items,
+        )
+        if analysis_type == "spectral":
+            self.status_var.set(f"图已生成：功率谱密度 / {columns[0]}")
+        else:
+            self.status_var.set(f"图已生成：{display_meta['title_prefix'] if display_meta else '互谱分析'} / {series_label}")
+
+    def build_overlay_export_frame(self, series_results: list[dict[str, Any]]) -> pd.DataFrame:
+        merged_frame: pd.DataFrame | None = None
+        for item in series_results:
+            y_values = item.get("density", item.get("values"))
+            if y_values is None:
+                continue
+            series_frame = pd.DataFrame(
+                {
+                    "frequency_hz": item["freq"],
+                    item["label"]: y_values,
+                }
+            )
+            if merged_frame is None:
+                merged_frame = series_frame
+            else:
+                merged_frame = merged_frame.merge(series_frame, on="frequency_hz", how="outer")
+
+        if merged_frame is None:
+            return pd.DataFrame(columns=["frequency_hz"])
+        merged_frame = merged_frame.sort_values("frequency_hz").reset_index(drop=True)
+        first_details = dict(series_results[0].get("details", {})) if series_results else {}
+        for key in (
+            "cross_execution_path",
+            "cross_implementation_id",
+            "cross_reference_column",
+            "reference_column",
+            "ygas_target_column",
+            "dat_target_column",
+            "target_column",
+            "cross_order",
+            "canonical_cross_pairs",
+            "generated_cross_series_count",
+            "generated_cross_series_roles",
+            "display_semantics",
+            "display_value_source",
+        ):
+            value = first_details.get(key)
+            if value is not None and key not in merged_frame.columns:
+                if isinstance(value, (list, tuple)):
+                    text_value = " | ".join(str(item) for item in value if str(item).strip())
+                else:
+                    text_value = str(value)
+                merged_frame[key] = [text_value] * len(merged_frame)
+        return merged_frame
+
+    def plot_multi_spectral_results(
+        self,
+        target_column: str,
+        series_results: list[dict[str, Any]],
+        skipped_files: list[str],
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.reset_plot_output_state()
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        payload = dict(payload or {})
+        device_groups = list(payload.get("device_groups", []))
+        device_count = int(payload.get("device_count", len(series_results)))
+        file_count = int(payload.get("file_count", sum(int(item.get("file_count", 1)) for item in series_results)))
+
+        combined_freq: list[np.ndarray] = []
+        combined_density: list[np.ndarray] = []
+        for index, item in enumerate(series_results):
+            color = SERIES_COLORS[index % len(SERIES_COLORS)]
+            ax.scatter(
+                item["freq"],
+                item["density"],
+                color=color,
+                label=item["label"],
+                s=22,
+                alpha=0.8,
+                edgecolors="none",
+            )
+            combined_freq.append(item["freq"])
+            combined_density.append(item["density"])
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        all_freq = np.concatenate(combined_freq)
+        all_density = np.concatenate(combined_density)
+        self.add_selected_reference_slopes(ax, all_freq, all_density, is_psd=True)
+        if device_count == 1:
+            title = f"单台设备图谱 - {series_results[0]['label']} - {target_column}"
+        else:
+            title = f"多设备图谱对比 - {target_column}"
+        ax.set_title(title)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Density")
+        ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        ax.legend(loc="upper right")
+        self.figure.tight_layout()
+        self.refresh_canvas()
+
+        self.current_plot_kind = "multi_spectral"
+        self.current_plot_columns = [target_column]
+        self.current_result_freq = None
+        self.current_result_values = None
+        self.current_aligned_frame = None
+        self.current_aligned_metadata = {}
+        self.current_compare_files = [str(item["label"]) for item in series_results]
+        self.current_result_frame = self.build_overlay_export_frame(series_results)
+        first_details = series_results[0]["details"]
+        group_items = [
+            f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | 合并={item['merge_strategy']}"
+            for item in device_groups
+        ]
+        self.update_diagnostic_info(
+            layout="单设备模式" if device_count == 1 else "设备分组模式",
+            analysis_label=target_column,
+            fs=float(first_details["fs"]),
+            nsegment=int(first_details["nsegment"]),
+            overlap_ratio=float(first_details["overlap_ratio"]),
+            nperseg=int(first_details["nperseg"]),
+            noverlap=int(first_details["noverlap"]),
+            batch_success=len(series_results),
+            batch_skips=len(skipped_files),
+            extra_items=[
+                f"选中文件数={file_count}",
+                f"识别设备数={device_count}",
+                *group_items,
+                *self.build_reference_slope_diagnostic_items(is_psd=True),
+            ],
+        )
+
+        status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
+        status = f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
+        if skipped_files:
+            preview = "、".join(skipped_files[:3])
+            if len(skipped_files) > 3:
+                preview += " 等"
+            status += f" | 已跳过 {len(skipped_files)} 个文件：{preview}"
+        self.status_var.set(status)
+
+    def perform_multi_spectral_compare(self) -> None:
+        selected_files = self.get_selected_file_paths()
+        if len(selected_files) < 1:
+            self.status_var.set("设备图谱生成失败：文件数量不足")
+            self.update_diagnostic_info(layout=self.current_layout_label, batch_success=0, batch_skips=0)
+            self.render_plot_message("请先在文件列表中选择至少 1 个文件。", level="warning")
+            messagebox.showwarning("提示", "请先在文件列表中选择至少 1 个文件。")
+            return
+        if len(self.selected_columns) != 1:
+            self.status_var.set("设备图谱生成失败：未选中单一目标列")
+            self.update_diagnostic_info(layout=self.current_layout_label, batch_success=0, batch_skips=0)
+            self.render_plot_message("按设备分组生成图谱前，需要先在可分析列中选择 1 个目标列。", level="warning")
+            messagebox.showwarning("提示", "按设备分组生成图谱前，需要先在可分析列中选择 1 个目标列。")
+            return
+
+        target_column = self.selected_columns[0]
+        fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        self.start_background_task(
+            status_text=f"正在按设备分组准备图谱：{target_column}",
+            worker=lambda reporter: self.prepare_multi_spectral_compare_payload(
+                selected_files,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                reporter=reporter,
+            ),
+            on_success=self.on_multi_spectral_compare_ready,
+            error_title="按设备分组生成图谱",
+        )
+
+    def add_reference_slope(
+        self,
+        ax: Any,
+        freq: np.ndarray,
+        density: np.ndarray,
+        slope: float,
+        *,
+        color: str = "#d65f5f",
+        label: str | None = None,
+    ) -> None:
+        freq_array = np.asarray(freq, dtype=float)
+        density_array = np.asarray(density, dtype=float)
+        base_mask = np.isfinite(freq_array) & (freq_array > 0) & np.isfinite(density_array)
+        if np.count_nonzero(base_mask) < 2:
+            return
+        positive_mask = base_mask & (density_array > 0)
+        if np.count_nonzero(positive_mask) >= 2:
+            ref_x = np.asarray(freq_array[positive_mask], dtype=float)
+            ref_anchor_values = np.asarray(density_array[positive_mask], dtype=float)
+        else:
+            fallback_values = np.abs(density_array[base_mask])
+            fallback_mask = np.isfinite(fallback_values) & (fallback_values > 0)
+            if np.count_nonzero(fallback_mask) < 2:
+                return
+            base_freq = np.asarray(freq_array[base_mask], dtype=float)
+            ref_x = np.asarray(base_freq[fallback_mask], dtype=float)
+            ref_anchor_values = np.asarray(fallback_values[fallback_mask], dtype=float)
+        anchor_index = len(ref_x) // 2
+        x_anchor = ref_x[anchor_index]
+        y_anchor = ref_anchor_values[anchor_index]
+        if not (np.isfinite(x_anchor) and np.isfinite(y_anchor) and x_anchor > 0 and y_anchor > 0):
+            return
+        ref = y_anchor * (ref_x / x_anchor) ** slope
+        slope_text = float_to_fraction_str(slope)
+        ref_label = label or f"Reference slope {slope_text}"
+        ax.plot(ref_x, ref, linestyle="--", linewidth=1.4, color=color, label=ref_label)
+
+    def add_fixed_reference_power_law(
+        self,
+        ax: Any,
+        x_values: np.ndarray,
+        *,
+        slope: float = -2 / 3,
+        amplitude_at_1hz: float = 1.0,
+        label: str = "(-2/3)",
+        color: str = "#d65f5f",
+    ) -> None:
+        x_array = np.asarray(x_values, dtype=float)
+        mask = np.isfinite(x_array) & (x_array > 0)
+        if np.count_nonzero(mask) < 2:
+            return
+        ref_x = np.unique(np.sort(x_array[mask]))
+        ref_y = float(amplitude_at_1hz) * np.power(ref_x, slope)
+        ax.plot(ref_x, ref_y, linestyle="--", linewidth=1.4, color=color, label=label, zorder=1)
+
+    def clear_plot(self) -> None:
+        self.update_diagnostic_info(layout=self.current_layout_label)
+        self.render_plot_message("请先在左侧勾选要分析的列。")
+        self.status_var.set("已清除图表。")
+
+    def update_table_view(self) -> None:
+        table_data = self.preview_data if self.preview_data is not None else self.raw_data
+        if table_data is None:
+            self.tree.delete(*self.tree.get_children())
+            self.page_info_var.set("0 / 0")
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        columns = list(table_data.columns)
+        self.tree["columns"] = columns
+        for col in columns:
+            self.tree.heading(col, text=col)
+
+        self.adjust_column_widths()
+        self.load_virtual_page()
+
+    def adjust_column_widths(self) -> None:
+        table_data = self.preview_data if self.preview_data is not None else self.raw_data
+        if table_data is None:
+            return
+
+        sample_data = table_data.head(20)
+        for col in table_data.columns:
+            max_len = self.table_font.measure(col)
+            for value in sample_data[col]:
+                text = self.format_display_value(value)
+            max_len = max(max_len, self.table_font.measure(text))
+            self.tree.column(col, width=min(max_len + 24, 300), anchor="w")
+
+    def load_virtual_page(self) -> None:
+        table_data = self.preview_data if self.preview_data is not None else self.raw_data
+        if table_data is None:
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        total_rows = len(table_data)
+        if total_rows == 0:
+            self.page_info_var.set("0 / 0")
+            return
+
+        max_page = max(math.ceil(total_rows / ROWS_PER_PAGE) - 1, 0)
+        self.page_index = max(0, min(self.page_index, max_page))
+
+        start_row = self.page_index * ROWS_PER_PAGE
+        end_row = min(start_row + ROWS_PER_PAGE, total_rows)
+        rows_to_insert = table_data.iloc[start_row:end_row]
+
+        for _, row in rows_to_insert.iterrows():
+            formatted_row = [self.format_display_value(value) for value in row.tolist()]
+            self.tree.insert("", tk.END, values=formatted_row)
+
+        self.page_info_var.set(f"{self.page_index + 1} / {max_page + 1}  ({start_row + 1}-{end_row} / {total_rows})")
+
+    def format_display_value(self, value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        if isinstance(value, (float, np.floating)):
+            return f"{value:.4f}"
+        if isinstance(value, (int, np.integer)):
+            return str(value)
+        if isinstance(value, str):
+            try:
+                numeric = float(value)
+            except ValueError:
+                return value
+            if math.isfinite(numeric):
+                return f"{numeric:.4f}"
+        return str(value)
+
+    def prev_page(self) -> None:
+        if self.page_index > 0:
+            self.page_index -= 1
+            self.load_virtual_page()
+
+    def next_page(self) -> None:
+        if self.raw_data is None:
+            return
+        max_page = max(math.ceil(len(self.raw_data) / ROWS_PER_PAGE) - 1, 0)
+        if self.page_index < max_page:
+            self.page_index += 1
+            self.load_virtual_page()
+
+    def save_figure(self) -> None:
+        if self.current_plot_kind is None:
+            messagebox.showwarning("警告", "没有可保存的图表。")
+            return
+
+        if self.separate_plot_entries:
+            choice = messagebox.askyesnocancel(
+                "保存图片",
+                "当前主页面图仍可直接保存。\n\n"
+                "选择“是”：保存主页面图\n"
+                "选择“否”：批量保存独立窗口图\n"
+                "选择“取消”：不执行保存",
+            )
+            if choice is None:
+                return
+            if not choice:
+                target_folder = filedialog.askdirectory(title="选择保存目录")
+                if not target_folder:
+                    return
+                saved_paths: list[str] = []
+                for entry in self.separate_plot_entries:
+                    path = Path(target_folder) / entry["filename"]
+                    entry["figure"].savefig(path, dpi=300, bbox_inches="tight")
+                    saved_paths.append(str(path))
+                self.status_var.set(f"已分别保存 {len(saved_paths)} 张独立窗口图到：{target_folder}")
+                return
+
+        default_filename = self.build_default_filename()
+        path = filedialog.asksaveasfilename(
+            title="保存图片",
+            defaultextension=".png",
+            filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")],
+            initialfile=default_filename,
+        )
+        if not path:
+            return
+
+        self.figure.savefig(path, dpi=300, bbox_inches="tight")
+        self.status_var.set(f"主页面图已保存到：{path}")
+
+    def build_compare_filename_core(self) -> str:
+        if self.current_plot_columns:
+            base = sanitize_filename(self.current_plot_columns[0])
+        elif self.scheme_name_var.get().strip():
+            base = sanitize_filename(self.scheme_name_var.get().strip())
+        else:
+            base = "compare"
+        style_tag = self.get_plot_style_tag(self.current_plot_style_label) if self.current_plot_style_label else "auto"
+        layout_tag = self.get_plot_layout_tag(self.current_plot_layout_label) if self.current_plot_layout_label else "overlay"
+        return f"{base}_{layout_tag}_{style_tag}"
+
+    def export_results(self) -> None:
+        if self.current_plot_kind is None or self.current_result_frame is None:
+            messagebox.showwarning("警告", "没有可导出的分析结果。")
+            return
+
+        default_filename = self.build_default_data_filename()
+        path = filedialog.asksaveasfilename(
+            title="导出结果",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            initialfile=default_filename,
+        )
+        if not path:
+            return
+
+        self.current_result_frame.to_csv(path, index=False, encoding="utf-8-sig")
+        if self.current_plot_kind == "target_spectrum":
+            export_path = Path(path)
+            group_records = list(self.current_target_plot_metadata.get("group_records", []))
+            qc_frame = self.current_target_plot_metadata.get("group_qc_export_frame")
+            if not isinstance(qc_frame, pd.DataFrame):
+                qc_frame = self.build_target_group_qc_export_frame(group_records)
+            if isinstance(qc_frame, pd.DataFrame) and not qc_frame.empty:
+                qc_path = export_path.with_name(f"{export_path.stem}_group_qc_summary.csv")
+                qc_frame.to_csv(qc_path, index=False, encoding="utf-8-sig")
+                self.status_var.set(f"结果已导出到：{path} | 组级QC：{qc_path}")
+                return
+        self.status_var.set(f"结果已导出到：{path}")
+
+    def export_aligned_data(self) -> None:
+        if (self.current_aligned_frame is None or self.current_aligned_frame.empty) and self.current_plot_kind == "target_spectrum":
+            aligned_frames = self.current_target_plot_metadata.get("aligned_frames")
+            if isinstance(aligned_frames, list) and aligned_frames:
+                self.current_aligned_frame = self.merge_timestamp_frames(aligned_frames)
+        if (self.current_aligned_frame is None or self.current_aligned_frame.empty) and self.current_lazy_aligned_frames:
+            self.current_aligned_frame = self.merge_timestamp_frames(self.current_lazy_aligned_frames)
+        if self.current_aligned_frame is None or self.current_aligned_frame.empty:
+            messagebox.showwarning("警告", "当前没有可导出的对齐数据。")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="导出对齐数据",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            initialfile=self.build_default_aligned_filename(),
+        )
+        if not path:
+            return
+
+        export_frame = self.current_aligned_frame.copy()
+        if self.current_aligned_metadata:
+            for key, value in self.current_aligned_metadata.items():
+                export_frame[key] = str(value)
+        export_frame.to_csv(path, index=False, encoding="utf-8-sig")
+        self.status_var.set(f"对齐数据已导出到：{path}")
+
+    def build_comparison_base_name(self) -> str:
+        start = self.current_comparison_metadata.get("start")
+        end = self.current_comparison_metadata.get("end")
+        if isinstance(start, pd.Timestamp) and isinstance(end, pd.Timestamp):
+            start_text = start.strftime("%Y%m%d_%H%M%S")
+            end_text = end.strftime("%Y%m%d_%H%M%S")
+            return f"compare_merged_{start_text}_to_{end_text}"
+        return "compare_merged"
+
+    def build_target_plot_base_name(self) -> str:
+        start = self.current_target_plot_metadata.get("start")
+        end = self.current_target_plot_metadata.get("end")
+        if isinstance(start, pd.Timestamp) and isinstance(end, pd.Timestamp):
+            start_text = start.strftime("%Y%m%d_%H%M%S")
+            end_text = end.strftime("%Y%m%d_%H%M%S")
+            return f"target_windowed_{start_text}_to_{end_text}"
+        return "target_windowed"
+
+    def build_default_filename(self) -> str:
+        if self.current_data_source_kind == "comparison_analysis":
+            base_name = self.build_comparison_base_name()
+            if self.current_plot_kind == "spectral" and self.current_plot_columns:
+                col = sanitize_filename(self.current_plot_columns[0])
+                return f"{base_name}_{col}_spectral_plot.png"
+            if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
+                col1 = sanitize_filename(self.current_plot_columns[0])
+                col2 = sanitize_filename(self.current_plot_columns[1])
+                return f"{base_name}_{col1}_vs_{col2}_cross_plot.png"
+
+        if self.current_plot_kind == "target_spectrum":
+            element = sanitize_filename(self.current_plot_columns[0] if self.current_plot_columns else "target")
+            return f"{self.build_target_plot_base_name()}_{element}_target_spectrum_plot.png"
+
+        if self.current_file is None:
+            return "spectral_plot.png"
+
+        base_name = sanitize_filename(self.current_file.stem)
+        if self.current_plot_kind == "spectral":
+            return f"{base_name}_spectral_plot.png"
+
+        if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
+            col1 = sanitize_filename(self.current_plot_columns[0])
+            col2 = sanitize_filename(self.current_plot_columns[1])
+            return f"{base_name}_cross_{col1}_vs_{col2}_plot.png"
+
+        if self.current_plot_kind == "multi_spectral" and self.current_plot_columns:
+            col = sanitize_filename(self.current_plot_columns[0])
+            if len(self.current_compare_files) == 1:
+                device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
+                return f"{device_name}_单台图谱_{col}_plot.png"
+            return f"multi_device_{col}_plot.png"
+
+        if self.current_plot_kind in {
+            "aligned_time_series",
+            "aligned_scatter",
+            "dual_psd_compare",
+            "aligned_diff",
+            "aligned_ratio",
+            "aligned_cospectrum",
+            "aligned_quadrature",
+        }:
+            kind_name = {
+                "aligned_time_series": "time_compare",
+                "aligned_scatter": "scatter_compare",
+                "dual_psd_compare": "psd_compare",
+                "aligned_diff": "difference_compare",
+                "aligned_ratio": "ratio_compare",
+                "aligned_cospectrum": "cospectrum_compare",
+                "aligned_quadrature": "quadrature_compare",
+            }[self.current_plot_kind]
+            return f"{kind_name}_{self.build_compare_filename_core()}_plot.png"
+
+        return "spectral_plot.png"
+
+    def build_default_data_filename(self) -> str:
+        if self.current_data_source_kind == "comparison_analysis":
+            base_name = self.build_comparison_base_name()
+            if self.current_plot_kind == "spectral" and self.current_plot_columns:
+                col = sanitize_filename(self.current_plot_columns[0])
+                return f"{base_name}_{col}_spectral_data.csv"
+            if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
+                col1 = sanitize_filename(self.current_plot_columns[0])
+                col2 = sanitize_filename(self.current_plot_columns[1])
+                return f"{base_name}_{col1}_vs_{col2}_cross_data.csv"
+
+        if self.current_plot_kind == "target_spectrum":
+            element = sanitize_filename(self.current_plot_columns[0] if self.current_plot_columns else "target")
+            return f"{self.build_target_plot_base_name()}_{element}_target_spectrum_data.csv"
+
+        if self.current_file is None:
+            return "spectral_data.csv"
+
+        base_name = sanitize_filename(self.current_file.stem)
+        if self.current_plot_kind == "spectral":
+            return f"{base_name}_spectral_data.csv"
+
+        if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
+            col1 = sanitize_filename(self.current_plot_columns[0])
+            col2 = sanitize_filename(self.current_plot_columns[1])
+            return f"{base_name}_cross_{col1}_vs_{col2}_data.csv"
+
+        if self.current_plot_kind == "multi_spectral" and self.current_plot_columns:
+            col = sanitize_filename(self.current_plot_columns[0])
+            if len(self.current_compare_files) == 1:
+                device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
+                return f"{device_name}_单台图谱_{col}_data.csv"
+            return f"multi_device_{col}_data.csv"
+
+        if self.current_plot_kind == "dual_psd_compare":
+            return f"psd_compare_{self.build_compare_filename_core()}_data.csv"
+
+        if self.current_plot_kind == "aligned_cospectrum":
+            return f"cospectrum_compare_{self.build_compare_filename_core()}_data.csv"
+
+        if self.current_plot_kind == "aligned_quadrature":
+            return f"quadrature_compare_{self.build_compare_filename_core()}_data.csv"
+
+        return "spectral_data.csv"
+
+    def build_default_aligned_filename(self) -> str:
+        return f"aligned_{self.build_compare_filename_core()}_data.csv"
+
+
+def main() -> None:
+    matplotlib.use("TkAgg")
+    global FigureCanvasTkAgg, NavigationToolbar2Tk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as _FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as _NavigationToolbar2Tk
+
+    FigureCanvasTkAgg = _FigureCanvasTkAgg
+    NavigationToolbar2Tk = _NavigationToolbar2Tk
+    root = tk.Tk()
+    app = FileViewerApp(root)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
