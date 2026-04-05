@@ -1,35 +1,76 @@
-# 数据分析软件说明
+# Data Analysis Spectrum Tool
 
-## 交付文件
-- `fr_r_spectrum_tool_rebuild.py`
-  GUI 主程序入口
-- `spectrum_core.py`
-  不依赖 Tkinter 的纯逻辑 core 模块
-- `smoke_check_data_pipeline.py`
-  无 GUI 自检脚本
-- `rebuild_notes.md`
-  版本补丁说明
-- `requirements.txt`
-  依赖列表
+`fr_r_spectrum_tool_rebuild.py` is the GUI entry point.  
+`spectrum_core.py` contains the shared parsing, PSD, cross-spectrum, and target
+spectral logic.  
+`smoke_check_data_pipeline.py` provides headless smoke checks.
 
-## 依赖安装
+## Install
+
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## GUI 启动
+## Start GUI
+
 ```bash
-python D:\数据分析\fr_r_spectrum_tool_rebuild.py
+python fr_r_spectrum_tool_rebuild.py
 ```
 
-## 无 GUI 自检
+## Repository Fixtures
+
+Minimal reproducible fixtures are bundled in:
+
+- `tests/fixtures/smoke/ygas_h2o_1min.log`
+- `tests/fixtures/smoke/toa5_h2o_1min.dat`
+
+These two files are intentionally small and stable:
+
+- each file contains one minute of data
+- each file can be used by itself for single-file smoke
+- together they provide a common time window for dual/compare smoke
+
+More details are in `tests/fixtures/README.md`.
+
+## Local Smoke
+
+One command that works after clone:
+
 ```bash
-python D:\数据分析\smoke_check_data_pipeline.py --mode single --ygas "C:\Users\A\Desktop\SAMPLE202603270700-202603270730.log"
-python D:\数据分析\smoke_check_data_pipeline.py --mode single --dat "你的_TOA5_文件.dat"
-python D:\数据分析\smoke_check_data_pipeline.py --mode dual --ygas "你的_ygas.log" --dat "你的_TOA5_文件.dat" --element CO2
+python smoke_check_data_pipeline.py --mode repo-fixture-smoke
 ```
 
-## 推荐测试文件
-- YGAS 高频 `txt / log`
-- TOA5 `dat`
-- 同时覆盖同一时间段的 `ygas + dat` 组合样本
+This bundled smoke covers:
+
+- single ygas
+- single dat
+- dual ygas+dat
+- single-vs-compare base spectrum consistency
+
+## CI Command
+
+The GitHub Actions workflow runs the same repository fixture smoke:
+
+```bash
+python smoke_check_data_pipeline.py --mode repo-fixture-smoke
+```
+
+Workflow file:
+
+- `.github/workflows/repo-fixture-smoke.yml`
+
+## Extra Checks
+
+If you want the lower-level metadata smoke:
+
+```bash
+python smoke_check_data_pipeline.py --mode time-range-metadata-check
+```
+
+If you want direct compile checks:
+
+```bash
+python -m py_compile fr_r_spectrum_tool_rebuild.py
+python -m py_compile spectrum_core.py
+python -m py_compile smoke_check_data_pipeline.py
+```

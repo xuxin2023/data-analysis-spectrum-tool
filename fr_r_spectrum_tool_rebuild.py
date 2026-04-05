@@ -97,6 +97,87 @@ LEGACY_TARGET_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
 LEGACY_TARGET_LINESTYLES = ["-", "--", "-.", ":"]
 MODE1_COLUMN_TEMPLATE = list(core.MODE1_COLUMN_TEMPLATE)
 ELEMENT_PRESETS: dict[str, dict[str, list[str]]] = dict(core.ELEMENT_PRESETS)
+EXPORT_SCHEMA_VERSION = "psd_export_v2"
+EXPORT_SCHEMA_VERSION_FIELD = "export_schema_version"
+EXPORT_REQUIRED_METADATA_FIELDS = (
+    "base_spectrum_builder",
+    "base_fs_source",
+    "base_requested_start",
+    "base_requested_end",
+    "base_actual_start",
+    "base_actual_end",
+    "time_range_policy",
+    "time_range_policy_label",
+    "time_range_policy_note",
+)
+EXPORT_ADDITIONAL_METADATA_FIELDS = (
+    *core.TIME_RANGE_METADATA_EXPORT_KEYS,
+    "cross_execution_path",
+    "cross_implementation_id",
+    "cross_reference_column",
+    "reference_column",
+    "ygas_target_column",
+    "dat_target_column",
+    "target_column",
+    "cross_order",
+    "canonical_cross_pairs",
+    "generated_cross_series_count",
+    "generated_cross_series_roles",
+    "display_semantics",
+    "display_value_source",
+)
+
+
+def get_required_export_metadata_fields() -> tuple[str, ...]:
+    return EXPORT_REQUIRED_METADATA_FIELDS
+
+
+def get_export_metadata_field_order(*, include_additional: bool = False) -> tuple[str, ...]:
+    ordered_fields: list[str] = [EXPORT_SCHEMA_VERSION_FIELD, *EXPORT_REQUIRED_METADATA_FIELDS]
+    if include_additional:
+        for field in EXPORT_ADDITIONAL_METADATA_FIELDS:
+            if field not in ordered_fields:
+                ordered_fields.append(field)
+    return tuple(ordered_fields)
+
+
+def build_export_metadata_from_details(
+    details: dict[str, Any],
+    *,
+    include_additional: bool = False,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {EXPORT_SCHEMA_VERSION_FIELD: EXPORT_SCHEMA_VERSION}
+    for key in get_export_metadata_field_order(include_additional=include_additional):
+        if key == EXPORT_SCHEMA_VERSION_FIELD:
+            continue
+        value = details.get(key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def build_aggregated_export_metadata(
+    series_results: list[dict[str, Any]],
+    *,
+    formatter: Any,
+    include_additional: bool = False,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {EXPORT_SCHEMA_VERSION_FIELD: EXPORT_SCHEMA_VERSION}
+    for key in get_export_metadata_field_order(include_additional=include_additional):
+        if key == EXPORT_SCHEMA_VERSION_FIELD:
+            continue
+        values: list[str] = []
+        for item in series_results:
+            details = dict(item.get("details", {}))
+            value = details.get(key)
+            if value is None:
+                continue
+            text_value = formatter(value)
+            if text_value and text_value not in values:
+                values.append(text_value)
+        if values:
+            metadata[key] = values[0] if len(values) == 1 else " | ".join(values)
+    return metadata
 
 
 def get_resource_path(*parts: str) -> Path:
@@ -920,11 +1001,18 @@ class FileViewerApp:
         ttk.Button(compare_frame, text="自动补齐txt覆盖范围", command=self.auto_fill_txt_covering_dat_range).grid(
             row=11, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2)
         )
-        quick_button_frame = ttk.Frame(compare_frame)
-        quick_button_frame.grid(row=12, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        time_shortcut_frame = ttk.Frame(compare_frame)
+        time_shortcut_frame.grid(row=12, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        quick_button_frame = ttk.Frame(time_shortcut_frame)
+        quick_button_frame.pack(fill=tk.X)
         ttk.Button(quick_button_frame, text="最近10分钟", command=lambda: self.apply_recent_time_range(10)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(quick_button_frame, text="最近30分钟", command=lambda: self.apply_recent_time_range(30)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         ttk.Button(quick_button_frame, text="最近1小时", command=lambda: self.apply_recent_time_range(60)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Button(
+            time_shortcut_frame,
+            text="将当前 compare 共同时间窗同步到单图分析",
+            command=self.sync_compare_common_time_range_to_single_analysis,
+        ).pack(fill=tk.X, pady=(4, 0))
 
         ttk.Label(compare_frame, text="设备A分析列").grid(row=13, column=0, sticky="w", padx=6, pady=4)
         self.device_a_combo = ttk.Combobox(compare_frame, textvariable=self.device_a_column_var, state="readonly")
@@ -1289,6 +1377,24 @@ class FileViewerApp:
         if not self.time_start_var.get().strip() and not self.time_end_var.get().strip():
             return None, None
         return self.resolve_time_range_inputs()
+
+    def format_metadata_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, pd.Timestamp):
+            return core.format_metadata_timestamp(value)
+        if isinstance(value, (list, tuple, set)):
+            parts = [self.format_metadata_value(item) for item in value]
+            return " | ".join(part for part in parts if part)
+        return str(value)
+
+    def attach_metadata_columns(self, frame: pd.DataFrame, metadata: dict[str, Any]) -> pd.DataFrame:
+        enriched = frame.copy()
+        for key, value in metadata.items():
+            if value is None or key in enriched.columns:
+                continue
+            enriched[key] = [self.format_metadata_value(value)] * len(enriched)
+        return enriched
 
     def guess_timestamp_column(self, df: pd.DataFrame) -> str | None:
         preferred_names = ("时间戳", "TIMESTAMP", "timestamp", "Timestamp", "time", "Time", "日期时间")
@@ -2100,6 +2206,17 @@ class FileViewerApp:
                 details["device_group_merge_strategy"] = str(group["merge_metadata"].get("merge_strategy", ""))
                 details["source_paths"] = [str(path) for path in group["source_paths"]]
                 details["grouped_profile_name"] = str(merged_parsed.profile_name)
+                details.update(
+                    core.build_single_time_range_metadata(
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        has_timestamp=bool(payload["series_meta"].get("has_timestamp")),
+                        requested_start=details.get("base_requested_start"),
+                        requested_end=details.get("base_requested_end"),
+                        actual_start=details.get("base_actual_start"),
+                        actual_end=details.get("base_actual_end"),
+                    )
+                )
 
                 series_results.append(
                     {
@@ -2287,7 +2404,6 @@ class FileViewerApp:
         match_tolerance = self.get_match_tolerance_seconds(default_value=0.2)
         spectrum_type = self.get_selected_cross_spectrum_type(compare_mode)
         scheme_name = self.scheme_name_var.get().strip() or "默认方案"
-
         self.start_background_task(
             status_text=f"正在准备双设备比对数据：{compare_mode}",
             worker=lambda reporter: self.prepare_dual_plot_payload(
@@ -2311,6 +2427,12 @@ class FileViewerApp:
                 overlap_ratio=overlap_ratio,
                 match_tolerance=match_tolerance,
                 spectrum_type=spectrum_type,
+                time_range_context={
+                    "strategy_label": self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                    "has_txt_dat_context": bool(
+                        selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+                    ),
+                },
                 reporter=reporter,
             ),
             on_success=self.on_prepared_dual_plot_ready,
@@ -2340,6 +2462,7 @@ class FileViewerApp:
         overlap_ratio: float,
         match_tolerance: float,
         spectrum_type: str,
+        time_range_context: dict[str, Any] | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
         base_payload = {
@@ -2363,6 +2486,7 @@ class FileViewerApp:
             "overlap_ratio": overlap_ratio,
             "match_tolerance": match_tolerance,
             "spectrum_type": spectrum_type,
+            "time_range_context": dict(time_range_context or {}),
         }
 
         if compare_mode == "时间序列对比":
@@ -2512,6 +2636,18 @@ class FileViewerApp:
                         require_timestamp=True,
                     )
                     details = dict(psd_payload["details"])
+                    details.update(
+                        core.build_compare_time_range_metadata(
+                            strategy_label=str(base_payload["time_range_context"].get("strategy_label") or "使用 txt+dat 共同时间范围"),
+                            start_dt=start_dt,
+                            end_dt=end_dt,
+                            has_txt_dat_context=bool(base_payload["time_range_context"].get("has_txt_dat_context")),
+                            requested_start=details.get("base_requested_start"),
+                            requested_end=details.get("base_requested_end"),
+                            actual_start=details.get("base_actual_start"),
+                            actual_end=details.get("base_actual_end"),
+                        )
+                    )
                     if side == "txt":
                         txt_points = max(txt_points, int(psd_payload["series_meta"].get("valid_points", 0)))
                         fs_a_last = float(psd_payload["effective_fs"])
@@ -3486,6 +3622,40 @@ class FileViewerApp:
         self.time_end_var.set(common_end.strftime("%Y-%m-%d %H:%M:%S"))
         self.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
         self.status_var.set("已填入 txt 与 dat 的共同时间范围")
+
+    def resolve_compare_common_time_range_from_meta(
+        self,
+        selection_meta: dict[str, Any],
+    ) -> tuple[pd.Timestamp, pd.Timestamp]:
+        txt_summary = selection_meta.get("txt_summary")
+        dat_summary = selection_meta.get("dat_summary")
+        if txt_summary is None or dat_summary is None:
+            raise ValueError("当前 compare 选择中缺少 txt/dat 时间摘要，无法计算共同时间窗。")
+        common_start = max(pd.Timestamp(txt_summary["start"]), pd.Timestamp(dat_summary["start"]))
+        common_end = min(pd.Timestamp(txt_summary["end"]), pd.Timestamp(dat_summary["end"]))
+        if common_start > common_end:
+            raise ValueError(self.build_no_common_time_range_message(txt_summary, dat_summary))
+        return common_start, common_end
+
+    def sync_compare_common_time_range_to_single_analysis(
+        self,
+        selection_meta: dict[str, Any] | None = None,
+    ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        try:
+            if selection_meta is None:
+                _parsed_a, _label_a, _parsed_b, _label_b, selection_meta = self.build_compare_selection()
+            common_start, common_end = self.resolve_compare_common_time_range_from_meta(dict(selection_meta))
+        except Exception as exc:
+            self.render_plot_message(f"compare 共同时间窗同步失败：{exc}", level="warning")
+            self.status_var.set(f"compare 共同时间窗同步失败：{exc}")
+            return None
+
+        self.time_start_var.set(common_start.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip("."))
+        self.time_end_var.set(common_end.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip("."))
+        if self.left_workflow_notebook is not None and self.single_analysis_tab is not None:
+            self.left_workflow_notebook.select(self.single_analysis_tab)
+        self.status_var.set("已将当前 compare 共同时间窗同步到单图分析；单图分析将按用户时间窗生成。")
+        return common_start, common_end
 
     def auto_fill_txt_covering_dat_range(self) -> None:
         selected_files = self.get_selected_file_paths()
@@ -5046,6 +5216,17 @@ class FileViewerApp:
             )
             details = dict(payload["details"])
             details["analysis_context"] = "single_file_base_spectrum"
+            details.update(
+                core.build_single_time_range_metadata(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    has_timestamp=bool(payload["series_meta"].get("has_timestamp")),
+                    requested_start=details.get("base_requested_start"),
+                    requested_end=details.get("base_requested_end"),
+                    actual_start=details.get("base_actual_start"),
+                    actual_end=details.get("base_actual_end"),
+                )
+            )
             return np.asarray(payload["freq"], dtype=float), np.asarray(payload["density"], dtype=float), details
         data = self.column_data[col]
         return self.compute_psd_from_array(data)
@@ -5376,12 +5557,16 @@ class FileViewerApp:
         *,
         prefix: str | None = None,
     ) -> pd.DataFrame:
-        return core.build_cross_spectrum_export_frame(
+        frame = core.build_cross_spectrum_export_frame(
             freq,
             details,
             mask,
             prefix=prefix,
             target_context=details.get("target_spectral_context"),
+        )
+        return self.attach_metadata_columns(
+            frame,
+            build_export_metadata_from_details(details, include_additional=True),
         )
 
     def merge_frequency_frames(self, frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -6948,6 +7133,9 @@ class FileViewerApp:
         txt_series = [item for item in series_results if item["side"] == "txt"]
         dat_series = [item for item in series_results if item["side"] == "dat"]
         first_details = dict(series_results[0].get("details", {}))
+        time_range_meta = core.extract_time_range_metadata(first_details)
+        time_range_display_suffix = core.build_time_range_display_suffix(first_details)
+        time_range_filename_suffix = core.build_time_range_filename_suffix(first_details)
         valid_freq_points = int(sum(len(item["freq"]) for item in series_results))
         quality_warnings: list[str] = []
         if valid_freq_points < 10:
@@ -6973,7 +7161,7 @@ class FileViewerApp:
             )
             ax.set_xscale("log")
             ax.set_yscale("log")
-            ax.set_title("时间段内 PSD 对比")
+            ax.set_title(f"时间段内 PSD 对比{time_range_display_suffix}")
             ax.set_xlabel("Frequency (Hz)")
             ax.set_ylabel("Density")
             ax.grid(True, which="both", linestyle="--", alpha=0.3)
@@ -7007,8 +7195,8 @@ class FileViewerApp:
                     is_psd=True,
                 )
             for ax, title in (
-                (ax_a, f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}"),
-                (ax_b, f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}"),
+                (ax_a, f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}{time_range_display_suffix}"),
+                (ax_b, f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}{time_range_display_suffix}"),
             ):
                 ax.set_xscale("log")
                 ax.set_yscale("log")
@@ -7048,8 +7236,8 @@ class FileViewerApp:
                 entries.append(
                     {
                         "figure": fig_a,
-                        "title": "设备A - PSD 对比",
-                        "filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}.png",
+                        "title": f"设备A - PSD 对比{time_range_display_suffix}",
+                        "filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
                     }
                 )
 
@@ -7077,8 +7265,8 @@ class FileViewerApp:
                 entries.append(
                     {
                         "figure": fig_b,
-                        "title": "设备B - PSD 对比",
-                        "filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}.png",
+                        "title": f"设备B - PSD 对比{time_range_display_suffix}",
+                        "filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
                     }
                 )
                 self.show_separate_plot_windows(entries)
@@ -7098,12 +7286,13 @@ class FileViewerApp:
             f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
             f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
             f"设备B_base_fs_source={next((item['details'].get('base_fs_source') for item in dat_series if item.get('details')), None)}",
+            *core.build_time_range_diagnostic_items(first_details),
             f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
             f"实际命中设备B列={','.join(sorted({item['column'] for item in dat_series}))}",
             "对齐策略=时间窗裁切后独立PSD",
             f"出图样式={style}",
             f"出图布局={layout}",
-            f"时间范围={start_dt or '自动'} ~ {end_dt or '自动'}",
+            f"compare_common_time_range={start_dt or '自动'} ~ {end_dt or '自动'}",
             f"txt 合并后点数={txt_points}",
             f"dat 裁切后点数={dat_points}",
             f"txt_FS={fs_a_last:g}",
@@ -7117,7 +7306,11 @@ class FileViewerApp:
             analysis_label="；".join(item["label"] for item in series_results),
             extra_items=extra_items,
         )
-        status = f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(series_results)}"
+        status = (
+            f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(series_results)}"
+            f" | 时间窗={time_range_meta.get('time_range_policy_label', first_details.get('time_range_policy_label', '默认'))}"
+            f" | {time_range_meta.get('time_range_difference_hint', core.TIME_RANGE_DIFFERENCE_HINT)}"
+        )
         if layout == "分别生成两张图":
             if self.separate_plot_windows:
                 status += f" | 已生成独立图窗口：{len(self.separate_plot_windows)} 个"
@@ -7231,6 +7424,7 @@ class FileViewerApp:
         display_meta: dict[str, str] | None = None
 
         if analysis_type == "spectral":
+            time_range_display_suffix = core.build_time_range_display_suffix(details)
             positive = (freq > 0) & np.isfinite(freq) & np.isfinite(density) & (density > 0)
             freq = freq[positive]
             density = density[positive]
@@ -7242,16 +7436,7 @@ class FileViewerApp:
                 quality_items.append(f"base_spectrum_builder={details.get('base_spectrum_builder')}")
             if details.get("base_fs_source") is not None:
                 quality_items.append(f"base_fs_source={details.get('base_fs_source')}")
-            if details.get("base_requested_start") is not None or details.get("base_requested_end") is not None:
-                quality_items.append(
-                    f"base_requested_time_range={details.get('base_requested_start') or '自动'} ~ "
-                    f"{details.get('base_requested_end') or '自动'}"
-                )
-            if details.get("base_actual_start") is not None or details.get("base_actual_end") is not None:
-                quality_items.append(
-                    f"base_actual_time_range={details.get('base_actual_start') or '无'} ~ "
-                    f"{details.get('base_actual_end') or '无'}"
-                )
+            quality_items.extend(core.build_time_range_diagnostic_items(details))
             if len(freq) < 10:
                 quality_items.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
             ax.set_xscale("log")
@@ -7265,7 +7450,7 @@ class FileViewerApp:
                 alpha=0.8,
                 edgecolors="none",
             )
-            title = f"功率谱密度：{columns[0]}"
+            title = f"功率谱密度：{columns[0]}{time_range_display_suffix}"
             ylabel = "Power Spectral Density"
             self.add_selected_reference_slopes(ax, freq, density, is_psd=True)
         else:
@@ -7373,6 +7558,10 @@ class FileViewerApp:
                     "psd": self.current_result_values,
                 }
             )
+            self.current_result_frame = self.attach_metadata_columns(
+                self.current_result_frame,
+                build_export_metadata_from_details(details, include_additional=True),
+            )
         else:
             export_mask = self.build_spectrum_plot_mask(
                 raw_freq,
@@ -7397,7 +7586,11 @@ class FileViewerApp:
             extra_items=quality_items,
         )
         if analysis_type == "spectral":
-            self.status_var.set(f"图已生成：功率谱密度 / {columns[0]}")
+            policy_label = str(details.get("time_range_policy_label") or "默认")
+            self.status_var.set(
+                f"图已生成：功率谱密度 / {columns[0]} | 时间窗={policy_label} | "
+                f"{details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
+            )
         else:
             self.status_var.set(f"图已生成：{display_meta['title_prefix'] if display_meta else '互谱分析'} / {series_label}")
 
@@ -7421,30 +7614,14 @@ class FileViewerApp:
         if merged_frame is None:
             return pd.DataFrame(columns=["frequency_hz"])
         merged_frame = merged_frame.sort_values("frequency_hz").reset_index(drop=True)
-        first_details = dict(series_results[0].get("details", {})) if series_results else {}
-        for key in (
-            "cross_execution_path",
-            "cross_implementation_id",
-            "cross_reference_column",
-            "reference_column",
-            "ygas_target_column",
-            "dat_target_column",
-            "target_column",
-            "cross_order",
-            "canonical_cross_pairs",
-            "generated_cross_series_count",
-            "generated_cross_series_roles",
-            "display_semantics",
-            "display_value_source",
-        ):
-            value = first_details.get(key)
-            if value is not None and key not in merged_frame.columns:
-                if isinstance(value, (list, tuple)):
-                    text_value = " | ".join(str(item) for item in value if str(item).strip())
-                else:
-                    text_value = str(value)
-                merged_frame[key] = [text_value] * len(merged_frame)
-        return merged_frame
+        return self.attach_metadata_columns(
+            merged_frame,
+            build_aggregated_export_metadata(
+                series_results,
+                formatter=self.format_metadata_value,
+                include_additional=True,
+            ),
+        )
 
     def plot_multi_spectral_results(
         self,
@@ -7461,6 +7638,8 @@ class FileViewerApp:
         device_groups = list(payload.get("device_groups", []))
         device_count = int(payload.get("device_count", len(series_results)))
         file_count = int(payload.get("file_count", sum(int(item.get("file_count", 1)) for item in series_results)))
+        first_details = dict(series_results[0].get("details", {})) if series_results else {}
+        time_range_display_suffix = core.build_time_range_display_suffix(first_details)
 
         combined_freq: list[np.ndarray] = []
         combined_density: list[np.ndarray] = []
@@ -7484,9 +7663,9 @@ class FileViewerApp:
         all_density = np.concatenate(combined_density)
         self.add_selected_reference_slopes(ax, all_freq, all_density, is_psd=True)
         if device_count == 1:
-            title = f"单台设备图谱 - {series_results[0]['label']} - {target_column}"
+            title = f"单台设备图谱 - {series_results[0]['label']} - {target_column}{time_range_display_suffix}"
         else:
-            title = f"多设备图谱对比 - {target_column}"
+            title = f"多设备图谱对比 - {target_column}{time_range_display_suffix}"
         ax.set_title(title)
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("Density")
@@ -7508,7 +7687,6 @@ class FileViewerApp:
             f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | 合并={item['merge_strategy']}"
             for item in device_groups
         ]
-        time_range_text = f"{payload.get('start_dt') or '全文件'} ~ {payload.get('end_dt') or '全文件'}"
         self.update_diagnostic_info(
             layout="单设备模式" if device_count == 1 else "设备分组模式",
             analysis_label=target_column,
@@ -7522,16 +7700,20 @@ class FileViewerApp:
             extra_items=[
                 f"选中文件数={file_count}",
                 f"识别设备数={device_count}",
-                f"基础谱线时间范围={time_range_text}",
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
                 f"base_fs_source={first_details.get('base_fs_source')}",
+                *core.build_time_range_diagnostic_items(first_details),
                 *group_items,
                 *self.build_reference_slope_diagnostic_items(is_psd=True),
             ],
         )
 
         status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
-        status = f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
+        status = (
+            f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
+            f" | 时间窗={first_details.get('time_range_policy_label') or '默认'}"
+            f" | {first_details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
+        )
         if skipped_files:
             preview = "、".join(skipped_files[:3])
             if len(skipped_files) > 3:
@@ -7841,11 +8023,12 @@ class FileViewerApp:
         return "target_windowed"
 
     def build_default_filename(self) -> str:
+        time_range_filename_suffix = core.build_time_range_filename_suffix(self.current_result_frame)
         if self.current_data_source_kind == "comparison_analysis":
             base_name = self.build_comparison_base_name()
             if self.current_plot_kind == "spectral" and self.current_plot_columns:
                 col = sanitize_filename(self.current_plot_columns[0])
-                return f"{base_name}_{col}_spectral_plot.png"
+                return f"{base_name}_{col}_spectral{time_range_filename_suffix}_plot.png"
             if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
                 col1 = sanitize_filename(self.current_plot_columns[0])
                 col2 = sanitize_filename(self.current_plot_columns[1])
@@ -7855,12 +8038,21 @@ class FileViewerApp:
             element = sanitize_filename(self.current_plot_columns[0] if self.current_plot_columns else "target")
             return f"{self.build_target_plot_base_name()}_{element}_target_spectrum_plot.png"
 
-        if self.current_file is None:
+        if self.current_file is None and self.current_plot_kind not in {
+            "multi_spectral",
+            "aligned_time_series",
+            "aligned_scatter",
+            "dual_psd_compare",
+            "aligned_diff",
+            "aligned_ratio",
+            "aligned_cospectrum",
+            "aligned_quadrature",
+        }:
             return "spectral_plot.png"
 
-        base_name = sanitize_filename(self.current_file.stem)
+        base_name = sanitize_filename(self.current_file.stem) if self.current_file is not None else "current_plot"
         if self.current_plot_kind == "spectral":
-            return f"{base_name}_spectral_plot.png"
+            return f"{base_name}_spectral{time_range_filename_suffix}_plot.png"
 
         if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
             col1 = sanitize_filename(self.current_plot_columns[0])
@@ -7871,8 +8063,8 @@ class FileViewerApp:
             col = sanitize_filename(self.current_plot_columns[0])
             if len(self.current_compare_files) == 1:
                 device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
-                return f"{device_name}_单台图谱_{col}_plot.png"
-            return f"multi_device_{col}_plot.png"
+                return f"{device_name}_单台图谱_{col}{time_range_filename_suffix}_plot.png"
+            return f"multi_device_{col}{time_range_filename_suffix}_plot.png"
 
         if self.current_plot_kind in {
             "aligned_time_series",
@@ -7892,16 +8084,17 @@ class FileViewerApp:
                 "aligned_cospectrum": "cospectrum_compare",
                 "aligned_quadrature": "quadrature_compare",
             }[self.current_plot_kind]
-            return f"{kind_name}_{self.build_compare_filename_core()}_plot.png"
+            return f"{kind_name}_{self.build_compare_filename_core()}{time_range_filename_suffix if self.current_plot_kind == 'dual_psd_compare' else ''}_plot.png"
 
         return "spectral_plot.png"
 
     def build_default_data_filename(self) -> str:
+        time_range_filename_suffix = core.build_time_range_filename_suffix(self.current_result_frame)
         if self.current_data_source_kind == "comparison_analysis":
             base_name = self.build_comparison_base_name()
             if self.current_plot_kind == "spectral" and self.current_plot_columns:
                 col = sanitize_filename(self.current_plot_columns[0])
-                return f"{base_name}_{col}_spectral_data.csv"
+                return f"{base_name}_{col}_spectral{time_range_filename_suffix}_data.csv"
             if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
                 col1 = sanitize_filename(self.current_plot_columns[0])
                 col2 = sanitize_filename(self.current_plot_columns[1])
@@ -7911,12 +8104,17 @@ class FileViewerApp:
             element = sanitize_filename(self.current_plot_columns[0] if self.current_plot_columns else "target")
             return f"{self.build_target_plot_base_name()}_{element}_target_spectrum_data.csv"
 
-        if self.current_file is None:
+        if self.current_file is None and self.current_plot_kind not in {
+            "multi_spectral",
+            "dual_psd_compare",
+            "aligned_cospectrum",
+            "aligned_quadrature",
+        }:
             return "spectral_data.csv"
 
-        base_name = sanitize_filename(self.current_file.stem)
+        base_name = sanitize_filename(self.current_file.stem) if self.current_file is not None else "current_plot"
         if self.current_plot_kind == "spectral":
-            return f"{base_name}_spectral_data.csv"
+            return f"{base_name}_spectral{time_range_filename_suffix}_data.csv"
 
         if self.current_plot_kind == "cross" and len(self.current_plot_columns) == 2:
             col1 = sanitize_filename(self.current_plot_columns[0])
@@ -7927,11 +8125,11 @@ class FileViewerApp:
             col = sanitize_filename(self.current_plot_columns[0])
             if len(self.current_compare_files) == 1:
                 device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
-                return f"{device_name}_单台图谱_{col}_data.csv"
-            return f"multi_device_{col}_data.csv"
+                return f"{device_name}_单台图谱_{col}{time_range_filename_suffix}_data.csv"
+            return f"multi_device_{col}{time_range_filename_suffix}_data.csv"
 
         if self.current_plot_kind == "dual_psd_compare":
-            return f"psd_compare_{self.build_compare_filename_core()}_data.csv"
+            return f"psd_compare_{self.build_compare_filename_core()}{time_range_filename_suffix}_data.csv"
 
         if self.current_plot_kind == "aligned_cospectrum":
             return f"cospectrum_compare_{self.build_compare_filename_core()}_data.csv"

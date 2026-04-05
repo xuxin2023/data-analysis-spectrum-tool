@@ -10,6 +10,74 @@ import pandas as pd
 
 import spectrum_core as core
 
+REPO_ROOT = Path(__file__).resolve().parent
+REPO_FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "smoke"
+REPO_FIXTURE_YGAS = REPO_FIXTURE_DIR / "ygas_h2o_1min.log"
+REPO_FIXTURE_DAT = REPO_FIXTURE_DIR / "toa5_h2o_1min.dat"
+REVERSE_ENGINEERING_README = REPO_ROOT / "reverse_engineering" / "README.md"
+
+
+def resolve_repo_fixture_paths() -> dict[str, Path]:
+    fixtures = {
+        "ygas": REPO_FIXTURE_YGAS,
+        "dat": REPO_FIXTURE_DAT,
+    }
+    missing = [str(path) for path in fixtures.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "repo fixture files are missing: " + ", ".join(missing)
+        )
+    return fixtures
+
+
+def clone_args(args: argparse.Namespace, **overrides: object) -> argparse.Namespace:
+    data = vars(args).copy()
+    data.update(overrides)
+    return argparse.Namespace(**data)
+
+
+def extract_markdown_section_items(path: Path, heading: str) -> list[str]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    target_heading = f"## {heading}"
+    collected: list[str] = []
+    collecting = False
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if line.startswith("## "):
+            if collecting:
+                break
+            collecting = line == target_heading
+            continue
+        if not collecting:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- "):
+            collected.append(stripped[2:].strip())
+        else:
+            collected.append(stripped)
+    return collected
+
+
+def load_reverse_engineering_semantics_context() -> dict[str, list[str]]:
+    return {
+        "verified_facts": extract_markdown_section_items(
+            REVERSE_ENGINEERING_README,
+            "Verified facts from the unpacked payload",
+        ),
+        "interpretation": extract_markdown_section_items(
+            REVERSE_ENGINEERING_README,
+            "Interpretation used in this rebuild",
+        ),
+        "current_gap": extract_markdown_section_items(
+            REVERSE_ENGINEERING_README,
+            "Current gap",
+        ),
+    }
+
 
 def parse_supported_file(path: Path) -> core.ParsedDataResult:
     profile = core.detect_file_profile(path, core.read_preview_lines(path))
@@ -183,6 +251,86 @@ def print_group_summary(group_records: list[dict[str, object]]) -> None:
             f"status={record.get('status')} keep={record.get('keep')} "
             f"forced_include={record.get('forced_include')} reason={record.get('reason')}"
         )
+
+
+def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
+    fixtures = resolve_repo_fixture_paths()
+    print("[repo_fixture_smoke]")
+    print(f"fixture_ygas={fixtures['ygas']}")
+    print(f"fixture_dat={fixtures['dat']}")
+
+    checks: list[tuple[str, object, argparse.Namespace]] = [
+        (
+            "single_ygas",
+            run_single_mode,
+            clone_args(
+                args,
+                mode="single",
+                ygas=[str(fixtures["ygas"])],
+                dat=None,
+                element="H2O",
+            ),
+        ),
+        (
+            "single_dat",
+            run_single_mode,
+            clone_args(
+                args,
+                mode="single",
+                ygas=None,
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "dual_ygas_dat",
+            run_dual_mode,
+            clone_args(
+                args,
+                mode="dual",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_compare_base_spectrum",
+            run_single_compare_base_spectrum_core_metadata_check_mode,
+            clone_args(
+                args,
+                mode="single-compare-base-spectrum-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "frr_compat_semantics",
+            run_frr_compat_semantics_check_mode,
+            clone_args(
+                args,
+                mode="frr-compat-semantics-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+    ]
+
+    failed = False
+    for name, func, mode_args in checks:
+        try:
+            exit_code = int(func(mode_args))
+            ok = exit_code == 0
+            detail = f"exit_code={exit_code}"
+        except Exception as exc:
+            ok = False
+            detail = str(exc)
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
 
 
 def run_single_mode(args: argparse.Namespace) -> int:
@@ -586,12 +734,21 @@ def run_target_cospectrum_implementation_mode(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
-    if not args.ygas or not args.dat:
-        raise ValueError("cross-display-semantics-check 模式需要提供 --ygas 和 --dat。")
-
-    ygas_paths = [Path(path) for path in args.ygas]
-    dat_path = Path(args.dat)
+def run_cross_display_semantics_check_mode(
+    args: argparse.Namespace,
+    *,
+    header: str = "cross display semantics check",
+    include_readme_context: bool = False,
+) -> int:
+    if args.ygas and args.dat:
+        ygas_paths = [Path(path) for path in args.ygas]
+        dat_path = Path(args.dat)
+        input_source = "cli_inputs"
+    else:
+        fixtures = resolve_repo_fixture_paths()
+        ygas_paths = [fixtures["ygas"]]
+        dat_path = fixtures["dat"]
+        input_source = "repo_fixture_default"
     target_element = args.element
     parsed_dat = parse_supported_file(dat_path)
     parsed_ygas = parse_supported_file(ygas_paths[0])
@@ -766,10 +923,61 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
         spectrum_type=core.CROSS_SPECTRUM_REAL,
         insufficient_message="generic 双列分析未得到有效协谱图。",
     )
+    generic_mag_freq, _generic_mag_raw_values, generic_mag_details = core.compute_cross_spectrum_from_arrays_with_params(
+        reference_frame["value"].to_numpy(dtype=float),
+        dat_target_frame["value"].to_numpy(dtype=float),
+        float(generic_fs),
+        args.nsegment,
+        args.overlap_ratio,
+        spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+        insufficient_message="generic 双列分析未得到有效互谱幅值。",
+    )
+    generic_mag_details = dict(generic_mag_details)
+    generic_mag_details.update(core.describe_generic_default_cross_implementation())
+    generic_mag_details["alignment_strategy"] = core.GENERIC_SAME_FRAME_ALIGNMENT_STRATEGY
+    generic_mag_details["cross_reference_column"] = str(reference_column)
+    generic_mag_details["reference_column"] = str(reference_column)
+    generic_mag_details["target_column"] = str(dat_target_column)
+    generic_mag_details["cross_order"] = f"{reference_column} -> {dat_target_column}"
+    generic_mag_values, generic_mag_mask, generic_mag_details = core.resolve_cross_display_output(
+        generic_mag_freq,
+        generic_mag_details,
+        analysis_context=generic_mag_details.get("analysis_context"),
+        cross_execution_path=generic_mag_details.get("cross_execution_path"),
+        spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+        insufficient_message="generic 双列分析未得到有效互谱幅值。",
+    )
+    generic_quad_freq, _generic_quad_raw_values, generic_quad_details = core.compute_cross_spectrum_from_arrays_with_params(
+        reference_frame["value"].to_numpy(dtype=float),
+        dat_target_frame["value"].to_numpy(dtype=float),
+        float(generic_fs),
+        args.nsegment,
+        args.overlap_ratio,
+        spectrum_type=core.CROSS_SPECTRUM_IMAG,
+        insufficient_message="generic 双列分析未得到有效正交谱。",
+    )
+    generic_quad_details = dict(generic_quad_details)
+    generic_quad_details.update(core.describe_generic_default_cross_implementation())
+    generic_quad_details["alignment_strategy"] = core.GENERIC_SAME_FRAME_ALIGNMENT_STRATEGY
+    generic_quad_details["cross_reference_column"] = str(reference_column)
+    generic_quad_details["reference_column"] = str(reference_column)
+    generic_quad_details["target_column"] = str(dat_target_column)
+    generic_quad_details["cross_order"] = f"{reference_column} -> {dat_target_column}"
+    generic_quad_values, generic_quad_mask, generic_quad_details = core.resolve_cross_display_output(
+        generic_quad_freq,
+        generic_quad_details,
+        analysis_context=generic_quad_details.get("analysis_context"),
+        cross_execution_path=generic_quad_details.get("cross_execution_path"),
+        spectrum_type=core.CROSS_SPECTRUM_IMAG,
+        insufficient_message="generic 双列分析未得到有效正交谱。",
+    )
 
     def _masked_values(payload: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         mask = np.asarray(payload["mask"], dtype=bool)
         return np.asarray(payload["freq"], dtype=float)[mask], np.asarray(payload["values"], dtype=float)[mask]
+
+    def _masked_detail_values(mask: np.ndarray, details: dict[str, Any], detail_key: str) -> np.ndarray:
+        return np.asarray(details[detail_key], dtype=float)[np.asarray(mask, dtype=bool)]
 
     def _series_lookup(payload: dict[str, Any]) -> dict[tuple[int, str], dict[str, Any]]:
         return {
@@ -798,7 +1006,11 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
                 break
 
     generic_display_values = np.asarray(generic_values, dtype=float)[np.asarray(generic_mask, dtype=bool)]
-    generic_real_values = np.asarray(generic_details["cross_spectrum_real"], dtype=float)[np.asarray(generic_mask, dtype=bool)]
+    generic_real_values = _masked_detail_values(generic_mask, generic_details, "cross_spectrum_real")
+    generic_mag_display_values = np.asarray(generic_mag_values, dtype=float)[np.asarray(generic_mag_mask, dtype=bool)]
+    generic_mag_abs_values = _masked_detail_values(generic_mag_mask, generic_mag_details, "cross_spectrum_abs")
+    generic_quad_display_values = np.asarray(generic_quad_values, dtype=float)[np.asarray(generic_quad_mask, dtype=bool)]
+    generic_quad_imag_values = _masked_detail_values(generic_quad_mask, generic_quad_details, "cross_spectrum_imag")
     quad_mask = np.asarray(advanced_ygas_quad["mask"], dtype=bool)
     quad_display_values = np.asarray(advanced_ygas_quad["values"], dtype=float)[quad_mask]
     quad_imag_values = np.asarray(advanced_ygas_quad["details"]["cross_spectrum_imag"], dtype=float)[quad_mask]
@@ -816,27 +1028,37 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
     actual_group_series_count = int(target_group_cos["target_metadata"].get("actual_series_count", 0))
     generated_roles = sorted(str(item) for item in (target_group_cos["target_metadata"].get("generated_cross_series_roles") or []))
 
-    checks: list[tuple[str, bool]] = [
-        ("advanced canonical ygas cos == magnitude", _allclose_payload(advanced_ygas_cos, advanced_ygas_mag)),
-        ("advanced canonical dat cos == magnitude", _allclose_payload(advanced_dat_cos, advanced_dat_mag)),
-        ("advanced canonical ygas display_semantics == abs_pxy", advanced_ygas_cos["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
-        ("advanced canonical dat display_semantics == abs_pxy", advanced_dat_cos["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
-        ("advanced canonical quadrature display_semantics == imag_pxy", advanced_ygas_quad["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_IMAG),
-        ("advanced canonical quadrature uses imag source", np.allclose(quad_display_values, quad_imag_values)),
+    math_checks: list[tuple[str, bool]] = [
+        ("generic cross magnitude display_semantics == abs_pxy", generic_mag_details.get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
+        ("generic cross magnitude display_value_source == cross_spectrum_abs", generic_mag_details.get("display_value_source") == "cross_spectrum_abs"),
+        ("generic cross magnitude values come from abs(Pxy)", np.allclose(generic_mag_display_values, generic_mag_abs_values)),
+        ("generic cospectrum display_semantics == real_pxy", generic_details.get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_REAL),
+        ("generic cospectrum display_value_source == cross_spectrum_real", generic_details.get("display_value_source") == "cross_spectrum_real"),
+        ("generic cospectrum values come from real(Pxy)", np.allclose(generic_display_values, generic_real_values)),
+        ("generic quadrature display_semantics == imag_pxy", generic_quad_details.get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_IMAG),
+        ("generic quadrature display_value_source == cross_spectrum_imag", generic_quad_details.get("display_value_source") == "cross_spectrum_imag"),
+        ("generic quadrature values come from imag(Pxy)", np.allclose(generic_quad_display_values, generic_quad_imag_values)),
+    ]
+    frr_checks: list[tuple[str, bool]] = [
+        ("target canonical ygas cos == magnitude", _allclose_payload(advanced_ygas_cos, advanced_ygas_mag)),
+        ("target canonical dat cos == magnitude", _allclose_payload(advanced_dat_cos, advanced_dat_mag)),
+        ("target canonical ygas UI cospectrum display_semantics == abs_pxy", advanced_ygas_cos["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
+        ("target canonical dat UI cospectrum display_semantics == abs_pxy", advanced_dat_cos["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
+        ("target canonical quadrature display_semantics == imag_pxy", advanced_ygas_quad["details"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_IMAG),
+        ("target canonical quadrature values still come from imag(Pxy)", np.allclose(quad_display_values, quad_imag_values)),
         ("target group canonical cos keys == magnitude keys", group_pair_keys_same),
         ("target group canonical cos values == magnitude values", group_values_same),
+        ("target group target-spectral metadata display_semantics == abs_pxy", target_group_cos["target_metadata"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
+    ]
+    diagnostic_checks: list[tuple[str, bool]] = [
         ("target group actual_series_count == kept_groups * 2", actual_group_series_count == expected_group_series_count),
         ("target group generated_cross_series_roles == [dat_target_vs_uz, ygas_target_vs_uz]", generated_roles == ["dat_target_vs_uz", "ygas_target_vs_uz"]),
-        ("target group display_semantics == abs_pxy", target_group_cos["target_metadata"].get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_ABS),
         ("target group reference_column == Uz", target_group_cos["target_metadata"].get("reference_column") == "Uz"),
         ("target group has ygas_target_column", bool(target_group_cos["target_metadata"].get("ygas_target_column"))),
         ("target group has dat_target_column", bool(target_group_cos["target_metadata"].get("dat_target_column"))),
         ("target group canonical_cross_pairs count == 2", len(target_group_cos["target_metadata"].get("canonical_cross_pairs") or []) == 2),
         ("summary ygas pair resolves as canonical", bool(summary_pair_ygas.get("uses_canonical_pair")) and summary_pair_ygas.get("resolved_pair", {}).get("series_role") == "ygas_target_vs_uz"),
         ("summary dat pair resolves as canonical", bool(summary_pair_dat.get("uses_canonical_pair")) and summary_pair_dat.get("resolved_pair", {}).get("series_role") == "dat_target_vs_uz"),
-        ("generic cos display_semantics == real_pxy", generic_details.get("display_semantics") == core.CROSS_DISPLAY_SEMANTICS_REAL),
-        ("generic cos display_value_source == cross_spectrum_real", generic_details.get("display_value_source") == "cross_spectrum_real"),
-        ("generic cos values come from cross_spectrum_real", np.allclose(generic_display_values, generic_real_values)),
         ("canonical diagnostics.cross_execution_path == target_spectral_canonical", advanced_ygas_cos["details"].get("cross_execution_path") == "target_spectral_canonical"),
         ("canonical diagnostics.cross_implementation_id == A", advanced_ygas_cos["details"].get("cross_implementation_id") == "A"),
         ("canonical diagnostics.cross_reference_column == Uz", advanced_ygas_cos["details"].get("cross_reference_column") == "Uz"),
@@ -846,7 +1068,8 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
         ),
     ]
 
-    print("[cross display semantics check]")
+    print(f"[{header}]")
+    print(f"- input_source={input_source}")
     print(f"- element={target_element}")
     print(f"- ygas_count={len(ygas_paths)}")
     print(f"- dat={dat_path}")
@@ -855,10 +1078,32 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
     print(f"- reference_column={reference_column}")
     print("")
 
-    for label, ok in checks:
-        print(f"[{'PASS' if ok else 'FAIL'}] {label}")
+    for section_title, section_checks in (
+        ("数学正确语义", math_checks),
+        ("FRR 兼容语义", frr_checks),
+        ("诊断字段", diagnostic_checks),
+    ):
+        print(f"[{section_title}]")
+        for label, ok in section_checks:
+            print(f"[{'PASS' if ok else 'FAIL'}] {label}")
+        print("")
 
-    print("")
+    if include_readme_context:
+        print("[reverse_engineering README 对照]")
+        for section_title, key in (
+            ("已确认的 payload 事实", "verified_facts"),
+            ("当前 rebuild 采用的解释", "interpretation"),
+            ("当前仍然存在的 gap", "current_gap"),
+        ):
+            print(f"- {section_title}:")
+            items = load_reverse_engineering_semantics_context().get(key, [])
+            if not items:
+                print("  - evidence unavailable")
+                continue
+            for item in items:
+                print(f"  - {item}")
+        print("")
+
     print("[diagnostics]")
     diagnostics = target_group_cos["target_metadata"]
     for key in (
@@ -870,10 +1115,12 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
         "canonical_cross_pairs",
         "generated_cross_series_count",
         "generated_cross_series_roles",
+        "display_semantics",
+        "display_value_source",
     ):
         print(f"- {key}={diagnostics.get(key)}")
 
-    failed = [label for label, ok in checks if not ok]
+    failed = [label for label, ok in [*math_checks, *frr_checks, *diagnostic_checks] if not ok]
     if failed:
         print("")
         print("[failed checks]")
@@ -883,11 +1130,19 @@ def run_cross_display_semantics_check_mode(args: argparse.Namespace) -> int:
 
     print("")
     print("[summary]")
-    print("- target_spectral canonical 下，协谱图现在按 abs(Pxy) 显示，因此与互谱幅值一致。")
-    print("- target non-PSD 与高级页 canonical cross 现在都保留 ygas/dat 两条系列。")
-    print("- comparison summary / main analysis 现在都能识别 B_Uz -> A_target 与 B_Uz -> B_target 两条 canonical pair。")
-    print("- generic 双列分析仍保留数学定义：协谱=real(Pxy)，正交谱=imag(Pxy)。")
+    print("- 数学正确语义：generic dual-column analysis 保持 cross magnitude=abs(Pxy), cospectrum=real(Pxy), quadrature=imag(Pxy)。")
+    print("- FRR 兼容语义：target-spectral canonical path 下，UI“协谱图”仍映射到 abs(Pxy)，因此会与互谱幅值一致。")
+    print("- README 对照说明：当前仅基于 payload 线索与仓库实现做回归验证，没有声称已完全还原原始源码。")
+    print("- reverse_engineering/README.md 已明确：当前仍未在仓库中找到实际反编译 Python 源文件。")
     return 0
+
+
+def run_frr_compat_semantics_check_mode(args: argparse.Namespace) -> int:
+    return run_cross_display_semantics_check_mode(
+        args,
+        header="frr compat semantics check",
+        include_readme_context=True,
+    )
 
 
 def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
@@ -1041,6 +1296,43 @@ def run_single_compare_base_spectrum_check_mode(args: argparse.Namespace) -> int
     root.withdraw()
     app = app_mod.FileViewerApp(root)
     try:
+        ygas_loader_result = app.load_file_with_file_settings(ygas_path)
+        app.on_file_loaded(ygas_path, ygas_loader_result)
+        single_plot_column = col_a
+        if single_plot_column not in app.column_vars:
+            loaded_parsed = app.current_file_parsed
+            if loaded_parsed is not None:
+                resolved_loaded_column = choose_single_column(loaded_parsed, args.element, "single")
+                if resolved_loaded_column:
+                    single_plot_column = resolved_loaded_column
+            if single_plot_column not in app.column_vars:
+                element_token = str(args.element or "").strip().lower()
+                fallback_column = next(
+                    (
+                        name
+                        for name in app.column_vars
+                        if element_token and element_token in str(name).strip().lower()
+                    ),
+                    None,
+                )
+                if fallback_column is not None:
+                    single_plot_column = str(fallback_column)
+        if single_plot_column not in app.column_vars:
+            raise ValueError(
+                f"Loaded single-file UI does not expose target column: {col_a}; available={list(app.column_vars.keys())}"
+            )
+        for column_name, column_var in app.column_vars.items():
+            column_var.set(column_name == single_plot_column)
+        single_plot_freq, single_plot_density, single_plot_details = app.spectral_analysis()
+        app.plot_results("spectral", single_plot_freq, single_plot_density, [single_plot_column], single_plot_details)
+        single_plot_title = app.figure.axes[0].get_title() if app.figure.axes else ""
+        single_plot_diag_text = app.diagnostic_var.get()
+        single_plot_status_text = app.status_var.get()
+        single_plot_export_frame = app.current_result_frame.copy() if app.current_result_frame is not None else pd.DataFrame()
+        single_plot_export_columns = list(single_plot_export_frame.columns)
+        single_plot_default_filename = app.build_default_filename()
+        single_plot_default_data_filename = app.build_default_data_filename()
+
         dual_base = app.prepare_dual_compare_payload(
             ygas_paths=[ygas_path],
             dat_path=dat_path,
@@ -1161,6 +1453,1147 @@ def run_single_compare_base_spectrum_check_mode(args: argparse.Namespace) -> int
     return 1 if failed else 0
 
 
+def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-compare-base-spectrum-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    required_metadata_keys = list(app_mod.get_required_export_metadata_fields())
+    required_detail_metadata_keys = [key for key in required_metadata_keys if key != "time_range_policy_note"]
+    required_detail_metadata_keys = [key for key in required_metadata_keys if key != "time_range_policy_note"]
+    export_metadata_columns = required_metadata_keys + ["time_range_policy_note"]
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+        compare_time_range_meta = app.build_compare_time_range_meta(
+            strategy_label=app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            has_txt_dat_context=bool(
+                selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+            ),
+        )
+
+        single_ygas_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        single_dat_payload = app.prepare_multi_spectral_compare_payload(
+            [dat_path],
+            col_b,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        single_full_ygas_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=None,
+            end_dt=None,
+        )
+        single_plot_series = single_full_ygas_payload["series_results"][0]
+        single_plot_details = dict(single_plot_series["details"])
+        app.current_file = ygas_path
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.plot_results(
+            "spectral",
+            np.asarray(single_plot_series["freq"], dtype=float),
+            np.asarray(single_plot_series["density"], dtype=float),
+            [col_a],
+            single_plot_details,
+        )
+        single_plot_title = app.figure.axes[0].get_title() if app.figure.axes else ""
+        single_plot_diag_text = app.diagnostic_var.get()
+        single_plot_status_text = app.status_var.get()
+        single_plot_export_frame = app.current_result_frame.copy() if app.current_result_frame is not None else pd.DataFrame()
+        single_plot_export_columns = list(single_plot_export_frame.columns)
+        single_plot_default_filename = app.build_default_filename()
+        single_plot_default_data_filename = app.build_default_data_filename()
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_meta=compare_time_range_meta,
+        )
+
+        app.plot_multi_spectral_results(
+            col_a,
+            single_full_ygas_payload["series_results"],
+            single_full_ygas_payload["skipped_files"],
+            payload=single_full_ygas_payload,
+        )
+        single_title = app.figure.axes[0].get_title() if app.figure.axes else ""
+        single_diag_text = app.diagnostic_var.get()
+        single_status_text = app.status_var.get()
+        single_export_columns = list(app.current_result_frame.columns)
+        single_default_filename = app.build_default_filename()
+        single_default_data_filename = app.build_default_data_filename()
+
+        app.on_prepared_dual_plot_ready(dual_plot_payload)
+        compare_titles = [axis.get_title() for axis in app.figure.axes]
+        compare_diag_text = app.diagnostic_var.get()
+        compare_status_text = app.status_var.get()
+        compare_export_columns = list(app.current_result_frame.columns)
+        compare_default_filename = app.build_default_filename()
+        compare_default_data_filename = app.build_default_data_filename()
+
+        synced_range = app.sync_compare_common_time_range_to_single_analysis(selection_meta)
+        synced_start_dt, synced_end_dt = app.resolve_optional_time_range_inputs()
+        synced_single_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=synced_start_dt,
+            end_dt=synced_end_dt,
+        )
+    finally:
+        root.destroy()
+
+    if (
+        len(single_ygas_payload["series_results"]) != 1
+        or len(single_dat_payload["series_results"]) != 1
+        or len(single_full_ygas_payload["series_results"]) != 1
+    ):
+        raise ValueError("Single-type payload did not produce exactly one spectrum series per side.")
+
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+    )
+    dual_dat = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "dat" and str(item["column"]) == col_b
+    )
+    single_ygas = single_ygas_payload["series_results"][0]
+    single_dat = single_dat_payload["series_results"][0]
+    single_full_ygas = single_full_ygas_payload["series_results"][0]
+    synced_single_ygas = synced_single_payload["series_results"][0]
+    single_short_label = app.resolve_time_range_policy_short_label(
+        single_full_ygas["details"].get("time_range_policy"),
+        single_full_ygas["details"].get("time_range_policy_label"),
+    )
+    compare_short_label = app.resolve_time_range_policy_short_label(
+        dual_ygas["details"].get("time_range_policy"),
+        dual_ygas["details"].get("time_range_policy_label"),
+    )
+    single_file_tag = app.resolve_time_range_policy_file_tag(
+        single_full_ygas["details"].get("time_range_policy"),
+        single_full_ygas["details"].get("time_range_policy_label"),
+    )
+    compare_file_tag = app.resolve_time_range_policy_file_tag(
+        dual_ygas["details"].get("time_range_policy"),
+        dual_ygas["details"].get("time_range_policy_label"),
+    )
+
+    checks = [
+        (
+            "ygas_base_freq_equal_same_window",
+            np.array_equal(single_ygas["freq"], dual_ygas["freq"]),
+            {"single_points": len(single_ygas["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "ygas_base_density_allclose_same_window",
+            np.allclose(single_ygas["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_ygas["density"][:5].tolist(), "compare_first5": dual_ygas["density"][:5].tolist()},
+        ),
+        (
+            "dat_base_freq_equal_same_window",
+            np.array_equal(single_dat["freq"], dual_dat["freq"]),
+            {"single_points": len(single_dat["freq"]), "compare_points": len(dual_dat["freq"])},
+        ),
+        (
+            "dat_base_density_allclose_same_window",
+            np.allclose(single_dat["density"], dual_dat["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_dat["density"][:5].tolist(), "compare_first5": dual_dat["density"][:5].tolist()},
+        ),
+        (
+            "shared_base_builder",
+            single_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and single_dat["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_dat["details"].get("base_spectrum_builder") == "shared_profile_based",
+            {
+                "single_ygas_builder": single_ygas["details"].get("base_spectrum_builder"),
+                "dual_ygas_builder": dual_ygas["details"].get("base_spectrum_builder"),
+                "single_dat_builder": single_dat["details"].get("base_spectrum_builder"),
+                "dual_dat_builder": dual_dat["details"].get("base_spectrum_builder"),
+            },
+        ),
+        (
+            "same_window_metadata_keys_present",
+            all(single_ygas["details"].get(key) is not None for key in required_metadata_keys)
+            and all(single_dat["details"].get(key) is not None for key in required_metadata_keys)
+            and all(dual_ygas["details"].get(key) is not None for key in required_metadata_keys)
+            and all(dual_dat["details"].get(key) is not None for key in required_metadata_keys),
+            {
+                "required_keys": required_metadata_keys,
+                "single_ygas_keys": sorted(key for key in required_metadata_keys if single_ygas["details"].get(key) is not None),
+                "single_dat_keys": sorted(key for key in required_metadata_keys if single_dat["details"].get(key) is not None),
+                "dual_ygas_keys": sorted(key for key in required_metadata_keys if dual_ygas["details"].get(key) is not None),
+                "dual_dat_keys": sorted(key for key in required_metadata_keys if dual_dat["details"].get(key) is not None),
+            },
+        ),
+        (
+            "single_full_file_policy",
+            single_full_ygas["details"].get("time_range_policy") == "full_file",
+            {
+                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_full_label": single_full_ygas["details"].get("time_range_policy_label"),
+            },
+        ),
+        (
+            "compare_common_window_policy",
+            dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
+            and dual_dat["details"].get("time_range_policy") == "txt_dat_common_window",
+            {
+                "dual_ygas_policy": dual_ygas["details"].get("time_range_policy"),
+                "dual_dat_policy": dual_dat["details"].get("time_range_policy"),
+                "compare_policy_label": compare_time_range_meta.get("time_range_policy_label"),
+            },
+        ),
+        (
+            "single_full_vs_compare_window_distinguished",
+            single_full_ygas["details"].get("time_range_policy") != dual_ygas["details"].get("time_range_policy"),
+            {
+                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "compare_policy": dual_ygas["details"].get("time_range_policy"),
+                "single_full_actual": (
+                    single_full_ygas["details"].get("base_actual_start"),
+                    single_full_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
+            },
+        ),
+        (
+            "single_full_window_note_visible",
+            ("当前单图使用全文件" in single_diag_text) or ("当前单图使用全文件" in single_status_text),
+            {
+                "diagnostic_contains_note": "当前单图使用全文件" in single_diag_text,
+                "status_contains_note": "当前单图使用全文件" in single_status_text,
+                "single_status": single_status_text,
+            },
+        ),
+        (
+            "compare_window_note_visible",
+            ("双设备 PSD 对比使用txt+dat 共同时间范围" in compare_diag_text)
+            or ("时间窗=txt+dat 共同时间范围" in compare_status_text),
+            {
+                "diagnostic_contains_note": "双设备 PSD 对比使用txt+dat 共同时间范围" in compare_diag_text,
+                "status_contains_label": "时间窗=txt+dat 共同时间范围" in compare_status_text,
+                "compare_status": compare_status_text,
+            },
+        ),
+        (
+            "single_export_metadata_columns",
+            all(column in single_export_columns for column in export_metadata_columns),
+            {
+                "required_columns": export_metadata_columns,
+                "single_export_columns": single_export_columns,
+            },
+        ),
+        (
+            "compare_export_metadata_columns",
+            all(column in compare_export_columns for column in export_metadata_columns),
+            {
+                "required_columns": export_metadata_columns,
+                "compare_export_columns": compare_export_columns,
+            },
+        ),
+        (
+            "single_plot_title_contains_policy_short_label",
+            bool(single_plot_short_label) and single_plot_short_label in single_plot_title,
+            {"title": single_plot_title, "expected_label": single_plot_short_label},
+        ),
+        (
+            "single_overlay_title_contains_policy_short_label",
+            bool(single_overlay_short_label) and single_overlay_short_label in single_overlay_title,
+            {"title": single_overlay_title, "expected_label": single_overlay_short_label},
+        ),
+        (
+            "compare_title_contains_policy_short_label",
+            bool(compare_short_label) and any(compare_short_label in title for title in compare_titles),
+            {"titles": compare_titles, "expected_label": compare_short_label},
+        ),
+        (
+            "single_plot_default_filename_contains_policy_tag",
+            bool(single_plot_file_tag)
+            and f"_{single_plot_file_tag}_" in single_plot_default_filename
+            and f"_{single_plot_file_tag}_" in single_plot_default_data_filename,
+            {
+                "plot_filename": single_plot_default_filename,
+                "data_filename": single_plot_default_data_filename,
+                "expected_tag": single_plot_file_tag,
+            },
+        ),
+        (
+            "single_overlay_default_filename_contains_policy_tag",
+            bool(single_overlay_file_tag)
+            and f"_{single_overlay_file_tag}_" in single_overlay_default_filename
+            and f"_{single_overlay_file_tag}_" in single_overlay_default_data_filename,
+            {
+                "plot_filename": single_overlay_default_filename,
+                "data_filename": single_overlay_default_data_filename,
+                "expected_tag": single_overlay_file_tag,
+            },
+        ),
+        (
+            "compare_default_filename_contains_policy_tag",
+            bool(compare_file_tag)
+            and f"_{compare_file_tag}_" in compare_default_filename
+            and f"_{compare_file_tag}_" in compare_default_data_filename,
+            {
+                "plot_filename": compare_default_filename,
+                "data_filename": compare_default_data_filename,
+                "expected_tag": compare_file_tag,
+            },
+        ),
+        (
+            "single_and_compare_status_show_unified_hint",
+            "time_range_policy 与 base_actual_time_range" in single_status_text
+            and "time_range_policy 与 base_actual_time_range" in compare_status_text,
+            {
+                "single_status": single_status_text,
+                "compare_status": compare_status_text,
+            },
+        ),
+        (
+            "single_and_compare_diag_show_unified_hint",
+            "time_range_policy 与 base_actual_time_range" in single_diag_text
+            and "time_range_policy 与 base_actual_time_range" in compare_diag_text,
+            {
+                "single_diag": single_diag_text,
+                "compare_diag": compare_diag_text,
+            },
+        ),
+        (
+            "compare_to_single_sync_returns_common_window",
+            synced_range == (start_dt, end_dt),
+            {"synced_range": synced_range, "compare_range": (start_dt, end_dt)},
+        ),
+        (
+            "compare_to_single_sync_requested_range_equal",
+            synced_single_ygas["details"].get("base_requested_start") == dual_ygas["details"].get("base_requested_start")
+            and synced_single_ygas["details"].get("base_requested_end") == dual_ygas["details"].get("base_requested_end"),
+            {
+                "synced_single_requested": (
+                    synced_single_ygas["details"].get("base_requested_start"),
+                    synced_single_ygas["details"].get("base_requested_end"),
+                ),
+                "compare_requested": (
+                    dual_ygas["details"].get("base_requested_start"),
+                    dual_ygas["details"].get("base_requested_end"),
+                ),
+            },
+        ),
+        (
+            "compare_to_single_sync_actual_range_equal",
+            synced_single_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and synced_single_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
+            {
+                "synced_single_actual": (
+                    synced_single_ygas["details"].get("base_actual_start"),
+                    synced_single_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_compare_base_spectrum_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"same_window_time_range={start_dt} ~ {end_dt}")
+    print(
+        "single_full_time_range="
+        f"{single_full_ygas['details'].get('base_actual_start')} ~ {single_full_ygas['details'].get('base_actual_end')}"
+    )
+    print(
+        "compare_time_range="
+        f"{dual_ygas['details'].get('base_actual_start')} ~ {dual_ygas['details'].get('base_actual_end')}"
+    )
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_time_range_metadata_check_mode(args: argparse.Namespace) -> int:
+    requested_start = pd.Timestamp("2026-03-27 14:30:00")
+    requested_end = pd.Timestamp("2026-03-27 14:59:59.900000")
+    actual_start = pd.Timestamp("2026-03-27 14:30:47.600000")
+    actual_end = pd.Timestamp("2026-03-27 14:59:59.900000")
+
+    single_meta = core.build_single_time_range_metadata(
+        start_dt=requested_start,
+        end_dt=requested_end,
+        has_timestamp=True,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+    )
+    compare_meta = core.build_compare_time_range_metadata(
+        strategy_label="手动输入时间范围",
+        start_dt=requested_start,
+        end_dt=requested_end,
+        has_txt_dat_context=True,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+    )
+
+    checks = [
+        (
+            "time_range_metadata_keys_equal",
+            sorted(single_meta.keys()) == sorted(compare_meta.keys()),
+            {"single_keys": sorted(single_meta.keys()), "compare_keys": sorted(compare_meta.keys())},
+        ),
+        (
+            "time_range_export_keys_present",
+            all(key in single_meta for key in core.TIME_RANGE_METADATA_EXPORT_KEYS)
+            and all(key in compare_meta for key in core.TIME_RANGE_METADATA_EXPORT_KEYS),
+            {"export_keys": list(core.TIME_RANGE_METADATA_EXPORT_KEYS)},
+        ),
+        (
+            "requested_time_range_text_equal",
+            single_meta.get("base_requested_time_range") == compare_meta.get("base_requested_time_range"),
+            {
+                "single_requested": single_meta.get("base_requested_time_range"),
+                "compare_requested": compare_meta.get("base_requested_time_range"),
+            },
+        ),
+        (
+            "actual_time_range_text_equal",
+            single_meta.get("base_actual_time_range") == compare_meta.get("base_actual_time_range"),
+            {
+                "single_actual": single_meta.get("base_actual_time_range"),
+                "compare_actual": compare_meta.get("base_actual_time_range"),
+            },
+        ),
+        (
+            "display_suffix_equal_for_same_window",
+            core.build_time_range_display_suffix(single_meta) == core.build_time_range_display_suffix(compare_meta),
+            {
+                "single_suffix": core.build_time_range_display_suffix(single_meta),
+                "compare_suffix": core.build_time_range_display_suffix(compare_meta),
+            },
+        ),
+        (
+            "filename_suffix_equal_for_same_window",
+            core.build_time_range_filename_suffix(single_meta) == core.build_time_range_filename_suffix(compare_meta),
+            {
+                "single_suffix": core.build_time_range_filename_suffix(single_meta),
+                "compare_suffix": core.build_time_range_filename_suffix(compare_meta),
+            },
+        ),
+        (
+            "difference_hint_equal",
+            single_meta.get("time_range_difference_hint") == compare_meta.get("time_range_difference_hint"),
+            {
+                "single_hint": single_meta.get("time_range_difference_hint"),
+                "compare_hint": compare_meta.get("time_range_difference_hint"),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[time_range_metadata_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-compare-base-spectrum-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    required_metadata_keys = list(app_mod.get_required_export_metadata_fields())
+    required_detail_metadata_keys = [key for key in required_metadata_keys if key != "time_range_policy_note"]
+    required_export_columns = [app_mod.EXPORT_SCHEMA_VERSION_FIELD, *required_metadata_keys]
+    full_export_contract_columns = list(app_mod.get_export_metadata_field_order(include_additional=True))
+    legacy_time_range_export_columns = list(core.TIME_RANGE_METADATA_EXPORT_KEYS)
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+        compare_policy_meta = core.resolve_compare_time_range_policy(
+            strategy_label=app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            has_txt_dat_context=bool(
+                selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+            ),
+        )
+
+        single_ygas_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        single_dat_payload = app.prepare_multi_spectral_compare_payload(
+            [dat_path],
+            col_b,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        single_full_ygas_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=None,
+            end_dt=None,
+        )
+        single_plot_series = single_full_ygas_payload["series_results"][0]
+        single_plot_details = dict(single_plot_series["details"])
+        app.current_file = ygas_path
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.plot_results(
+            "spectral",
+            np.asarray(single_plot_series["freq"], dtype=float),
+            np.asarray(single_plot_series["density"], dtype=float),
+            [col_a],
+            single_plot_details,
+        )
+        single_plot_title = app.figure.axes[0].get_title() if app.figure.axes else ""
+        single_plot_diag_text = app.diagnostic_var.get()
+        single_plot_status_text = app.status_var.get()
+        single_plot_export_frame = app.current_result_frame.copy() if app.current_result_frame is not None else pd.DataFrame()
+        single_plot_export_columns = list(single_plot_export_frame.columns)
+        single_plot_default_filename = app.build_default_filename()
+        single_plot_default_data_filename = app.build_default_data_filename()
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_context={
+                "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                "has_txt_dat_context": True,
+            },
+        )
+
+        app.plot_multi_spectral_results(
+            col_a,
+            single_full_ygas_payload["series_results"],
+            single_full_ygas_payload["skipped_files"],
+            payload=single_full_ygas_payload,
+        )
+        single_overlay_title = app.figure.axes[0].get_title() if app.figure.axes else ""
+        single_overlay_diag_text = app.diagnostic_var.get()
+        single_overlay_status_text = app.status_var.get()
+        single_overlay_export_frame = (
+            app.current_result_frame.copy() if app.current_result_frame is not None else pd.DataFrame()
+        )
+        single_overlay_export_columns = list(single_overlay_export_frame.columns)
+        single_overlay_default_filename = app.build_default_filename()
+        single_overlay_default_data_filename = app.build_default_data_filename()
+
+        app.on_prepared_dual_plot_ready(dual_plot_payload)
+        compare_titles = [axis.get_title() for axis in app.figure.axes]
+        compare_diag_text = app.diagnostic_var.get()
+        compare_status_text = app.status_var.get()
+        compare_export_frame = app.current_result_frame.copy() if app.current_result_frame is not None else pd.DataFrame()
+        compare_export_columns = list(compare_export_frame.columns)
+        compare_default_filename = app.build_default_filename()
+        compare_default_data_filename = app.build_default_data_filename()
+
+        synced_range = app.sync_compare_common_time_range_to_single_analysis(selection_meta)
+        synced_start_dt, synced_end_dt = app.resolve_optional_time_range_inputs()
+        synced_single_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=synced_start_dt,
+            end_dt=synced_end_dt,
+        )
+    finally:
+        root.destroy()
+
+    if (
+        len(single_ygas_payload["series_results"]) != 1
+        or len(single_dat_payload["series_results"]) != 1
+        or len(single_full_ygas_payload["series_results"]) != 1
+    ):
+        raise ValueError("Single-type payload did not produce exactly one spectrum series per side.")
+
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+    )
+    dual_dat = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "dat" and str(item["column"]) == col_b
+    )
+    single_ygas = single_ygas_payload["series_results"][0]
+    single_dat = single_dat_payload["series_results"][0]
+    single_full_ygas = single_full_ygas_payload["series_results"][0]
+    synced_single_ygas = synced_single_payload["series_results"][0]
+
+    single_plot_export_row = single_plot_export_frame.iloc[0].to_dict() if not single_plot_export_frame.empty else {}
+    single_overlay_export_row = (
+        single_overlay_export_frame.iloc[0].to_dict() if not single_overlay_export_frame.empty else {}
+    )
+    compare_export_row = compare_export_frame.iloc[0].to_dict() if not compare_export_frame.empty else {}
+    single_plot_short_label = core.resolve_time_range_policy_short_label(
+        single_plot_details.get("time_range_policy"),
+        single_plot_details.get("time_range_policy_label"),
+    )
+    single_overlay_short_label = core.resolve_time_range_policy_short_label(
+        single_full_ygas["details"].get("time_range_policy"),
+        single_full_ygas["details"].get("time_range_policy_label"),
+    )
+    compare_short_label = core.resolve_time_range_policy_short_label(
+        dual_ygas["details"].get("time_range_policy"),
+        dual_ygas["details"].get("time_range_policy_label"),
+    )
+    single_plot_file_tag = core.resolve_time_range_policy_file_tag(
+        single_plot_details.get("time_range_policy"),
+        single_plot_details.get("time_range_policy_label"),
+    )
+    single_overlay_file_tag = core.resolve_time_range_policy_file_tag(
+        single_full_ygas["details"].get("time_range_policy"),
+        single_full_ygas["details"].get("time_range_policy_label"),
+    )
+    compare_file_tag = core.resolve_time_range_policy_file_tag(
+        dual_ygas["details"].get("time_range_policy"),
+        dual_ygas["details"].get("time_range_policy_label"),
+    )
+
+    def export_value_matches(row: dict[str, object], details: dict[str, object], key: str) -> bool:
+        expected = details.get(key)
+        if expected is None:
+            return True
+        actual = row.get(key)
+        expected_text = core.format_metadata_timestamp(expected) if isinstance(expected, pd.Timestamp) else str(expected)
+        return str(actual) == expected_text
+
+    def overlay_export_value_matches(row: dict[str, object], series_items: list[dict[str, object]], key: str) -> bool:
+        expected_values: list[str] = []
+        for item in series_items:
+            details = dict(item.get("details", {}))
+            value = details.get(key)
+            if value is None:
+                continue
+            text_value = core.format_metadata_timestamp(value) if isinstance(value, pd.Timestamp) else str(value)
+            if text_value and text_value not in expected_values:
+                expected_values.append(text_value)
+        if not expected_values:
+            return True
+        expected_text = expected_values[0] if len(expected_values) == 1 else " | ".join(expected_values)
+        return str(row.get(key)) == expected_text
+
+    def contract_columns_in_order(columns: list[str]) -> list[str]:
+        return [column for column in columns if column in full_export_contract_columns]
+
+    def contract_order_is_stable(columns: list[str]) -> bool:
+        present = contract_columns_in_order(columns)
+        expected = [column for column in full_export_contract_columns if column in columns]
+        return present == expected
+
+    def schema_version_matches(row: dict[str, object]) -> bool:
+        return str(row.get(app_mod.EXPORT_SCHEMA_VERSION_FIELD)) == app_mod.EXPORT_SCHEMA_VERSION
+
+    def required_metadata_values_match(row: dict[str, object], details: dict[str, object]) -> bool:
+        return schema_version_matches(row) and all(
+            export_value_matches(row, details, key) for key in required_metadata_keys
+        )
+
+    def required_overlay_values_match(row: dict[str, object], series_items: list[dict[str, object]]) -> bool:
+        return schema_version_matches(row) and all(
+            overlay_export_value_matches(row, series_items, key) for key in required_metadata_keys
+        )
+
+    checks = [
+        (
+            "ygas_base_freq_equal_same_window",
+            np.array_equal(single_ygas["freq"], dual_ygas["freq"]),
+            {"single_points": len(single_ygas["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "ygas_base_density_allclose_same_window",
+            np.allclose(single_ygas["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_ygas["density"][:5].tolist(), "compare_first5": dual_ygas["density"][:5].tolist()},
+        ),
+        (
+            "dat_base_freq_equal_same_window",
+            np.array_equal(single_dat["freq"], dual_dat["freq"]),
+            {"single_points": len(single_dat["freq"]), "compare_points": len(dual_dat["freq"])},
+        ),
+        (
+            "dat_base_density_allclose_same_window",
+            np.allclose(single_dat["density"], dual_dat["density"], rtol=1e-12, atol=1e-12),
+            {"single_first5": single_dat["density"][:5].tolist(), "compare_first5": dual_dat["density"][:5].tolist()},
+        ),
+        (
+            "shared_base_builder",
+            single_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_ygas["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and single_dat["details"].get("base_spectrum_builder") == "shared_profile_based"
+            and dual_dat["details"].get("base_spectrum_builder") == "shared_profile_based",
+            {
+                "single_ygas_builder": single_ygas["details"].get("base_spectrum_builder"),
+                "dual_ygas_builder": dual_ygas["details"].get("base_spectrum_builder"),
+                "single_dat_builder": single_dat["details"].get("base_spectrum_builder"),
+                "dual_dat_builder": dual_dat["details"].get("base_spectrum_builder"),
+            },
+        ),
+        (
+            "same_window_metadata_keys_present",
+            all(single_ygas["details"].get(key) is not None for key in required_detail_metadata_keys)
+            and all(single_dat["details"].get(key) is not None for key in required_detail_metadata_keys)
+            and all(dual_ygas["details"].get(key) is not None for key in required_detail_metadata_keys)
+            and all(dual_dat["details"].get(key) is not None for key in required_detail_metadata_keys),
+            {
+                "required_keys": required_detail_metadata_keys,
+                "export_only_keys": [key for key in required_metadata_keys if key not in required_detail_metadata_keys],
+            },
+        ),
+        (
+            "single_full_file_policy",
+            single_full_ygas["details"].get("time_range_policy") == "full_file",
+            {
+                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_full_label": single_full_ygas["details"].get("time_range_policy_label"),
+            },
+        ),
+        (
+            "compare_common_window_policy",
+            dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
+            and dual_dat["details"].get("time_range_policy") == "txt_dat_common_window",
+            {
+                "dual_ygas_policy": dual_ygas["details"].get("time_range_policy"),
+                "dual_dat_policy": dual_dat["details"].get("time_range_policy"),
+                "compare_policy_label": compare_policy_meta.get("time_range_policy_label"),
+            },
+        ),
+        (
+            "single_full_vs_compare_window_distinguished",
+            single_full_ygas["details"].get("time_range_policy") != dual_ygas["details"].get("time_range_policy"),
+            {
+                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "compare_policy": dual_ygas["details"].get("time_range_policy"),
+            },
+        ),
+        (
+            "single_plot_title_contains_policy_short_label",
+            bool(single_plot_short_label) and single_plot_short_label in single_plot_title,
+            {"title": single_plot_title, "expected_label": single_plot_short_label},
+        ),
+        (
+            "single_overlay_title_contains_policy_short_label",
+            bool(single_overlay_short_label) and single_overlay_short_label in single_overlay_title,
+            {"title": single_overlay_title, "expected_label": single_overlay_short_label},
+        ),
+        (
+            "compare_title_contains_policy_short_label",
+            bool(compare_short_label) and any(compare_short_label in title for title in compare_titles),
+            {"titles": compare_titles, "expected_label": compare_short_label},
+        ),
+        (
+            "single_plot_default_filename_contains_policy_tag",
+            bool(single_plot_file_tag)
+            and f"_{single_plot_file_tag}_" in single_plot_default_filename
+            and f"_{single_plot_file_tag}_" in single_plot_default_data_filename,
+            {
+                "plot_filename": single_plot_default_filename,
+                "data_filename": single_plot_default_data_filename,
+                "expected_tag": single_plot_file_tag,
+            },
+        ),
+        (
+            "single_overlay_default_filename_contains_policy_tag",
+            bool(single_overlay_file_tag)
+            and f"_{single_overlay_file_tag}_" in single_overlay_default_filename
+            and f"_{single_overlay_file_tag}_" in single_overlay_default_data_filename,
+            {
+                "plot_filename": single_overlay_default_filename,
+                "data_filename": single_overlay_default_data_filename,
+                "expected_tag": single_overlay_file_tag,
+            },
+        ),
+        (
+            "compare_default_filename_contains_policy_tag",
+            bool(compare_file_tag)
+            and f"_{compare_file_tag}_" in compare_default_filename
+            and f"_{compare_file_tag}_" in compare_default_data_filename,
+            {
+                "plot_filename": compare_default_filename,
+                "data_filename": compare_default_data_filename,
+                "expected_tag": compare_file_tag,
+            },
+        ),
+        (
+            "single_and_compare_status_show_unified_hint",
+            "time_range_policy 与 base_actual_time_range" in single_plot_status_text
+            and "time_range_policy 与 base_actual_time_range" in single_overlay_status_text
+            and "time_range_policy 与 base_actual_time_range" in compare_status_text,
+            {
+                "single_plot_status": single_plot_status_text,
+                "single_overlay_status": single_overlay_status_text,
+                "compare_status": compare_status_text,
+            },
+        ),
+        (
+            "single_and_compare_diag_show_unified_hint",
+            "time_range_policy 与 base_actual_time_range" in single_plot_diag_text
+            and "time_range_policy 与 base_actual_time_range" in single_overlay_diag_text
+            and "time_range_policy 与 base_actual_time_range" in compare_diag_text,
+            {
+                "single_plot_diag": single_plot_diag_text,
+                "single_overlay_diag": single_overlay_diag_text,
+                "compare_diag": compare_diag_text,
+            },
+        ),
+        (
+            "single_plot_diag_items_from_same_metadata",
+            all(item in single_plot_diag_text for item in core.build_time_range_diagnostic_items(single_plot_details)),
+            {"expected_items": core.build_time_range_diagnostic_items(single_plot_details)},
+        ),
+        (
+            "single_overlay_diag_items_from_same_metadata",
+            all(
+                item in single_overlay_diag_text
+                for item in core.build_time_range_diagnostic_items(single_full_ygas["details"])
+            ),
+            {"expected_items": core.build_time_range_diagnostic_items(single_full_ygas["details"])},
+        ),
+        (
+            "single_plot_status_from_same_metadata",
+            str(single_plot_details.get("time_range_policy_label") or "") in single_plot_status_text
+            and str(single_plot_details.get("time_range_difference_hint") or "") in single_plot_status_text,
+            {
+                "single_status": single_plot_status_text,
+                "expected_label": single_plot_details.get("time_range_policy_label"),
+                "expected_hint": single_plot_details.get("time_range_difference_hint"),
+            },
+        ),
+        (
+            "single_overlay_status_from_same_metadata",
+            str(single_full_ygas["details"].get("time_range_policy_label") or "") in single_overlay_status_text
+            and str(single_full_ygas["details"].get("time_range_difference_hint") or "") in single_overlay_status_text,
+            {
+                "single_status": single_overlay_status_text,
+                "expected_label": single_full_ygas["details"].get("time_range_policy_label"),
+                "expected_hint": single_full_ygas["details"].get("time_range_difference_hint"),
+            },
+        ),
+        (
+            "compare_status_from_same_metadata",
+            str(dual_ygas["details"].get("time_range_policy_label") or "") in compare_status_text
+            and str(dual_ygas["details"].get("time_range_difference_hint") or "") in compare_status_text,
+            {
+                "compare_status": compare_status_text,
+                "expected_label": dual_ygas["details"].get("time_range_policy_label"),
+                "expected_hint": dual_ygas["details"].get("time_range_difference_hint"),
+            },
+        ),
+        (
+            "compare_diag_items_from_same_metadata",
+            all(item in compare_diag_text for item in core.build_time_range_diagnostic_items(dual_ygas["details"])),
+            {"expected_items": core.build_time_range_diagnostic_items(dual_ygas["details"])},
+        ),
+        (
+            "single_plot_export_required_columns",
+            all(column in single_plot_export_columns for column in required_export_columns),
+            {"required_columns": required_export_columns, "single_export_columns": single_plot_export_columns},
+        ),
+        (
+            "single_overlay_export_required_columns",
+            all(column in single_overlay_export_columns for column in required_export_columns),
+            {"required_columns": required_export_columns, "single_export_columns": single_overlay_export_columns},
+        ),
+        (
+            "compare_export_required_columns",
+            all(column in compare_export_columns for column in required_export_columns),
+            {"required_columns": required_export_columns, "compare_export_columns": compare_export_columns},
+        ),
+        (
+            "single_plot_export_contract_order_stable",
+            contract_order_is_stable(single_plot_export_columns),
+            {
+                "actual_contract_columns": contract_columns_in_order(single_plot_export_columns),
+                "expected_contract_columns": [
+                    column for column in full_export_contract_columns if column in single_plot_export_columns
+                ],
+            },
+        ),
+        (
+            "single_overlay_export_contract_order_stable",
+            contract_order_is_stable(single_overlay_export_columns),
+            {
+                "actual_contract_columns": contract_columns_in_order(single_overlay_export_columns),
+                "expected_contract_columns": [
+                    column for column in full_export_contract_columns if column in single_overlay_export_columns
+                ],
+            },
+        ),
+        (
+            "compare_export_contract_order_stable",
+            contract_order_is_stable(compare_export_columns),
+            {
+                "actual_contract_columns": contract_columns_in_order(compare_export_columns),
+                "expected_contract_columns": [
+                    column for column in full_export_contract_columns if column in compare_export_columns
+                ],
+            },
+        ),
+        (
+            "single_plot_export_schema_version_correct",
+            schema_version_matches(single_plot_export_row),
+            {"schema_version": single_plot_export_row.get(app_mod.EXPORT_SCHEMA_VERSION_FIELD)},
+        ),
+        (
+            "single_overlay_export_schema_version_correct",
+            schema_version_matches(single_overlay_export_row),
+            {"schema_version": single_overlay_export_row.get(app_mod.EXPORT_SCHEMA_VERSION_FIELD)},
+        ),
+        (
+            "compare_export_schema_version_correct",
+            schema_version_matches(compare_export_row),
+            {"schema_version": compare_export_row.get(app_mod.EXPORT_SCHEMA_VERSION_FIELD)},
+        ),
+        (
+            "single_plot_export_required_values_match_metadata",
+            required_metadata_values_match(single_plot_export_row, single_plot_details),
+            {"export_row": single_plot_export_row},
+        ),
+        (
+            "single_overlay_export_required_values_match_metadata",
+            required_overlay_values_match(single_overlay_export_row, [single_full_ygas]),
+            {"export_row": single_overlay_export_row},
+        ),
+        (
+            "compare_export_required_values_match_metadata",
+            required_overlay_values_match(compare_export_row, [dual_ygas, dual_dat]),
+            {"export_row": compare_export_row},
+        ),
+        (
+            "single_plot_legacy_time_range_columns_preserved",
+            all(column in single_plot_export_columns for column in legacy_time_range_export_columns),
+            {
+                "legacy_columns": legacy_time_range_export_columns,
+                "single_export_columns": single_plot_export_columns,
+            },
+        ),
+        (
+            "single_overlay_legacy_time_range_columns_preserved",
+            all(column in single_overlay_export_columns for column in legacy_time_range_export_columns),
+            {
+                "legacy_columns": legacy_time_range_export_columns,
+                "single_export_columns": single_overlay_export_columns,
+            },
+        ),
+        (
+            "compare_legacy_time_range_columns_preserved",
+            all(column in compare_export_columns for column in legacy_time_range_export_columns),
+            {
+                "legacy_columns": legacy_time_range_export_columns,
+                "compare_export_columns": compare_export_columns,
+            },
+        ),
+        (
+            "single_plot_and_overlay_contract_columns_same",
+            contract_columns_in_order(single_plot_export_columns) == contract_columns_in_order(single_overlay_export_columns),
+            {
+                "single_plot_contract_columns": contract_columns_in_order(single_plot_export_columns),
+                "single_overlay_contract_columns": contract_columns_in_order(single_overlay_export_columns),
+            },
+        ),
+        (
+            "compare_to_single_sync_returns_common_window",
+            synced_range == (start_dt, end_dt),
+            {"synced_range": synced_range, "compare_range": (start_dt, end_dt)},
+        ),
+        (
+            "compare_to_single_sync_requested_range_equal",
+            synced_single_ygas["details"].get("base_requested_start") == dual_ygas["details"].get("base_requested_start")
+            and synced_single_ygas["details"].get("base_requested_end") == dual_ygas["details"].get("base_requested_end"),
+            {
+                "synced_single_requested": (
+                    synced_single_ygas["details"].get("base_requested_start"),
+                    synced_single_ygas["details"].get("base_requested_end"),
+                ),
+                "compare_requested": (
+                    dual_ygas["details"].get("base_requested_start"),
+                    dual_ygas["details"].get("base_requested_end"),
+                ),
+            },
+        ),
+        (
+            "compare_to_single_sync_actual_range_equal",
+            synced_single_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and synced_single_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
+            {
+                "synced_single_actual": (
+                    synced_single_ygas["details"].get("base_actual_start"),
+                    synced_single_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_compare_base_spectrum_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"same_window_time_range={start_dt} ~ {end_dt}")
+    print(
+        "single_full_time_range="
+        f"{single_full_ygas['details'].get('base_actual_start')} ~ {single_full_ygas['details'].get('base_actual_end')}"
+    )
+    print(
+        "compare_time_range="
+        f"{dual_ygas['details'].get('base_actual_start')} ~ {dual_ygas['details'].get('base_actual_end')}"
+    )
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     example_log = r"C:\Users\A\Desktop\SAMPLE202603270700-202603270730.log"
     return argparse.ArgumentParser(
@@ -1196,8 +2629,11 @@ def main() -> int:
             "target-cospectrum-diagnose",
             "target-cospectrum-implementations",
             "cross-display-semantics-check",
+            "frr-compat-semantics-check",
             "device-group-spectral-check",
             "single-compare-base-spectrum-check",
+            "time-range-metadata-check",
+            "repo-fixture-smoke",
         ],
         default=None,
         help="single=单文件检查，dual=双设备检查，legacy-target/target-group=组驱动目标谱图自检，target-cospectrum-diagnose=目标协谱候选排查",
@@ -1248,10 +2684,16 @@ def main() -> int:
             return run_target_cospectrum_implementation_mode(args)
         if mode == "cross-display-semantics-check":
             return run_cross_display_semantics_check_mode(args)
+        if mode == "frr-compat-semantics-check":
+            return run_frr_compat_semantics_check_mode(args)
         if mode == "device-group-spectral-check":
             return run_device_group_spectral_check_mode(args)
         if mode == "single-compare-base-spectrum-check":
-            return run_single_compare_base_spectrum_check_mode(args)
+            return run_single_compare_base_spectrum_core_metadata_check_mode(args)
+        if mode == "time-range-metadata-check":
+            return run_time_range_metadata_check_mode(args)
+        if mode == "repo-fixture-smoke":
+            return run_repo_fixture_smoke_mode(args)
         return run_legacy_target_mode(args)
     except Exception as exc:
         print(f"[ERROR] {exc}")

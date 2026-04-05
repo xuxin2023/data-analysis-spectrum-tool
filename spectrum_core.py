@@ -88,6 +88,52 @@ TARGET_COSPECTRUM_DIAGNOSTIC_NOTES = (
     "当前只是对候选协谱 kernel 做对比排查。",
 )
 TARGET_COSPECTRUM_KERNEL_SELECTED_ID = "A"
+TIME_RANGE_DIFFERENCE_HINT = "当前图形差异仅可能来自时间窗策略不同，请优先查看 time_range_policy 与 base_actual_time_range。"
+TIME_RANGE_METADATA_EXPORT_KEYS = (
+    "base_requested_start",
+    "base_requested_end",
+    "base_actual_start",
+    "base_actual_end",
+    "base_requested_time_range",
+    "base_actual_time_range",
+    "time_range_policy",
+    "time_range_policy_label",
+    "time_range_policy_note",
+    "time_range_short_label",
+    "time_range_file_tag",
+    "time_range_difference_hint",
+)
+_TIME_RANGE_POLICY_SHORT_LABELS = {
+    "full_series_no_timestamp": "无时间轴",
+    "full_file": "全文件",
+    "user_input_window": "用户时间窗",
+    "manual_input_window": "用户时间窗",
+    "explicit_window": "用户时间窗",
+    "dat_window": "dat时间窗",
+    "txt_dat_common_window": "txt+dat共同时间窗",
+    "recent_10m": "最近10分钟",
+    "recent_30m": "最近30分钟",
+    "recent_1h": "最近1小时",
+}
+_TIME_RANGE_POLICY_FILE_TAGS = {
+    "full_series_no_timestamp": "no_timestamp",
+    "full_file": "full_file",
+    "user_input_window": "user_window",
+    "manual_input_window": "user_window",
+    "explicit_window": "user_window",
+    "dat_window": "dat_window",
+    "txt_dat_common_window": "txt_dat_common_window",
+    "recent_10m": "recent_10m",
+    "recent_30m": "recent_30m",
+    "recent_1h": "recent_1h",
+}
+_TIME_RANGE_LABEL_SHORT_LABELS = {
+    "全数据行（无时间轴）": "无时间轴",
+    "全文件时间范围": "全文件",
+    "用户输入时间窗": "用户时间窗",
+    "dat 时间范围": "dat时间窗",
+    "txt+dat 共同时间范围": "txt+dat共同时间窗",
+}
 _CSD_DEFAULT_DETREND = "__default__"
 TARGET_COSPECTRUM_KERNEL_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -711,6 +757,259 @@ def compute_base_spectrum_payload(
         "series_meta": series_meta,
         "effective_fs": float(effective_fs),
     }
+
+
+def format_metadata_timestamp(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
+    return str(value)
+
+
+def build_time_range_text(
+    start: Any,
+    end: Any,
+    *,
+    empty_start: str,
+    empty_end: str,
+) -> str:
+    start_text = format_metadata_timestamp(start) or empty_start
+    end_text = format_metadata_timestamp(end) or empty_end
+    return f"{start_text} ~ {end_text}"
+
+
+def resolve_time_range_policy_short_label(policy: Any, label: Any = None) -> str:
+    policy_text = str(policy or "").strip()
+    if policy_text in _TIME_RANGE_POLICY_SHORT_LABELS:
+        return _TIME_RANGE_POLICY_SHORT_LABELS[policy_text]
+    label_text = str(label or "").strip()
+    return _TIME_RANGE_LABEL_SHORT_LABELS.get(label_text, label_text or "默认时间窗")
+
+
+def resolve_time_range_policy_file_tag(policy: Any, label: Any = None) -> str:
+    policy_text = str(policy or "").strip()
+    if policy_text in _TIME_RANGE_POLICY_FILE_TAGS:
+        return _TIME_RANGE_POLICY_FILE_TAGS[policy_text]
+    short_label = resolve_time_range_policy_short_label(policy_text, label)
+    return re.sub(r"[^a-z0-9_]+", "_", short_label.lower().replace("+", "_plus_")).strip("_")
+
+
+def resolve_single_time_range_policy(
+    *,
+    start_dt: pd.Timestamp | None,
+    end_dt: pd.Timestamp | None,
+    has_timestamp: bool,
+) -> dict[str, Any]:
+    if not has_timestamp:
+        return {
+            "time_range_policy": "full_series_no_timestamp",
+            "time_range_policy_label": "全数据行（无时间轴）",
+            "time_range_policy_note": None,
+        }
+    if start_dt is None and end_dt is None:
+        return {
+            "time_range_policy": "full_file",
+            "time_range_policy_label": "全文件时间范围",
+            "time_range_policy_note": "注意：当前单图使用全文件；双设备 PSD 对比默认使用共同时间窗，因此图形可能不同。",
+        }
+    return {
+        "time_range_policy": "user_input_window",
+        "time_range_policy_label": "用户输入时间窗",
+        "time_range_policy_note": None,
+    }
+
+
+def resolve_compare_time_range_policy(
+    *,
+    strategy_label: str,
+    start_dt: pd.Timestamp | None,
+    end_dt: pd.Timestamp | None,
+    has_txt_dat_context: bool,
+) -> dict[str, Any]:
+    strategy = str(strategy_label or "").strip()
+    mapping = {
+        "手动输入时间范围": ("manual_input_window", "用户输入时间窗"),
+        "使用 dat 时间范围": ("dat_window", "dat 时间范围"),
+        "最近10分钟": ("recent_10m", "最近10分钟"),
+        "最近30分钟": ("recent_30m", "最近30分钟"),
+        "最近1小时": ("recent_1h", "最近1小时"),
+        "使用 txt+dat 共同时间范围": ("txt_dat_common_window", "txt+dat 共同时间范围"),
+    }
+    if strategy in mapping:
+        policy, label = mapping[strategy]
+    elif has_txt_dat_context:
+        policy, label = ("txt_dat_common_window", "txt+dat 共同时间范围")
+    elif start_dt is None and end_dt is None:
+        policy, label = ("full_file", "全文件时间范围")
+    else:
+        policy, label = ("explicit_window", strategy or "显式时间窗")
+    note = None
+    if policy != "full_file":
+        note = f"注意：当前双设备 PSD 对比使用{label}；若单文件/单设备图谱使用全文件，图形可能不同。"
+    return {
+        "time_range_policy": policy,
+        "time_range_policy_label": label,
+        "time_range_policy_note": note,
+    }
+
+
+def build_time_range_metadata(
+    *,
+    time_range_policy: str,
+    time_range_policy_label: str,
+    time_range_policy_note: str | None,
+    requested_start: Any,
+    requested_end: Any,
+    actual_start: Any,
+    actual_end: Any,
+) -> dict[str, Any]:
+    metadata = {
+        "time_range_policy": str(time_range_policy or "").strip(),
+        "time_range_policy_label": str(time_range_policy_label or "").strip(),
+        "time_range_policy_note": str(time_range_policy_note).strip() if time_range_policy_note else None,
+        "base_requested_start": requested_start,
+        "base_requested_end": requested_end,
+        "base_actual_start": actual_start,
+        "base_actual_end": actual_end,
+    }
+    metadata["base_requested_time_range"] = build_time_range_text(
+        metadata["base_requested_start"],
+        metadata["base_requested_end"],
+        empty_start="自动",
+        empty_end="自动",
+    )
+    metadata["base_actual_time_range"] = build_time_range_text(
+        metadata["base_actual_start"],
+        metadata["base_actual_end"],
+        empty_start="无",
+        empty_end="无",
+    )
+    metadata["time_range_short_label"] = resolve_time_range_policy_short_label(
+        metadata["time_range_policy"],
+        metadata["time_range_policy_label"],
+    )
+    metadata["time_range_file_tag"] = resolve_time_range_policy_file_tag(
+        metadata["time_range_policy"],
+        metadata["time_range_policy_label"],
+    )
+    metadata["time_range_difference_hint"] = TIME_RANGE_DIFFERENCE_HINT
+    return metadata
+
+
+def build_single_time_range_metadata(
+    *,
+    start_dt: pd.Timestamp | None,
+    end_dt: pd.Timestamp | None,
+    has_timestamp: bool,
+    requested_start: Any,
+    requested_end: Any,
+    actual_start: Any,
+    actual_end: Any,
+) -> dict[str, Any]:
+    policy_meta = resolve_single_time_range_policy(
+        start_dt=start_dt,
+        end_dt=end_dt,
+        has_timestamp=has_timestamp,
+    )
+    return build_time_range_metadata(
+        time_range_policy=str(policy_meta["time_range_policy"]),
+        time_range_policy_label=str(policy_meta["time_range_policy_label"]),
+        time_range_policy_note=policy_meta.get("time_range_policy_note"),
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+    )
+
+
+def build_compare_time_range_metadata(
+    *,
+    strategy_label: str,
+    start_dt: pd.Timestamp | None,
+    end_dt: pd.Timestamp | None,
+    has_txt_dat_context: bool,
+    requested_start: Any,
+    requested_end: Any,
+    actual_start: Any,
+    actual_end: Any,
+) -> dict[str, Any]:
+    policy_meta = resolve_compare_time_range_policy(
+        strategy_label=strategy_label,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        has_txt_dat_context=has_txt_dat_context,
+    )
+    return build_time_range_metadata(
+        time_range_policy=str(policy_meta["time_range_policy"]),
+        time_range_policy_label=str(policy_meta["time_range_policy_label"]),
+        time_range_policy_note=policy_meta.get("time_range_policy_note"),
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=actual_start,
+        actual_end=actual_end,
+    )
+
+
+def extract_time_range_metadata(source: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if isinstance(source, dict):
+        for key in TIME_RANGE_METADATA_EXPORT_KEYS:
+            if key in source and source.get(key) is not None:
+                metadata[key] = source.get(key)
+        return metadata
+    if isinstance(source, pd.DataFrame) and not source.empty:
+        first_row = source.iloc[0]
+        for key in TIME_RANGE_METADATA_EXPORT_KEYS:
+            if key in source.columns:
+                value = first_row[key]
+                if value is not None and not pd.isna(value):
+                    metadata[key] = value
+    return metadata
+
+
+def build_time_range_display_suffix(source: Any) -> str:
+    metadata = extract_time_range_metadata(source)
+    short_label = str(metadata.get("time_range_short_label") or "").strip()
+    if not short_label:
+        short_label = resolve_time_range_policy_short_label(
+            metadata.get("time_range_policy"),
+            metadata.get("time_range_policy_label"),
+        )
+    return f" [{short_label}]" if short_label else ""
+
+
+def build_time_range_filename_suffix(source: Any) -> str:
+    metadata = extract_time_range_metadata(source)
+    tag = str(metadata.get("time_range_file_tag") or "").strip()
+    if not tag:
+        tag = resolve_time_range_policy_file_tag(
+            metadata.get("time_range_policy"),
+            metadata.get("time_range_policy_label"),
+        )
+    return f"_{tag}" if tag else ""
+
+
+def build_time_range_diagnostic_items(source: Any) -> list[str]:
+    metadata = extract_time_range_metadata(source)
+    items: list[str] = []
+    if metadata.get("time_range_policy") is not None:
+        items.append(f"time_range_policy={metadata.get('time_range_policy')}")
+    if metadata.get("time_range_policy_label") is not None:
+        items.append(f"time_range_policy_label={metadata.get('time_range_policy_label')}")
+    requested_text = metadata.get("base_requested_time_range")
+    if requested_text:
+        items.append(f"base_requested_time_range={requested_text}")
+    actual_text = metadata.get("base_actual_time_range")
+    if actual_text:
+        items.append(f"base_actual_time_range={actual_text}")
+    note = metadata.get("time_range_policy_note")
+    if note:
+        items.append(str(note))
+    hint = metadata.get("time_range_difference_hint")
+    if hint:
+        items.append(str(hint))
+    return items
 
 
 def build_target_summary_columns(
