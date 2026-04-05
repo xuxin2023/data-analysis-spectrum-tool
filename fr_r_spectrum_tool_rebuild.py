@@ -180,6 +180,101 @@ def build_aggregated_export_metadata(
     return metadata
 
 
+def _coerce_optional_int(value: Any, fallback: int = 0) -> int:
+    try:
+        if value is None:
+            raise TypeError
+        return int(value)
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
+def _format_series_metric_values(values: list[int]) -> str:
+    unique_values = list(dict.fromkeys(int(value) for value in values))
+    if not unique_values:
+        return "0"
+    return "/".join(str(value) for value in unique_values)
+
+
+def build_series_point_count_contract(series_results: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_series: list[dict[str, Any]] = []
+    for item in series_results:
+        details = dict(item.get("details", {}))
+        freq_values = np.asarray(item.get("freq", []), dtype=float)
+        valid_freq_points = _coerce_optional_int(details.get("valid_freq_points"), len(freq_values))
+        frequency_point_count = _coerce_optional_int(details.get("frequency_point_count"), len(freq_values))
+        normalized_series.append(
+            {
+                "label": str(item.get("label") or item.get("column") or f"series_{len(normalized_series) + 1}"),
+                "valid_freq_points": valid_freq_points,
+                "frequency_point_count": frequency_point_count,
+                "rendered_point_count": int(len(freq_values)),
+            }
+        )
+
+    valid_freq_points_values = [item["valid_freq_points"] for item in normalized_series]
+    frequency_point_count_values = [item["frequency_point_count"] for item in normalized_series]
+    rendered_point_count_values = [item["rendered_point_count"] for item in normalized_series]
+    return {
+        "series_count": int(len(normalized_series)),
+        "single_series_valid_freq_points": int(valid_freq_points_values[0]) if valid_freq_points_values else 0,
+        "single_series_valid_freq_points_display": _format_series_metric_values(valid_freq_points_values),
+        "single_series_frequency_point_count": int(frequency_point_count_values[0]) if frequency_point_count_values else 0,
+        "single_series_frequency_point_count_display": _format_series_metric_values(frequency_point_count_values),
+        "total_valid_freq_points_across_series": int(sum(valid_freq_points_values)),
+        "total_frequency_points_across_series": int(sum(frequency_point_count_values)),
+        "total_rendered_point_count_across_series": int(sum(rendered_point_count_values)),
+        "valid_freq_points_values": valid_freq_points_values,
+        "frequency_point_count_values": frequency_point_count_values,
+        "rendered_point_count_values": rendered_point_count_values,
+        "series_summaries": [
+            f"{item['label']}:{item['valid_freq_points']}/{item['frequency_point_count']}"
+            for item in normalized_series
+        ],
+    }
+
+
+def build_series_point_count_items(contract: dict[str, Any], *, prefix: str = "") -> list[str]:
+    normalized_prefix = str(prefix or "")
+    if normalized_prefix and not normalized_prefix.endswith("_"):
+        normalized_prefix = f"{normalized_prefix}_"
+    items = [
+        f"{normalized_prefix}single_series_valid_freq_points={contract.get('single_series_valid_freq_points_display', '0')}",
+        f"{normalized_prefix}single_series_frequency_point_count={contract.get('single_series_frequency_point_count_display', '0')}",
+        f"{normalized_prefix}series_count={int(contract.get('series_count', 0))}",
+        f"{normalized_prefix}total_valid_freq_points_across_series={int(contract.get('total_valid_freq_points_across_series', 0))}",
+        f"{normalized_prefix}total_frequency_points_across_series={int(contract.get('total_frequency_points_across_series', 0))}",
+    ]
+    series_summaries = list(contract.get("series_summaries", []))
+    if int(contract.get("series_count", 0)) > 1 and series_summaries:
+        items.append(f"{normalized_prefix}series_point_breakdown={' | '.join(series_summaries)}")
+    return items
+
+
+def build_series_point_count_status_items(
+    contract: dict[str, Any],
+    *,
+    prefix: str = "",
+    include_totals: bool = True,
+) -> list[str]:
+    normalized_prefix = str(prefix or "")
+    if normalized_prefix and not normalized_prefix.endswith("_"):
+        normalized_prefix = f"{normalized_prefix}_"
+    items = [
+        f"{normalized_prefix}single_series_valid_freq_points={contract.get('single_series_valid_freq_points_display', '0')}",
+        f"{normalized_prefix}single_series_frequency_point_count={contract.get('single_series_frequency_point_count_display', '0')}",
+    ]
+    if include_totals:
+        items.extend(
+            [
+                f"{normalized_prefix}series_count={int(contract.get('series_count', 0))}",
+                f"{normalized_prefix}total_valid_freq_points_across_series={int(contract.get('total_valid_freq_points_across_series', 0))}",
+                f"{normalized_prefix}total_frequency_points_across_series={int(contract.get('total_frequency_points_across_series', 0))}",
+            ]
+        )
+    return items
+
+
 def get_resource_path(*parts: str) -> Path:
     if hasattr(sys, "_MEIPASS"):
         base_dir = Path(getattr(sys, "_MEIPASS"))
@@ -489,6 +584,7 @@ class FileViewerApp:
         self.current_aligned_frame: pd.DataFrame | None = None
         self.current_lazy_aligned_frames: list[pd.DataFrame] = []
         self.current_aligned_metadata: dict[str, Any] = {}
+        self.current_point_count_contract: dict[str, Any] = {}
         self.current_compare_files: list[str] = []
         self.current_plot_style_label = ""
         self.current_plot_layout_label = ""
@@ -5526,6 +5622,7 @@ class FileViewerApp:
         self.current_plot_style_label = ""
         self.current_plot_layout_label = ""
         self.current_lazy_aligned_frames = []
+        self.current_point_count_contract = {}
 
     def apply_series_style(
         self,
@@ -7267,9 +7364,12 @@ class FileViewerApp:
         time_range_meta = core.extract_time_range_metadata(first_details)
         time_range_display_suffix = core.build_time_range_display_suffix(first_details)
         time_range_filename_suffix = core.build_time_range_filename_suffix(first_details)
-        valid_freq_points = int(sum(len(item["freq"]) for item in series_results))
+        point_count_contract = build_series_point_count_contract(series_results)
+        txt_point_count_contract = build_series_point_count_contract(txt_series)
+        dat_point_count_contract = build_series_point_count_contract(dat_series)
+        total_valid_freq_points_across_series = int(point_count_contract["total_valid_freq_points_across_series"])
         quality_warnings: list[str] = []
-        if valid_freq_points < 10:
+        if total_valid_freq_points_across_series < 10:
             quality_warnings.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
         if txt_points < 32 or dat_points < 32:
             quality_warnings.append("有效点数偏少，当前 PSD 结果可能不稳定。")
@@ -7410,10 +7510,23 @@ class FileViewerApp:
         self.current_aligned_metadata = {}
         self.current_compare_files = [label_a, label_b]
         self.current_result_frame = self.build_overlay_export_frame(series_results)
+        self.current_point_count_contract = {
+            "global": dict(point_count_contract),
+            "txt": dict(txt_point_count_contract),
+            "dat": dict(dat_point_count_contract),
+        }
+        series_point_items = [
+            f"{item['label']} | valid_freq_points={item.get('details', {}).get('valid_freq_points')} | "
+            f"frequency_point_count={item.get('details', {}).get('frequency_point_count')}"
+            for item in series_results
+        ]
         self.register_plot_style_layout(style, layout)
         extra_items = [
             f"当前要素映射={mapping_name}",
             f"当前谱类型=PSD",
+            *build_series_point_count_items(point_count_contract),
+            *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
+            *build_series_point_count_items(dat_point_count_contract, prefix="dat"),
             f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
             f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
             f"设备B_base_fs_source={next((item['details'].get('base_fs_source') for item in dat_series if item.get('details')), None)}",
@@ -7428,8 +7541,8 @@ class FileViewerApp:
             f"dat 裁切后点数={dat_points}",
             f"txt_FS={fs_a_last:g}",
             f"dat_FS={fs_b_last:g}",
-            f"有效频点数={valid_freq_points}",
             f"成功系列数={len(series_results)}",
+            *series_point_items,
         ] + self.build_timestamp_quality_items(parsed_a, parsed_b)
         extra_items.extend(quality_warnings)
         self.update_diagnostic_info(
@@ -7439,6 +7552,11 @@ class FileViewerApp:
         )
         status = (
             f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(series_results)}"
+            f" | {' | '.join(build_series_point_count_status_items(txt_point_count_contract, prefix='txt', include_totals=False))}"
+            f" | {' | '.join(build_series_point_count_status_items(dat_point_count_contract, prefix='dat', include_totals=False))}"
+            f" | series_count={point_count_contract['series_count']}"
+            f" | total_valid_freq_points_across_series={point_count_contract['total_valid_freq_points_across_series']}"
+            f" | total_frequency_points_across_series={point_count_contract['total_frequency_points_across_series']}"
             f" | 时间窗={time_range_meta.get('time_range_policy_label', first_details.get('time_range_policy_label', '默认'))}"
             f" | {time_range_meta.get('time_range_difference_hint', core.TIME_RANGE_DIFFERENCE_HINT)}"
         )
@@ -7553,6 +7671,7 @@ class FileViewerApp:
         series_label = ordered_columns[0] if analysis_type == "spectral" else f"{ordered_columns[0]} vs {ordered_columns[1]}"
         quality_items: list[str] = []
         display_meta: dict[str, str] | None = None
+        point_count_contract: dict[str, Any] = {}
 
         if analysis_type == "spectral":
             time_range_display_suffix = core.build_time_range_display_suffix(details)
@@ -7561,8 +7680,17 @@ class FileViewerApp:
             density = density[positive]
             if len(freq) == 0:
                 raise ValueError("当前所选列波动过小或为恒定列，无法生成有效谱图。")
+            point_count_contract = build_series_point_count_contract(
+                [
+                    {
+                        "label": series_label,
+                        "freq": freq,
+                        "details": details,
+                    }
+                ]
+            )
             quality_items.append("当前谱类型=PSD")
-            quality_items.append(f"有效频点数={len(freq)}")
+            quality_items.extend(build_series_point_count_items(point_count_contract))
             if details.get("base_spectrum_builder") is not None:
                 quality_items.append(f"base_spectrum_builder={details.get('base_spectrum_builder')}")
             if details.get("base_fs_source") is not None:
@@ -7607,9 +7735,18 @@ class FileViewerApp:
                 label=series_label,
                 color=SERIES_COLORS[0],
             )
+            point_count_contract = build_series_point_count_contract(
+                [
+                    {
+                        "label": series_label,
+                        "freq": freq,
+                        "details": details,
+                    }
+                ]
+            )
             ylabel = self.get_cross_spectrum_display_meta(spectrum_type)["ylabel"]
             quality_items.append(f"当前谱类型={spectrum_type}")
-            quality_items.append(f"有效频点数={len(freq)}")
+            quality_items.extend(build_series_point_count_items(point_count_contract))
             if details.get("cross_execution_path") is not None:
                 quality_items.append(f"cross_execution_path={details.get('cross_execution_path')}")
             if details.get("cross_implementation_id") is not None:
@@ -7705,6 +7842,7 @@ class FileViewerApp:
                 details,
                 export_mask,
             )
+        self.current_point_count_contract = {"global": dict(point_count_contract)}
         self.update_diagnostic_info(
             layout=self.current_layout_label,
             analysis_label=series_label,
@@ -7720,10 +7858,14 @@ class FileViewerApp:
             policy_label = str(details.get("time_range_policy_label") or "默认")
             self.status_var.set(
                 f"图已生成：功率谱密度 / {columns[0]} | 时间窗={policy_label} | "
+                f"{' | '.join(build_series_point_count_status_items(point_count_contract))} | "
                 f"{details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
             )
         else:
-            self.status_var.set(f"图已生成：{display_meta['title_prefix'] if display_meta else '互谱分析'} / {series_label}")
+            self.status_var.set(
+                f"图已生成：{display_meta['title_prefix'] if display_meta else '互谱分析'} / {series_label}"
+                f" | {' | '.join(build_series_point_count_status_items(point_count_contract))}"
+            )
 
     def build_overlay_export_frame(self, series_results: list[dict[str, Any]]) -> pd.DataFrame:
         merged_frame: pd.DataFrame | None = None
@@ -7813,6 +7955,8 @@ class FileViewerApp:
         self.current_aligned_metadata = {}
         self.current_compare_files = [str(item["label"]) for item in series_results]
         self.current_result_frame = self.build_overlay_export_frame(series_results)
+        point_count_contract = build_series_point_count_contract(series_results)
+        self.current_point_count_contract = {"global": dict(point_count_contract)}
         first_details = series_results[0]["details"]
         group_items = [
             f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | "
@@ -7839,7 +7983,7 @@ class FileViewerApp:
             extra_items=[
                 f"选中文件数={file_count}",
                 f"识别设备数={device_count}",
-                f"series_count={len(series_results)}",
+                *build_series_point_count_items(point_count_contract),
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
                 f"base_fs_source={first_details.get('base_fs_source')}",
                 f"selection_merge_scope={first_details.get('selection_merge_scope')}",
@@ -7859,7 +8003,7 @@ class FileViewerApp:
         status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
         status = (
             f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
-            f" | 当前频点数={first_details.get('valid_freq_points')}/{first_details.get('frequency_point_count')}"
+            f" | {' | '.join(build_series_point_count_status_items(point_count_contract))}"
             f" | 时间窗={first_details.get('time_range_policy_label') or '默认'}"
             f" | {first_details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
         )

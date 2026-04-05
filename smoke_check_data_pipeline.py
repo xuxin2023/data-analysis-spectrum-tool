@@ -316,6 +316,17 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
+            "single_vs_compare_point_display_contract",
+            run_single_vs_compare_point_display_contract_check_mode,
+            clone_args(
+                args,
+                mode="single-vs-compare-point-display-contract-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
             "frr_compat_semantics",
             run_frr_compat_semantics_check_mode,
             clone_args(
@@ -1272,6 +1283,306 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
     print("[device_group_spectral_check]")
     print(f"sample_path={sample_path}")
     print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-vs-compare-point-display-contract-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    single_tokens = [
+        "single_series_valid_freq_points=",
+        "single_series_frequency_point_count=",
+        "series_count=",
+        "total_valid_freq_points_across_series=",
+        "total_frequency_points_across_series=",
+    ]
+    compare_tokens = [
+        "txt_single_series_valid_freq_points=",
+        "txt_single_series_frequency_point_count=",
+        "dat_single_series_valid_freq_points=",
+        "dat_single_series_frequency_point_count=",
+        "series_count=",
+        "total_valid_freq_points_across_series=",
+        "total_frequency_points_across_series=",
+    ]
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+
+        single_scope_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            col_a,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        if len(single_scope_payload["series_results"]) != 1:
+            raise ValueError("single-vs-compare-point-display-contract-check expects exactly one synced single series.")
+        single_scope_series = single_scope_payload["series_results"][0]
+
+        app.current_file = ygas_path
+        app.plot_results(
+            "spectral",
+            np.asarray(single_scope_series["freq"], dtype=float),
+            np.asarray(single_scope_series["density"], dtype=float),
+            [col_a],
+            dict(single_scope_series["details"]),
+        )
+        single_plot_diag_text = app.diagnostic_var.get()
+        single_plot_status_text = app.status_var.get()
+        single_plot_contract = dict(app.current_point_count_contract)
+
+        app.plot_multi_spectral_results(
+            col_a,
+            single_scope_payload["series_results"],
+            single_scope_payload["skipped_files"],
+            payload=single_scope_payload,
+        )
+        single_overlay_diag_text = app.diagnostic_var.get()
+        single_overlay_status_text = app.status_var.get()
+        single_overlay_contract = dict(app.current_point_count_contract)
+
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_context={
+                "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                "has_txt_dat_context": bool(
+                    selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+                ),
+            },
+        )
+        if dual_plot_payload.get("kind") != "psd_compare":
+            raise ValueError(f"expected psd_compare payload, got {dual_plot_payload.get('kind')}")
+        app.on_prepared_dual_plot_ready(dual_plot_payload)
+        compare_diag_text = app.diagnostic_var.get()
+        compare_status_text = app.status_var.get()
+        compare_contract = dict(app.current_point_count_contract)
+    finally:
+        root.destroy()
+
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+    )
+    dual_dat = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "dat" and str(item["column"]) == col_b
+    )
+    expected_compare_total_valid = sum(
+        int(item["details"].get("valid_freq_points", len(item["freq"])))
+        for item in dual_plot_payload["series_results"]
+    )
+    expected_compare_total_frequency = sum(
+        int(item["details"].get("frequency_point_count", len(item["freq"])))
+        for item in dual_plot_payload["series_results"]
+    )
+    expected_compare_rendered = sum(len(item["freq"]) for item in dual_plot_payload["series_results"])
+
+    checks = [
+        (
+            "single_plot_contract_tokens_visible_in_diag",
+            all(token in single_plot_diag_text for token in single_tokens),
+            {"diag": single_plot_diag_text},
+        ),
+        (
+            "single_plot_contract_tokens_visible_in_status",
+            all(token in single_plot_status_text for token in single_tokens),
+            {"status": single_plot_status_text},
+        ),
+        (
+            "single_overlay_contract_tokens_visible_in_diag",
+            all(token in single_overlay_diag_text for token in single_tokens),
+            {"diag": single_overlay_diag_text},
+        ),
+        (
+            "single_overlay_contract_tokens_visible_in_status",
+            all(token in single_overlay_status_text for token in single_tokens),
+            {"status": single_overlay_status_text},
+        ),
+        (
+            "compare_contract_tokens_visible_in_diag",
+            all(token in compare_diag_text for token in compare_tokens),
+            {"diag": compare_diag_text},
+        ),
+        (
+            "compare_contract_tokens_visible_in_status",
+            all(token in compare_status_text for token in compare_tokens),
+            {"status": compare_status_text},
+        ),
+        (
+            "compare_diag_no_ambiguous_valid_freq_label",
+            "有效频点数=" not in compare_diag_text,
+            {"diag": compare_diag_text},
+        ),
+        (
+            "single_status_no_legacy_current_freq_label",
+            "当前频点数=" not in single_plot_status_text and "当前频点数=" not in single_overlay_status_text,
+            {
+                "single_plot_status": single_plot_status_text,
+                "single_overlay_status": single_overlay_status_text,
+            },
+        ),
+        (
+            "single_plot_single_series_matches_compare_txt",
+            int(single_plot_contract["global"]["single_series_valid_freq_points"])
+            == int(dual_ygas["details"].get("valid_freq_points", 0))
+            and int(single_plot_contract["global"]["single_series_frequency_point_count"])
+            == int(dual_ygas["details"].get("frequency_point_count", 0)),
+            {
+                "single_plot_contract": single_plot_contract,
+                "compare_txt_details": dual_ygas["details"],
+            },
+        ),
+        (
+            "single_overlay_single_series_matches_compare_txt",
+            int(single_overlay_contract["global"]["single_series_valid_freq_points"])
+            == int(dual_ygas["details"].get("valid_freq_points", 0))
+            and int(single_overlay_contract["global"]["single_series_frequency_point_count"])
+            == int(dual_ygas["details"].get("frequency_point_count", 0)),
+            {
+                "single_overlay_contract": single_overlay_contract,
+                "compare_txt_details": dual_ygas["details"],
+            },
+        ),
+        (
+            "compare_txt_side_contract_matches_payload",
+            int(compare_contract["txt"]["single_series_valid_freq_points"])
+            == int(dual_ygas["details"].get("valid_freq_points", 0))
+            and int(compare_contract["txt"]["single_series_frequency_point_count"])
+            == int(dual_ygas["details"].get("frequency_point_count", 0)),
+            {
+                "compare_txt_contract": compare_contract.get("txt"),
+                "compare_txt_details": dual_ygas["details"],
+            },
+        ),
+        (
+            "compare_dat_side_contract_matches_payload",
+            int(compare_contract["dat"]["single_series_valid_freq_points"])
+            == int(dual_dat["details"].get("valid_freq_points", 0))
+            and int(compare_contract["dat"]["single_series_frequency_point_count"])
+            == int(dual_dat["details"].get("frequency_point_count", 0)),
+            {
+                "compare_dat_contract": compare_contract.get("dat"),
+                "compare_dat_details": dual_dat["details"],
+            },
+        ),
+        (
+            "compare_total_valid_matches_series_sum",
+            int(compare_contract["global"]["total_valid_freq_points_across_series"]) == int(expected_compare_total_valid),
+            {
+                "compare_global_contract": compare_contract.get("global"),
+                "expected_total_valid": expected_compare_total_valid,
+            },
+        ),
+        (
+            "compare_total_frequency_matches_series_sum",
+            int(compare_contract["global"]["total_frequency_points_across_series"]) == int(expected_compare_total_frequency),
+            {
+                "compare_global_contract": compare_contract.get("global"),
+                "expected_total_frequency": expected_compare_total_frequency,
+            },
+        ),
+        (
+            "compare_series_count_matches_series_len",
+            int(compare_contract["global"]["series_count"]) == int(len(dual_plot_payload["series_results"])),
+            {
+                "compare_global_contract": compare_contract.get("global"),
+                "payload_series_count": len(dual_plot_payload["series_results"]),
+            },
+        ),
+        (
+            "compare_side_totals_sum_to_global",
+            int(compare_contract["txt"]["total_valid_freq_points_across_series"])
+            + int(compare_contract["dat"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["global"]["total_valid_freq_points_across_series"])
+            and int(compare_contract["txt"]["total_frequency_points_across_series"])
+            + int(compare_contract["dat"]["total_frequency_points_across_series"])
+            == int(compare_contract["global"]["total_frequency_points_across_series"]),
+            {"compare_contract": compare_contract},
+        ),
+        (
+            "rendered_points_equal_payload_lengths_no_decimation",
+            int(compare_contract["global"]["total_rendered_point_count_across_series"]) == int(expected_compare_rendered)
+            and int(expected_compare_rendered) == int(expected_compare_total_valid),
+            {
+                "compare_global_contract": compare_contract.get("global"),
+                "expected_rendered": expected_compare_rendered,
+                "expected_total_valid": expected_compare_total_valid,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_vs_compare_point_display_contract_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"same_window_time_range={start_dt} ~ {end_dt}")
+    print(f"single_plot_contract={single_plot_contract}")
+    print(f"single_overlay_contract={single_overlay_contract}")
+    print(f"compare_contract={compare_contract}")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -2827,6 +3138,7 @@ def main() -> int:
             "device-group-spectral-check",
             "single-compare-base-spectrum-check",
             "single-device-selection-scope-check",
+            "single-vs-compare-point-display-contract-check",
             "time-range-metadata-check",
             "repo-fixture-smoke",
         ],
@@ -2887,6 +3199,8 @@ def main() -> int:
             return run_single_compare_base_spectrum_core_metadata_check_mode(args)
         if mode == "single-device-selection-scope-check":
             return run_single_device_selection_scope_check_mode(args)
+        if mode == "single-vs-compare-point-display-contract-check":
+            return run_single_vs_compare_point_display_contract_check_mode(args)
         if mode == "time-range-metadata-check":
             return run_time_range_metadata_check_mode(args)
         if mode == "repo-fixture-smoke":
