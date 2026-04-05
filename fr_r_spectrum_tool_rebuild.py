@@ -2107,6 +2107,7 @@ class FileViewerApp:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         grouped: dict[str, dict[str, Any]] = {}
         skipped_files: list[str] = []
+        parsed_entries: list[dict[str, Any]] = []
         total_files = len(selected_files)
 
         for index, path in enumerate(selected_files, start=1):
@@ -2123,6 +2124,13 @@ class FileViewerApp:
                 continue
 
             device_info = core.resolve_device_identifier(parsed, path)
+            parsed_entries.append(
+                {
+                    "path": path,
+                    "parsed": parsed,
+                    "device_info": dict(device_info),
+                }
+            )
             group = grouped.setdefault(
                 str(device_info["device_id"]),
                 {
@@ -2138,6 +2146,14 @@ class FileViewerApp:
                     "parsed": parsed,
                 }
             )
+
+        selection_override = self.build_selection_scope_merged_device_group(
+            selected_files=selected_files,
+            parsed_entries=parsed_entries,
+            target_column=target_column,
+        )
+        if selection_override is not None:
+            return [selection_override], skipped_files
 
         device_groups: list[dict[str, Any]] = []
         for group in grouped.values():
@@ -2157,10 +2173,104 @@ class FileViewerApp:
             group["file_count"] = len(entries)
             group["source_paths"] = [item["path"] for item in entries]
             group["valid_value_count"] = valid_count
+            group["selection_merge_scope"] = "device_group"
             device_groups.append(group)
 
         device_groups.sort(key=lambda item: str(item["device_label"]).lower())
         return device_groups, skipped_files
+
+    def resolve_selection_merge_profile_family(self, profile_name: str) -> str:
+        normalized = str(profile_name or "").strip()
+        if normalized.startswith("YGAS_MODE1") or normalized == "YGAS_MERGED":
+            return "ygas"
+        if normalized in {"TOA5_DAT", "TOA5_MERGED"}:
+            return "dat"
+        return "generic"
+
+    def build_selection_scope_merged_device_group(
+        self,
+        *,
+        selected_files: list[Path],
+        parsed_entries: list[dict[str, Any]],
+        target_column: str,
+    ) -> dict[str, Any] | None:
+        if len(selected_files) < 2 or len(parsed_entries) != len(selected_files):
+            return None
+
+        selection_hint = core.resolve_selection_scope_device_hint(selected_files)
+        if not bool(selection_hint.get("is_consistent")):
+            return None
+
+        profile_families = {
+            self.resolve_selection_merge_profile_family(str(entry["parsed"].profile_name))
+            for entry in parsed_entries
+        }
+        if len(profile_families) != 1:
+            return None
+        profile_family = next(iter(profile_families))
+        device_sources = {str(entry["device_info"].get("device_source", "")) for entry in parsed_entries}
+        unique_device_ids = {str(entry["device_info"].get("device_id", "")) for entry in parsed_entries}
+
+        if profile_family == "ygas":
+            should_override = len(unique_device_ids) > 1 or "filename" in device_sources
+        else:
+            should_override = len(unique_device_ids) > 1 and device_sources == {"filename"}
+        if not should_override:
+            return None
+
+        selection_device_id = str(selection_hint.get("device_id") or "selection_scope")
+        selection_device_label = str(selection_hint.get("device_label") or selection_device_id)
+        source_paths = list(selected_files)
+
+        if profile_family == "ygas":
+            merged_parsed, summary = core.load_and_merge_ygas_files_fast(
+                source_paths,
+                required_columns=[target_column],
+            )
+            merge_metadata: dict[str, Any] = {
+                "device_id": selection_device_id,
+                "file_count": len(source_paths),
+                "source_paths": [str(path) for path in source_paths],
+                "merge_strategy": "selection_scope_ygas_fast_merge",
+                "profile_name": merged_parsed.profile_name,
+                "timestamp_col": merged_parsed.timestamp_col,
+                "raw_rows": int(summary.get("raw_rows", merged_parsed.source_row_count or len(merged_parsed.dataframe))),
+                "merged_points": int(summary.get("total_points", len(merged_parsed.dataframe))),
+                "selection_merge_scope": "selection_level",
+                "group_device_source": "selection_scope:filename_hint",
+                "normalized_hints": list(selection_hint.get("normalized_hints", [])),
+            }
+        else:
+            merged_parsed, merge_metadata = core.merge_parsed_results_for_device_group(
+                [entry["parsed"] for entry in parsed_entries],
+                source_paths=source_paths,
+                device_id=selection_device_id,
+            )
+            merge_metadata = dict(merge_metadata)
+            merge_metadata["merge_strategy"] = "selection_scope_profile_merge"
+            merge_metadata["selection_merge_scope"] = "selection_level"
+            merge_metadata["group_device_source"] = "selection_scope:filename_hint"
+            merge_metadata["normalized_hints"] = list(selection_hint.get("normalized_hints", []))
+
+        if target_column not in merged_parsed.dataframe.columns:
+            return None
+        column_values = pd.to_numeric(merged_parsed.dataframe[target_column], errors="coerce").to_numpy(dtype=float)
+        valid_count = int(np.count_nonzero(np.isfinite(column_values)))
+        if valid_count < 2:
+            return None
+
+        return {
+            "device_id": selection_device_id,
+            "device_label": selection_device_label,
+            "device_source": str(merge_metadata.get("group_device_source") or "selection_scope:filename_hint"),
+            "entries": list(parsed_entries),
+            "merged_parsed": merged_parsed,
+            "merge_metadata": merge_metadata,
+            "file_count": len(parsed_entries),
+            "source_paths": source_paths,
+            "valid_value_count": valid_count,
+            "selection_merge_scope": str(merge_metadata.get("selection_merge_scope") or "selection_level"),
+        }
 
     def prepare_multi_spectral_compare_payload(
         self,
@@ -2202,10 +2312,16 @@ class FileViewerApp:
                 details["device_id"] = str(group["device_id"])
                 details["device_label"] = str(group["device_label"])
                 details["device_source"] = str(group["device_source"])
+                details["group_device_source"] = str(group["device_source"])
                 details["device_file_count"] = int(group["file_count"])
                 details["device_group_merge_strategy"] = str(group["merge_metadata"].get("merge_strategy", ""))
+                details["selection_merge_scope"] = str(group.get("selection_merge_scope") or "device_group")
                 details["source_paths"] = [str(path) for path in group["source_paths"]]
                 details["grouped_profile_name"] = str(merged_parsed.profile_name)
+                details["raw_source_rows"] = int(
+                    group["merge_metadata"].get("raw_rows", merged_parsed.source_row_count or len(merged_parsed.dataframe))
+                )
+                details["merged_rows"] = int(group["merge_metadata"].get("merged_points", len(merged_parsed.dataframe)))
                 details.update(
                     core.build_single_time_range_metadata(
                         start_dt=start_dt,
@@ -2225,12 +2341,18 @@ class FileViewerApp:
                         "density": np.asarray(payload["density"], dtype=float),
                         "details": details,
                         "device_id": str(group["device_id"]),
+                        "device_source": str(group["device_source"]),
                         "file_count": int(group["file_count"]),
+                        "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
+                        "selection_merge_scope": str(group.get("selection_merge_scope") or "device_group"),
                         "source_paths": [str(path) for path in group["source_paths"]],
                     }
                 )
             except Exception as exc:
                 skipped_files.append(f"{group['device_label']}(计算失败: {exc})")
+
+        for item in series_results:
+            item["details"]["series_count"] = int(len(series_results))
 
         return {
             "target_column": target_column,
@@ -2241,8 +2363,17 @@ class FileViewerApp:
                     "device_id": str(group["device_id"]),
                     "device_label": str(group["device_label"]),
                     "device_source": str(group["device_source"]),
+                    "group_device_source": str(group["device_source"]),
                     "file_count": int(group["file_count"]),
                     "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
+                    "selection_merge_scope": str(group.get("selection_merge_scope") or "device_group"),
+                    "raw_source_rows": int(
+                        group["merge_metadata"].get(
+                            "raw_rows",
+                            group["merged_parsed"].source_row_count or len(group["merged_parsed"].dataframe),
+                        )
+                    ),
+                    "merged_rows": int(group["merge_metadata"].get("merged_points", len(group["merged_parsed"].dataframe))),
                 }
                 for group in device_groups
             ],
@@ -7684,8 +7815,16 @@ class FileViewerApp:
         self.current_result_frame = self.build_overlay_export_frame(series_results)
         first_details = series_results[0]["details"]
         group_items = [
-            f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | 合并={item['merge_strategy']}"
+            f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | "
+            f"merge_scope={item.get('selection_merge_scope', 'device_group')} | 合并={item['merge_strategy']} | "
+            f"raw_rows={item.get('raw_source_rows')} | merged_rows={item.get('merged_rows')}"
             for item in device_groups
+        ]
+        series_items = [
+            f"{item['label']} | valid_points={item['details'].get('valid_points')} | "
+            f"valid_freq_points={item['details'].get('valid_freq_points')} | "
+            f"frequency_point_count={item['details'].get('frequency_point_count')}"
+            for item in series_results
         ]
         self.update_diagnostic_info(
             layout="单设备模式" if device_count == 1 else "设备分组模式",
@@ -7700,10 +7839,19 @@ class FileViewerApp:
             extra_items=[
                 f"选中文件数={file_count}",
                 f"识别设备数={device_count}",
+                f"series_count={len(series_results)}",
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
                 f"base_fs_source={first_details.get('base_fs_source')}",
+                f"selection_merge_scope={first_details.get('selection_merge_scope')}",
+                f"group_device_source={first_details.get('group_device_source')}",
+                f"raw_source_rows={first_details.get('raw_source_rows')}",
+                f"merged_rows={first_details.get('merged_rows')}",
+                f"valid_points={first_details.get('valid_points')}",
+                f"valid_freq_points={first_details.get('valid_freq_points')}",
+                f"frequency_point_count={first_details.get('frequency_point_count')}",
                 *core.build_time_range_diagnostic_items(first_details),
                 *group_items,
+                *series_items,
                 *self.build_reference_slope_diagnostic_items(is_psd=True),
             ],
         )
@@ -7711,6 +7859,7 @@ class FileViewerApp:
         status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
         status = (
             f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
+            f" | 当前频点数={first_details.get('valid_freq_points')}/{first_details.get('frequency_point_count')}"
             f" | 时间窗={first_details.get('time_range_policy_label') or '默认'}"
             f" | {first_details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
         )

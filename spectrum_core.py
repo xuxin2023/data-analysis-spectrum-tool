@@ -340,6 +340,10 @@ DEVICE_FILENAME_TOKEN_BLACKLIST: set[str] = {
     "COMPARE",
     "ANALYSIS",
 }
+SELECTION_SCOPE_FILENAME_IGNORE_PATTERNS: tuple[str, ...] = (
+    r"(?:part|segment|seg|chunk|clip|slice|piece|window|section|block|batch|run|copy|tmp|temp)[a-z0-9]*",
+    r"v\d+",
+)
 
 
 @dataclass
@@ -463,6 +467,49 @@ def resolve_device_identifier(parsed: ParsedDataResult, path: Path) -> dict[str,
         "device_id": inferred,
         "device_label": inferred or path.stem,
         "device_source": "filename",
+    }
+
+
+def normalize_selection_scope_filename_hint(path: Path) -> str:
+    stem = str(path.stem).strip()
+    if not stem:
+        return str(path.stem)
+
+    cleaned = re.sub(r"(?i)\d{8,14}(?:[-_]\d{4,14})?", " ", stem)
+    cleaned = re.sub(r"(?i)\b(?:19|20)\d{2}[-_ ]?\d{2}[-_ ]?\d{2}\b", " ", cleaned)
+    tokens = re.findall(r"[A-Za-z0-9]+", cleaned)
+    kept_tokens: list[str] = []
+    for token in tokens:
+        normalized = normalize_device_identifier(token)
+        if not normalized:
+            continue
+        upper = normalized.upper()
+        lower = normalized.lower()
+        if upper in DEVICE_FILENAME_TOKEN_BLACKLIST:
+            continue
+        if re.fullmatch(r"\d{4,14}", normalized):
+            continue
+        if any(re.fullmatch(pattern, lower) for pattern in SELECTION_SCOPE_FILENAME_IGNORE_PATTERNS):
+            continue
+        kept_tokens.append(normalized)
+
+    if kept_tokens:
+        resolved = normalize_device_identifier("_".join(kept_tokens))
+        if resolved:
+            return resolved
+    return infer_device_identifier_from_path(path)
+
+
+def resolve_selection_scope_device_hint(paths: list[Path]) -> dict[str, Any]:
+    hints = [normalize_selection_scope_filename_hint(path) for path in paths]
+    unique_hints = _unique_non_empty_strings(hints)
+    resolved_id = unique_hints[0] if len(unique_hints) == 1 else None
+    return {
+        "normalized_hints": hints,
+        "unique_hints": unique_hints,
+        "is_consistent": resolved_id is not None,
+        "device_id": resolved_id,
+        "device_label": resolved_id,
     }
 
 

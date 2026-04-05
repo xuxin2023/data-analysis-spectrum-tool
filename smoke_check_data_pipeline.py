@@ -305,6 +305,17 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
+            "single_device_selection_scope",
+            run_single_device_selection_scope_check_mode,
+            clone_args(
+                args,
+                mode="single-device-selection-scope-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
             "frr_compat_semantics",
             run_frr_compat_semantics_check_mode,
             clone_args(
@@ -1261,6 +1272,189 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
     print("[device_group_spectral_check]")
     print(f"sample_path={sample_path}")
     print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_selection_scope_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-selection-scope-check needs --ygas and --dat.")
+
+    ygas_source = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_source)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+
+    with tempfile.TemporaryDirectory(prefix="selection_scope_smoke_") as temp_dir:
+        temp_root = Path(temp_dir)
+        ygas_path_a = temp_root / "partA_sensorx.log"
+        ygas_path_b = temp_root / "partB_sensorx.log"
+        shutil.copy2(ygas_source, ygas_path_a)
+        shutil.copy2(ygas_source, ygas_path_b)
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = app_mod.FileViewerApp(root)
+            single_full_payload = app.prepare_multi_spectral_compare_payload(
+                [ygas_path_a, ygas_path_b],
+                col_a,
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            dual_base = app.prepare_dual_compare_payload(
+                ygas_paths=[ygas_path_a, ygas_path_b],
+                dat_path=dat_path,
+                selected_paths=[ygas_path_a, ygas_path_b, dat_path],
+                compare_mode=compare_mode,
+                start_dt=None,
+                end_dt=None,
+            )
+            selection_meta = dict(dual_base["selection_meta"])
+            if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+                start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+            else:
+                start_dt, end_dt = None, None
+
+            single_payload = app.prepare_multi_spectral_compare_payload(
+                [ygas_path_a, ygas_path_b],
+                col_a,
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
+            dual_plot_payload = app.prepare_dual_plot_payload(
+                parsed_a=dual_base["parsed_a"],
+                label_a=str(dual_base["label_a"]),
+                parsed_b=dual_base["parsed_b"],
+                label_b=str(dual_base["label_b"]),
+                pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+                selection_meta=selection_meta,
+                compare_mode=compare_mode,
+                compare_scope="单对单",
+                start_dt=start_dt,
+                end_dt=end_dt,
+                mapping_name=str(args.element),
+                scheme_name="smoke",
+                alignment_strategy=app.get_alignment_strategy(compare_mode),
+                plot_style=app.resolve_plot_style(compare_mode),
+                plot_layout=app.resolve_plot_layout(compare_mode),
+                fs_ui=args.fs,
+                requested_nsegment=args.nsegment,
+                overlap_ratio=args.overlap_ratio,
+                match_tolerance=0.2,
+                spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+                time_range_context={
+                    "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                    "has_txt_dat_context": True,
+                },
+            )
+        finally:
+            root.destroy()
+
+    if len(single_payload["series_results"]) != 1:
+        raise ValueError("single-device selection scope payload did not collapse to exactly one series.")
+
+    single_group = single_full_payload["device_groups"][0]
+    single_series = single_payload["series_results"][0]
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+    )
+
+    checks = [
+        (
+            "filename_fallback_fragmentation_collapsed",
+            single_full_payload["device_count"] == 1
+            and len(single_full_payload["device_groups"]) == 1
+            and int(single_group.get("file_count", 0)) == 2,
+            {"device_groups": single_full_payload["device_groups"]},
+        ),
+        (
+            "selection_merge_scope_flagged",
+            str(single_group.get("selection_merge_scope")) == "selection_level"
+            and "selection_scope" in str(single_group.get("group_device_source", "")),
+            {"selection_group": single_group},
+        ),
+        (
+            "single_vs_compare_valid_points_equal",
+            int(single_series["details"].get("valid_points", 0)) == int(dual_ygas["details"].get("valid_points", 0)),
+            {
+                "single_valid_points": single_series["details"].get("valid_points"),
+                "compare_valid_points": dual_ygas["details"].get("valid_points"),
+            },
+        ),
+        (
+            "single_vs_compare_nperseg_equal",
+            int(single_series["details"].get("nperseg", 0)) == int(dual_ygas["details"].get("nperseg", 0)),
+            {
+                "single_nperseg": single_series["details"].get("nperseg"),
+                "compare_nperseg": dual_ygas["details"].get("nperseg"),
+            },
+        ),
+        (
+            "single_vs_compare_valid_freq_points_equal",
+            int(single_series["details"].get("valid_freq_points", 0))
+            == int(dual_ygas["details"].get("valid_freq_points", 0)),
+            {
+                "single_valid_freq_points": single_series["details"].get("valid_freq_points"),
+                "compare_valid_freq_points": dual_ygas["details"].get("valid_freq_points"),
+            },
+        ),
+        (
+            "single_vs_compare_frequency_point_count_equal",
+            int(single_series["details"].get("frequency_point_count", 0))
+            == int(dual_ygas["details"].get("frequency_point_count", 0)),
+            {
+                "single_frequency_point_count": single_series["details"].get("frequency_point_count"),
+                "compare_frequency_point_count": dual_ygas["details"].get("frequency_point_count"),
+            },
+        ),
+        (
+            "single_vs_compare_freq_equal",
+            np.array_equal(single_series["freq"], dual_ygas["freq"]),
+            {"single_points": len(single_series["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "single_vs_compare_density_allclose",
+            np.allclose(single_series["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
+            {
+                "single_first5": single_series["density"][:5].tolist(),
+                "compare_first5": dual_ygas["density"][:5].tolist(),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_selection_scope_check]")
+    print(f"ygas_source={ygas_source}")
+    print(f"dat_path={dat_path}")
+    print(f"selection_paths={[str(ygas_path_a), str(ygas_path_b)]}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"time_range={start_dt} ~ {end_dt}")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -2632,6 +2826,7 @@ def main() -> int:
             "frr-compat-semantics-check",
             "device-group-spectral-check",
             "single-compare-base-spectrum-check",
+            "single-device-selection-scope-check",
             "time-range-metadata-check",
             "repo-fixture-smoke",
         ],
@@ -2690,6 +2885,8 @@ def main() -> int:
             return run_device_group_spectral_check_mode(args)
         if mode == "single-compare-base-spectrum-check":
             return run_single_compare_base_spectrum_core_metadata_check_mode(args)
+        if mode == "single-device-selection-scope-check":
+            return run_single_device_selection_scope_check_mode(args)
         if mode == "time-range-metadata-check":
             return run_time_range_metadata_check_mode(args)
         if mode == "repo-fixture-smoke":
