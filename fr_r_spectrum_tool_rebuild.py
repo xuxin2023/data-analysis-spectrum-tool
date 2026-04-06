@@ -276,13 +276,14 @@ def build_series_point_count_status_items(
     return items
 
 
-def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
+def build_execution_items(
+    details: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    include_plot_execution_path: bool = False,
+) -> list[str]:
     items: list[str] = []
-    for key in (
-        "single_txt_execution_path",
-        "single_txt_selection_scope",
-        "single_txt_time_range_policy",
-    ):
+    for key in keys:
         value = details.get(key)
         if value is not None:
             items.append(f"{key}={value}")
@@ -291,6 +292,31 @@ def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_ex
         if plot_execution_path is not None:
             items.append(f"plot_execution_path={plot_execution_path}")
     return items
+
+
+def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
+    return build_execution_items(
+        details,
+        (
+            "single_txt_execution_path",
+            "single_txt_selection_scope",
+            "single_txt_time_range_policy",
+        ),
+        include_plot_execution_path=include_plot_execution_path,
+    )
+
+
+def build_single_device_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
+    return build_execution_items(
+        details,
+        (
+            "single_device_execution_path",
+            "single_device_selection_scope",
+            "single_device_time_range_policy",
+            "single_device_compare_side_fallback_reason",
+        ),
+        include_plot_execution_path=include_plot_execution_path,
+    )
 
 
 def get_resource_path(*parts: str) -> Path:
@@ -650,9 +676,9 @@ class FileViewerApp:
         self.dat_summary_var = tk.StringVar(value="dat 摘要：等待选择 dat 文件")
         self.folder_prepare_summary_var = tk.StringVar(value="自动准备摘要：等待选择文件夹")
         self.selected_dat_var = tk.StringVar(value="")
-        self.single_compare_style_preview_var = tk.BooleanVar(value=False)
+        self.single_compare_style_preview_var = tk.BooleanVar(value=True)
         self.single_compare_style_preview_info_var = tk.StringVar(
-            value="当前没有可复用的 compare txt 侧上下文，单图保持旧单文件路径。"
+            value="当前没有可复用的 compare txt 侧上下文；满足条件后会默认自动复用，取消勾选可退回旧路径。"
         )
         self.legacy_target_use_analysis_params_var = tk.BooleanVar(value=False)
         self.legacy_target_spectrum_mode_var = tk.StringVar(value=core.LEGACY_TARGET_SPECTRUM_MODE_PSD)
@@ -1249,7 +1275,7 @@ class FileViewerApp:
 
         self.single_compare_style_preview_check = ttk.Checkbutton(
             actions_frame,
-            text="txt 单图复用对比图 txt 侧输入",
+            text="复用 compare txt 侧输入（单图/单设备）",
             variable=self.single_compare_style_preview_var,
             state="disabled",
         )
@@ -2023,19 +2049,39 @@ class FileViewerApp:
             "selected_paths": [*selected_ygas_paths, resolved_dat_path],
         }
 
-    def resolve_single_compare_style_preview_context(self) -> dict[str, Any]:
-        if self.current_data_source_kind != "file" or self.current_file is None:
-            raise ValueError("当前不是单文件视图，无法启用 txt 单图 compare-side 等效路径。")
-
-        current_path = Path(self.current_file)
+    def build_compare_side_candidate_contexts(self) -> list[dict[str, Any]]:
         candidate_contexts: list[dict[str, Any]] = []
+        seen_keys: set[tuple[tuple[str, ...], str]] = set()
+
+        def append_context(context: dict[str, Any]) -> None:
+            ygas_paths = [Path(path) for path in context.get("ygas_paths", [])]
+            dat_path_value = context.get("dat_path")
+            if not ygas_paths or dat_path_value is None:
+                return
+            dat_path = Path(dat_path_value)
+            key = (
+                tuple(sorted(str(path.resolve()) for path in ygas_paths)),
+                str(dat_path.resolve()),
+            )
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            candidate_contexts.append(
+                {
+                    **context,
+                    "ygas_paths": ygas_paths,
+                    "dat_path": dat_path,
+                    "selected_paths": [*ygas_paths, dat_path],
+                }
+            )
+
         auto_context = self.build_auto_compare_selection_snapshot()
         if auto_context is not None:
-            candidate_contexts.append(auto_context)
+            append_context(auto_context)
 
         ygas_paths, dat_path, _other = self.classify_selected_compare_files()
         if dat_path is not None and ygas_paths:
-            candidate_contexts.append(
+            append_context(
                 {
                     "ygas_paths": list(ygas_paths),
                     "dat_path": Path(dat_path),
@@ -2043,50 +2089,81 @@ class FileViewerApp:
                 }
             )
 
-        for context in candidate_contexts:
-            ygas_candidates = [Path(path) for path in context.get("ygas_paths", [])]
-            dat_candidate = Path(context["dat_path"])
-            if current_path in ygas_candidates:
-                return {
-                    **context,
-                    "ygas_paths": ygas_candidates,
-                    "dat_path": dat_candidate,
-                    "selected_paths": [*ygas_candidates, dat_candidate],
-                }
+        return candidate_contexts
 
-        raise ValueError("当前文件不是可配对的 txt/ygas，或缺少可复用的 dat 上下文。")
+    def resolve_txt_compare_side_equivalent_context(self, selection_paths: list[Path]) -> dict[str, Any]:
+        normalized_selection = [Path(path) for path in selection_paths]
+        if not normalized_selection:
+            raise ValueError("当前没有选中的 txt/ygas 文件。")
+
+        candidate_contexts = self.build_compare_side_candidate_contexts()
+        if not candidate_contexts:
+            raise ValueError("当前没有可复用的 dat / compare 上下文。")
+
+        selection_keys = {str(path.resolve()) for path in normalized_selection}
+        for context in candidate_contexts:
+            ygas_keys = {str(Path(path).resolve()) for path in context.get("ygas_paths", [])}
+            if selection_keys.issubset(ygas_keys):
+                return context
+
+        raise ValueError("当前选择的文件不属于 compare 的 txt/ygas 一侧。")
+
+    def resolve_single_compare_style_preview_context(self) -> dict[str, Any]:
+        if self.current_data_source_kind != "file" or self.current_file is None:
+            raise ValueError("当前不是单文件视图，无法启用 txt 单图 compare-side 等效路径。")
+        return self.resolve_txt_compare_side_equivalent_context([Path(self.current_file)])
 
     def refresh_single_compare_style_preview_state(self) -> None:
         available = False
-        info_text = "当前没有可复用的 compare txt 侧上下文，单图保持旧单文件路径。"
+        info_text = "当前没有可复用的 compare txt 侧上下文；满足条件后会默认自动复用，取消勾选可退回旧路径。"
         try:
             context = self.resolve_single_compare_style_preview_context()
             available = True
-            info_text = (
-                f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
-                " 开启后单图将使用 merged txt + compare 时间窗，仅绘制当前 txt 谱线。"
-            )
+            if self.single_compare_style_preview_var.get():
+                info_text = (
+                    f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
+                    " 当前默认复用 compare txt 侧输入作用域与时间窗；取消勾选可退回旧路径。"
+                )
+            else:
+                info_text = (
+                    f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
+                    " 当前已手动关闭复用，单图/单设备会继续走旧路径。"
+                )
         except Exception:
             available = False
-
-        if not available and self.single_compare_style_preview_var.get():
-            self.single_compare_style_preview_var.set(False)
 
         self.single_compare_style_preview_available = available
         if self.single_compare_style_preview_check is not None:
             self.single_compare_style_preview_check.configure(state="normal" if available else "disabled")
         self.single_compare_style_preview_info_var.set(info_text)
 
-    def build_single_txt_compare_equivalent_payload(self, selected_column: str) -> dict[str, Any] | None:
+    def build_txt_compare_side_equivalent_payload(
+        self,
+        *,
+        selection_paths: list[Path],
+        selected_column: str,
+        execution_context: str,
+        plot_execution_path: str,
+        execution_path_key: str,
+        execution_path_value: str,
+        selection_scope_key: str,
+        time_range_policy_key: str,
+        fs_ui: float | None = None,
+        requested_nsegment: int | None = None,
+        overlap_ratio: float | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
         if not self.single_compare_style_preview_var.get():
-            return None
-        if self.current_data_source_kind != "file" or self.current_file is None:
-            return None
+            return None, "reuse_disabled_by_user"
 
         try:
-            context = self.resolve_single_compare_style_preview_context()
-        except ValueError:
-            return None
+            context = self.resolve_txt_compare_side_equivalent_context(selection_paths)
+        except ValueError as exc:
+            message = str(exc)
+            if "dat / compare" in message:
+                return None, "no_compare_dat_context"
+            if "txt/ygas 一侧" in message:
+                return None, "selection_not_txt_side"
+            return None, "compare_context_unavailable"
 
         compare_selection = self.build_compare_selection_from_paths(
             list(context["ygas_paths"]),
@@ -2095,19 +2172,20 @@ class FileViewerApp:
         merged_ygas, txt_label, _parsed_dat, dat_label, selection_meta = compare_selection
         valid_txt_columns = {str(column) for column in merged_ygas.dataframe.columns}
         if selected_column not in valid_txt_columns:
-            return None
+            return None, "merged_ygas_missing_target_column"
 
         txt_summary = selection_meta.get("txt_summary")
         dat_summary = selection_meta.get("dat_summary")
         if txt_summary is None or dat_summary is None:
-            return None
+            return None, "compare_time_range_context_missing"
 
         try:
             start_dt, end_dt = self.resolve_compare_time_range(txt_summary, dat_summary)
         except Exception:
-            return None
+            return None, "compare_time_range_unresolved"
 
-        fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        if fs_ui is None or requested_nsegment is None or overlap_ratio is None:
+            fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
         payload = core.compute_base_spectrum_payload(
             merged_ygas,
             selected_column,
@@ -2131,20 +2209,122 @@ class FileViewerApp:
                 actual_end=details.get("base_actual_end"),
             )
         )
-        details["analysis_context"] = "single_txt_compare_side_equivalent"
-        details["plot_execution_path"] = "single_txt_compare_side_equivalent"
-        details["single_txt_execution_path"] = "compare_side_equivalent"
-        details["single_txt_selection_scope"] = "merged_ygas_compare_scope"
-        details["single_txt_time_range_policy"] = str(details.get("time_range_policy") or "")
+        details["analysis_context"] = execution_context
+        details["plot_execution_path"] = plot_execution_path
+        details[execution_path_key] = execution_path_value
+        details[selection_scope_key] = "merged_ygas_compare_scope"
+        details[time_range_policy_key] = str(details.get("time_range_policy") or "")
+        details["selection_merge_scope"] = "merged_ygas_compare_scope"
+        details["group_device_source"] = "compare_txt_side"
         details["compare_txt_source_label"] = str(txt_label)
         details["compare_dat_source_label"] = str(dat_label)
         details["compare_txt_file_count"] = int(len(context["ygas_paths"]))
         details["compare_dat_file_name"] = str(Path(context["dat_path"]).name)
+        details["raw_source_rows"] = int(txt_summary.get("raw_rows", merged_ygas.source_row_count or len(merged_ygas.dataframe)))
+        details["merged_rows"] = int(txt_summary.get("total_points", len(merged_ygas.dataframe)))
+        details["rendered_point_count"] = int(len(payload["freq"]))
         return {
             "freq": np.asarray(payload["freq"], dtype=float),
             "density": np.asarray(payload["density"], dtype=float),
             "details": details,
+            "context": context,
+            "selection_meta": selection_meta,
+            "txt_label": str(txt_label),
+            "dat_label": str(dat_label),
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+        }, None
+
+    def build_single_txt_compare_equivalent_payload(self, selected_column: str) -> dict[str, Any] | None:
+        if self.current_data_source_kind != "file" or self.current_file is None:
+            return None
+        payload, _fallback_reason = self.build_txt_compare_side_equivalent_payload(
+            selection_paths=[Path(self.current_file)],
+            selected_column=selected_column,
+            execution_context="single_txt_compare_side_equivalent",
+            plot_execution_path="single_txt_compare_side_equivalent",
+            execution_path_key="single_txt_execution_path",
+            execution_path_value="compare_side_equivalent",
+            selection_scope_key="single_txt_selection_scope",
+            time_range_policy_key="single_txt_time_range_policy",
+        )
+        return payload
+
+    def build_single_device_txt_compare_equivalent_payload(
+        self,
+        selected_files: list[Path],
+        *,
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        payload, fallback_reason = self.build_txt_compare_side_equivalent_payload(
+            selection_paths=selected_files,
+            selected_column=target_column,
+            execution_context="single_device_compare_txt_side_equivalent",
+            plot_execution_path="single_device_compare_txt_side_equivalent",
+            execution_path_key="single_device_execution_path",
+            execution_path_value="compare_txt_side_equivalent",
+            selection_scope_key="single_device_selection_scope",
+            time_range_policy_key="single_device_time_range_policy",
+            fs_ui=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+        )
+        if payload is None:
+            return None, fallback_reason
+
+        context = dict(payload.get("context") or {})
+        source_paths = [Path(path) for path in context.get("ygas_paths", [])]
+        device_label = str(payload.get("txt_label") or "compare txt 侧")
+        device_id = "compare_txt_side"
+        device_source = "compare_txt_side"
+        file_count = int(len(source_paths))
+        details = dict(payload["details"])
+        details["device_id"] = device_id
+        details["device_label"] = device_label
+        details["device_source"] = device_source
+        details["group_device_source"] = device_source
+        details["device_file_count"] = file_count
+        details["device_group_merge_strategy"] = "compare_txt_side_equivalent"
+        details["source_paths"] = [str(path) for path in source_paths]
+        details["selection_merge_scope"] = "merged_ygas_compare_scope"
+
+        series_result = {
+            "label": device_label,
+            "freq": np.asarray(payload["freq"], dtype=float),
+            "density": np.asarray(payload["density"], dtype=float),
+            "details": details,
+            "device_id": device_id,
+            "device_source": device_source,
+            "file_count": file_count,
+            "merge_strategy": "compare_txt_side_equivalent",
+            "selection_merge_scope": "merged_ygas_compare_scope",
+            "source_paths": [str(path) for path in source_paths],
         }
+        return {
+            "target_column": target_column,
+            "series_results": [series_result],
+            "skipped_files": [],
+            "device_groups": [
+                {
+                    "device_id": device_id,
+                    "device_label": device_label,
+                    "device_source": device_source,
+                    "group_device_source": device_source,
+                    "file_count": file_count,
+                    "merge_strategy": "compare_txt_side_equivalent",
+                    "selection_merge_scope": "merged_ygas_compare_scope",
+                    "raw_source_rows": int(details.get("raw_source_rows", 0) or 0),
+                    "merged_rows": int(details.get("merged_rows", 0) or 0),
+                }
+            ],
+            "device_count": 1,
+            "file_count": file_count,
+            "start_dt": payload.get("start_dt"),
+            "end_dt": payload.get("end_dt"),
+        }, None
 
     def apply_recent_time_range(self, minutes: int) -> None:
         try:
@@ -2588,6 +2768,16 @@ class FileViewerApp:
         end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
+        compare_side_payload, compare_side_fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
+            selected_files,
+            target_column=target_column,
+            fs=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+        )
+        if compare_side_payload is not None:
+            return compare_side_payload
+
         series_results: list[dict[str, Any]] = []
         device_groups, skipped_files = self.build_device_grouped_spectral_selection(
             selected_files,
@@ -2627,6 +2817,9 @@ class FileViewerApp:
                     group["merge_metadata"].get("raw_rows", merged_parsed.source_row_count or len(merged_parsed.dataframe))
                 )
                 details["merged_rows"] = int(group["merge_metadata"].get("merged_points", len(merged_parsed.dataframe)))
+                details["analysis_context"] = "single_device_grouped_spectrum"
+                details["plot_execution_path"] = "single_device_grouped_spectrum"
+                details["rendered_point_count"] = int(len(payload["freq"]))
                 details.update(
                     core.build_single_time_range_metadata(
                         start_dt=start_dt,
@@ -2658,6 +2851,15 @@ class FileViewerApp:
 
         for item in series_results:
             item["details"]["series_count"] = int(len(series_results))
+        if len(series_results) == 1:
+            single_details = series_results[0]["details"]
+            single_details["single_device_execution_path"] = "legacy_device_group_scope"
+            single_details["single_device_selection_scope"] = str(
+                single_details.get("selection_merge_scope") or "device_group"
+            )
+            single_details["single_device_time_range_policy"] = str(single_details.get("time_range_policy") or "")
+            if compare_side_fallback_reason:
+                single_details["single_device_compare_side_fallback_reason"] = compare_side_fallback_reason
 
         return {
             "target_column": target_column,
@@ -8189,7 +8391,8 @@ class FileViewerApp:
         series_items = [
             f"{item['label']} | valid_points={item['details'].get('valid_points')} | "
             f"valid_freq_points={item['details'].get('valid_freq_points')} | "
-            f"frequency_point_count={item['details'].get('frequency_point_count')}"
+            f"frequency_point_count={item['details'].get('frequency_point_count')} | "
+            f"rendered_point_count={item['details'].get('rendered_point_count', len(item['freq']))}"
             for item in series_results
         ]
         self.update_diagnostic_info(
@@ -8215,6 +8418,8 @@ class FileViewerApp:
                 f"valid_points={first_details.get('valid_points')}",
                 f"valid_freq_points={first_details.get('valid_freq_points')}",
                 f"frequency_point_count={first_details.get('frequency_point_count')}",
+                f"rendered_point_count={first_details.get('rendered_point_count', len(series_results[0]['freq']))}",
+                *build_single_device_execution_items(first_details, include_plot_execution_path=True),
                 *core.build_time_range_diagnostic_items(first_details),
                 *group_items,
                 *series_items,
@@ -8225,7 +8430,7 @@ class FileViewerApp:
         status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
         status = (
             f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
-            f" | {' | '.join(build_series_point_count_status_items(point_count_contract))}"
+            f" | {' | '.join(build_series_point_count_status_items(point_count_contract) + build_single_device_execution_items(first_details))}"
             f" | 时间窗={first_details.get('time_range_policy_label') or '默认'}"
             f" | {first_details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
         )
