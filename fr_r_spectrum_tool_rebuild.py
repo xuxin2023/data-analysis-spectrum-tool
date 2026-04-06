@@ -112,6 +112,7 @@ EXPORT_REQUIRED_METADATA_FIELDS = (
 )
 EXPORT_ADDITIONAL_METADATA_FIELDS = (
     *core.TIME_RANGE_METADATA_EXPORT_KEYS,
+    "plot_execution_path",
     "cross_execution_path",
     "cross_implementation_id",
     "cross_reference_column",
@@ -272,6 +273,23 @@ def build_series_point_count_status_items(
                 f"{normalized_prefix}total_frequency_points_across_series={int(contract.get('total_frequency_points_across_series', 0))}",
             ]
         )
+    return items
+
+
+def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
+    items: list[str] = []
+    for key in (
+        "single_txt_execution_path",
+        "single_txt_selection_scope",
+        "single_txt_time_range_policy",
+    ):
+        value = details.get(key)
+        if value is not None:
+            items.append(f"{key}={value}")
+    if include_plot_execution_path:
+        plot_execution_path = details.get("plot_execution_path")
+        if plot_execution_path is not None:
+            items.append(f"plot_execution_path={plot_execution_path}")
     return items
 
 
@@ -632,6 +650,10 @@ class FileViewerApp:
         self.dat_summary_var = tk.StringVar(value="dat 摘要：等待选择 dat 文件")
         self.folder_prepare_summary_var = tk.StringVar(value="自动准备摘要：等待选择文件夹")
         self.selected_dat_var = tk.StringVar(value="")
+        self.single_compare_style_preview_var = tk.BooleanVar(value=False)
+        self.single_compare_style_preview_info_var = tk.StringVar(
+            value="当前没有可复用的 compare txt 侧上下文，单图保持旧单文件路径。"
+        )
         self.legacy_target_use_analysis_params_var = tk.BooleanVar(value=False)
         self.legacy_target_spectrum_mode_var = tk.StringVar(value=core.LEGACY_TARGET_SPECTRUM_MODE_PSD)
         self.legacy_target_color_mode_var = tk.StringVar(value=LEGACY_TARGET_COLOR_MODE_BY_DEVICE)
@@ -656,6 +678,8 @@ class FileViewerApp:
         self.single_analysis_tab: ttk.Frame | None = None
         self.dual_compare_tab: ttk.Frame | None = None
         self.advanced_param_tab: ttk.Frame | None = None
+        self.single_compare_style_preview_check: ttk.Checkbutton | None = None
+        self.single_compare_style_preview_available = False
         self.table_font = tkfont.nametofont("TkDefaultFont")
 
         self._build_ui()
@@ -1223,6 +1247,21 @@ class FileViewerApp:
         )
         self.preserve_button.pack(anchor="w", padx=6, pady=(6, 2))
 
+        self.single_compare_style_preview_check = ttk.Checkbutton(
+            actions_frame,
+            text="txt 单图复用对比图 txt 侧输入",
+            variable=self.single_compare_style_preview_var,
+            state="disabled",
+        )
+        self.single_compare_style_preview_check.pack(anchor="w", padx=6, pady=(0, 2))
+        ttk.Label(
+            actions_frame,
+            textvariable=self.single_compare_style_preview_info_var,
+            foreground="#666666",
+            wraplength=300,
+            justify="left",
+        ).pack(fill=tk.X, padx=6, pady=(0, 4))
+
         self.btn_spectral = ttk.Button(actions_frame, text="单列功率谱密度", command=lambda: self.perform_analysis("spectral"))
         self.btn_spectral.pack(fill=tk.X, padx=6, pady=2)
 
@@ -1403,6 +1442,7 @@ class FileViewerApp:
             self.overlap_ratio_var,
             self.cross_spectrum_type_var,
             self.reference_slope_mode_var,
+            self.single_compare_style_preview_var,
         ):
             variable.trace_add("write", lambda *_args: self.schedule_auto_analysis())
 
@@ -1886,20 +1926,11 @@ class FileViewerApp:
         parsed_a: ParsedFileResult,
         parsed_b: ParsedFileResult,
     ) -> tuple[str | None, str | None, str]:
-        mapping_mode = self.mapping_mode_var.get().strip() or "手动映射"
-        mapping_name = "手动映射"
-        hit_a: str | None = None
-        hit_b: str | None = None
-
-        if mapping_mode == "预设映射":
-            mapping_name = self.element_preset_var.get().strip() or "CO2"
-            preset = ELEMENT_PRESETS.get(mapping_name, {})
-            hit_a = self.select_first_matching_column(parsed_a.suggested_columns, preset.get("A", []))
-            hit_b = self.select_first_matching_column(parsed_b.suggested_columns, preset.get("B", []))
-            if hit_a:
-                self.device_a_column_var.set(hit_a)
-            if hit_b:
-                self.device_b_column_var.set(hit_b)
+        hit_a, hit_b, mapping_name = self.resolve_compare_mapping_hits(parsed_a, parsed_b)
+        if hit_a:
+            self.device_a_column_var.set(hit_a)
+        if hit_b:
+            self.device_b_column_var.set(hit_b)
 
         if not self.device_a_column_var.get() and parsed_a.suggested_columns:
             self.device_a_column_var.set(parsed_a.suggested_columns[0])
@@ -1910,6 +1941,22 @@ class FileViewerApp:
         preferred_b = [self.device_b_column_var.get()] if self.device_b_column_var.get() else []
         self.set_listbox_values(self.device_a_multi_listbox, parsed_a.suggested_columns, preferred_a)
         self.set_listbox_values(self.device_b_multi_listbox, parsed_b.suggested_columns, preferred_b)
+        return hit_a, hit_b, mapping_name
+
+    def resolve_compare_mapping_hits(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+    ) -> tuple[str | None, str | None, str]:
+        mapping_mode = self.mapping_mode_var.get().strip() or "手动映射"
+        mapping_name = "手动映射"
+        hit_a: str | None = None
+        hit_b: str | None = None
+        if mapping_mode == "预设映射":
+            mapping_name = self.element_preset_var.get().strip() or "CO2"
+            preset = ELEMENT_PRESETS.get(mapping_name, {})
+            hit_a = self.select_first_matching_column(parsed_a.suggested_columns, preset.get("A", []))
+            hit_b = self.select_first_matching_column(parsed_b.suggested_columns, preset.get("B", []))
         return hit_a, hit_b, mapping_name
 
     def build_compare_pairs(self) -> list[dict[str, str]]:
@@ -1938,6 +1985,166 @@ class FileViewerApp:
         if len(b_values) == 1:
             return [{"a_col": a_col, "b_col": b_values[0], "label": f"{a_col} vs {b_values[0]}"} for a_col in a_values]
         return [{"a_col": a_col, "b_col": b_col, "label": f"{a_col} vs {b_col}"} for a_col, b_col in zip(a_values, b_values)]
+
+    def build_auto_compare_selection_snapshot(self) -> dict[str, Any] | None:
+        payload = self.auto_prepare_payload
+        if payload is None:
+            return None
+        ygas_infos = list(payload.get("ygas_infos", []))
+        dat_infos = list(payload.get("dat_infos", []))
+        if not ygas_infos or not dat_infos:
+            return None
+
+        dat_path: Path | None = None
+        selected_dat_label = self.selected_dat_var.get().strip()
+        if selected_dat_label:
+            dat_path = self.auto_dat_options.get(selected_dat_label)
+        if dat_path is None:
+            selected_dat_path = payload.get("selected_dat_path")
+            if selected_dat_path:
+                dat_path = Path(selected_dat_path)
+        if dat_path is None:
+            chosen_info = self.choose_best_dat_info(ygas_infos, dat_infos)
+            if chosen_info is not None:
+                dat_path = Path(chosen_info["path"])
+        if dat_path is None:
+            return None
+
+        try:
+            selection = self.build_auto_selection_for_dat(payload, Path(dat_path))
+        except Exception:
+            return None
+
+        selected_ygas_paths = [Path(path) for path in selection.get("selected_ygas_paths", [])]
+        resolved_dat_path = Path(selection["dat_info"]["path"])
+        return {
+            "ygas_paths": selected_ygas_paths,
+            "dat_path": resolved_dat_path,
+            "selected_paths": [*selected_ygas_paths, resolved_dat_path],
+        }
+
+    def resolve_single_compare_style_preview_context(self) -> dict[str, Any]:
+        if self.current_data_source_kind != "file" or self.current_file is None:
+            raise ValueError("当前不是单文件视图，无法启用 txt 单图 compare-side 等效路径。")
+
+        current_path = Path(self.current_file)
+        candidate_contexts: list[dict[str, Any]] = []
+        auto_context = self.build_auto_compare_selection_snapshot()
+        if auto_context is not None:
+            candidate_contexts.append(auto_context)
+
+        ygas_paths, dat_path, _other = self.classify_selected_compare_files()
+        if dat_path is not None and ygas_paths:
+            candidate_contexts.append(
+                {
+                    "ygas_paths": list(ygas_paths),
+                    "dat_path": Path(dat_path),
+                    "selected_paths": [*ygas_paths, Path(dat_path)],
+                }
+            )
+
+        for context in candidate_contexts:
+            ygas_candidates = [Path(path) for path in context.get("ygas_paths", [])]
+            dat_candidate = Path(context["dat_path"])
+            if current_path in ygas_candidates:
+                return {
+                    **context,
+                    "ygas_paths": ygas_candidates,
+                    "dat_path": dat_candidate,
+                    "selected_paths": [*ygas_candidates, dat_candidate],
+                }
+
+        raise ValueError("当前文件不是可配对的 txt/ygas，或缺少可复用的 dat 上下文。")
+
+    def refresh_single_compare_style_preview_state(self) -> None:
+        available = False
+        info_text = "当前没有可复用的 compare txt 侧上下文，单图保持旧单文件路径。"
+        try:
+            context = self.resolve_single_compare_style_preview_context()
+            available = True
+            info_text = (
+                f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
+                " 开启后单图将使用 merged txt + compare 时间窗，仅绘制当前 txt 谱线。"
+            )
+        except Exception:
+            available = False
+
+        if not available and self.single_compare_style_preview_var.get():
+            self.single_compare_style_preview_var.set(False)
+
+        self.single_compare_style_preview_available = available
+        if self.single_compare_style_preview_check is not None:
+            self.single_compare_style_preview_check.configure(state="normal" if available else "disabled")
+        self.single_compare_style_preview_info_var.set(info_text)
+
+    def build_single_txt_compare_equivalent_payload(self, selected_column: str) -> dict[str, Any] | None:
+        if not self.single_compare_style_preview_var.get():
+            return None
+        if self.current_data_source_kind != "file" or self.current_file is None:
+            return None
+
+        try:
+            context = self.resolve_single_compare_style_preview_context()
+        except ValueError:
+            return None
+
+        compare_selection = self.build_compare_selection_from_paths(
+            list(context["ygas_paths"]),
+            Path(context["dat_path"]),
+        )
+        merged_ygas, txt_label, _parsed_dat, dat_label, selection_meta = compare_selection
+        valid_txt_columns = {str(column) for column in merged_ygas.dataframe.columns}
+        if selected_column not in valid_txt_columns:
+            return None
+
+        txt_summary = selection_meta.get("txt_summary")
+        dat_summary = selection_meta.get("dat_summary")
+        if txt_summary is None or dat_summary is None:
+            return None
+
+        try:
+            start_dt, end_dt = self.resolve_compare_time_range(txt_summary, dat_summary)
+        except Exception:
+            return None
+
+        fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
+        payload = core.compute_base_spectrum_payload(
+            merged_ygas,
+            selected_column,
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            require_timestamp=True,
+        )
+        details = dict(payload["details"])
+        details.update(
+            core.build_compare_time_range_metadata(
+                strategy_label=str(self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"),
+                start_dt=start_dt,
+                end_dt=end_dt,
+                has_txt_dat_context=True,
+                requested_start=details.get("base_requested_start"),
+                requested_end=details.get("base_requested_end"),
+                actual_start=details.get("base_actual_start"),
+                actual_end=details.get("base_actual_end"),
+            )
+        )
+        details["analysis_context"] = "single_txt_compare_side_equivalent"
+        details["plot_execution_path"] = "single_txt_compare_side_equivalent"
+        details["single_txt_execution_path"] = "compare_side_equivalent"
+        details["single_txt_selection_scope"] = "merged_ygas_compare_scope"
+        details["single_txt_time_range_policy"] = str(details.get("time_range_policy") or "")
+        details["compare_txt_source_label"] = str(txt_label)
+        details["compare_dat_source_label"] = str(dat_label)
+        details["compare_txt_file_count"] = int(len(context["ygas_paths"]))
+        details["compare_dat_file_name"] = str(Path(context["dat_path"]).name)
+        return {
+            "freq": np.asarray(payload["freq"], dtype=float),
+            "density": np.asarray(payload["density"], dtype=float),
+            "details": details,
+        }
 
     def apply_recent_time_range(self, minutes: int) -> None:
         try:
@@ -2180,6 +2387,7 @@ class FileViewerApp:
             self.device_b_combo.configure(values=[])
             self.device_a_column_var.set("")
             self.device_b_column_var.set("")
+            self.refresh_single_compare_style_preview_state()
             return
 
         self.update_compare_column_values(self.device_a_combo, self.device_a_column_var, parsed_a.suggested_columns)
@@ -2193,6 +2401,7 @@ class FileViewerApp:
                 f"设备A={label_a}（{parsed_a.profile_name}） | 设备B={label_b}（{parsed_b.profile_name}） | 预设“{mapping_name}”未完全命中"
             )
         self.update_compare_summaries(meta["txt_summary"], meta["dat_summary"])
+        self.refresh_single_compare_style_preview_state()
 
     def build_device_grouped_spectral_selection(
         self,
@@ -5109,6 +5318,7 @@ class FileViewerApp:
             )
             cb.grid(row=row_offset + idx, column=0, sticky="w", padx=6, pady=2)
 
+        self.refresh_single_compare_style_preview_state()
         self.schedule_auto_analysis()
 
     def restore_selection_candidates(self) -> set[str]:
@@ -5433,6 +5643,14 @@ class FileViewerApp:
     def spectral_analysis(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         col = self.selected_columns[0]
         if self.current_data_source_kind == "file" and self.current_file_parsed is not None:
+            compare_equivalent_payload = self.build_single_txt_compare_equivalent_payload(col)
+            if compare_equivalent_payload is not None:
+                details = dict(compare_equivalent_payload["details"])
+                return (
+                    np.asarray(compare_equivalent_payload["freq"], dtype=float),
+                    np.asarray(compare_equivalent_payload["density"], dtype=float),
+                    details,
+                )
             start_dt, end_dt = self.resolve_optional_time_range_inputs()
             payload = self.compute_base_psd_payload(
                 self.current_file_parsed,
@@ -5443,6 +5661,7 @@ class FileViewerApp:
             )
             details = dict(payload["details"])
             details["analysis_context"] = "single_file_base_spectrum"
+            details["plot_execution_path"] = "single_file_base_spectrum"
             details.update(
                 core.build_single_time_range_metadata(
                     start_dt=start_dt,
@@ -7696,6 +7915,7 @@ class FileViewerApp:
             if details.get("base_fs_source") is not None:
                 quality_items.append(f"base_fs_source={details.get('base_fs_source')}")
             quality_items.extend(core.build_time_range_diagnostic_items(details))
+            quality_items.extend(build_single_txt_execution_items(details, include_plot_execution_path=True))
             if len(freq) < 10:
                 quality_items.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
             ax.set_xscale("log")
@@ -7856,9 +8076,11 @@ class FileViewerApp:
         )
         if analysis_type == "spectral":
             policy_label = str(details.get("time_range_policy_label") or "默认")
+            spectral_status_items = build_series_point_count_status_items(point_count_contract)
+            spectral_status_items.extend(build_single_txt_execution_items(details))
             self.status_var.set(
                 f"图已生成：功率谱密度 / {columns[0]} | 时间窗={policy_label} | "
-                f"{' | '.join(build_series_point_count_status_items(point_count_contract))} | "
+                f"{' | '.join(spectral_status_items)} | "
                 f"{details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
             )
         else:

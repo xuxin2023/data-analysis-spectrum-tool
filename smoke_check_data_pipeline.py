@@ -327,6 +327,17 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
+            "single_txt_compare_side_equivalence",
+            run_single_txt_compare_side_equivalence_check_mode,
+            clone_args(
+                args,
+                mode="single-txt-compare-side-equivalence-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
             "frr_compat_semantics",
             run_frr_compat_semantics_check_mode,
             clone_args(
@@ -1583,6 +1594,631 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
     print(f"single_plot_contract={single_plot_contract}")
     print(f"single_overlay_contract={single_overlay_contract}")
     print(f"compare_contract={compare_contract}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_compare_style_preview_check_mode(args: argparse.Namespace) -> int:
+    return run_single_txt_compare_side_equivalence_check_mode(args)
+
+    if not args.ygas or not args.dat:
+        raise ValueError("single-compare-style-preview-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    compare_style_status_tag = "单图按对比图方式显示=是"
+    compare_style_diag_tag = "single_compare_style_preview=enabled"
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        def configure_single_source(source_path: Path, parsed_source: ParsedFileResult, selected_column: str) -> None:
+            app.current_data_source_kind = "file"
+            app.current_data_source_label = f"当前文件：{source_path.name}"
+            app.current_file = source_path
+            app.current_file_parsed = parsed_source
+            app.current_layout_label = parsed_source.profile_name
+            app.raw_data = parsed_source.dataframe.copy()
+            app.column_vars = {selected_column: tk.BooleanVar(master=root, value=True)}
+
+        configure_single_source(ygas_path, parsed_a, str(col_a))
+
+        app.auto_prepare_payload = None
+        app.auto_dat_options = {}
+        app.selected_dat_var.set("")
+        app.refresh_single_compare_style_preview_state()
+        preview_unavailable_without_pair = not bool(app.single_compare_style_preview_available)
+
+        auto_payload = app.prepare_folder_auto_selection_payload([ygas_path, dat_path])
+        app.auto_prepare_payload = auto_payload
+        app.auto_dat_options = {app.build_dat_option_label(info): Path(info["path"]) for info in auto_payload["dat_infos"]}
+        selected_dat_path = Path(auto_payload["selected_dat_path"])
+        selected_dat_label = next(
+            label for label, path in app.auto_dat_options.items() if Path(path) == selected_dat_path
+        )
+        app.selected_dat_var.set(selected_dat_label)
+        app.refresh_single_compare_style_preview_state()
+        preview_available_with_pair = bool(app.single_compare_style_preview_available)
+
+        app.single_compare_style_preview_var.set(False)
+        app.perform_analysis("spectral", quiet=True)
+        plain_contract = dict(app.current_point_count_contract)
+        plain_status_text = app.status_var.get()
+        plain_diag_text = app.diagnostic_var.get()
+        plain_plot_kind = app.current_plot_kind
+
+        app.single_compare_style_preview_var.set(True)
+        app.perform_analysis("spectral", quiet=True)
+        preview_contract = dict(app.current_point_count_contract)
+        preview_status_text = app.status_var.get()
+        preview_diag_text = app.diagnostic_var.get()
+        preview_plot_kind = app.current_plot_kind
+
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_context={
+                "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                "has_txt_dat_context": bool(
+                    selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+                ),
+            },
+        )
+        app.on_prepared_dual_plot_ready(dual_plot_payload)
+        compare_contract = dict(app.current_point_count_contract)
+
+        dual_ygas = next(
+            item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+        )
+        dual_dat = next(
+            item for item in dual_plot_payload["series_results"] if str(item["side"]) == "dat" and str(item["column"]) == col_b
+        )
+
+        configure_single_source(dat_path, parsed_b, str(col_b))
+        app.refresh_single_compare_style_preview_state()
+        preview_available_with_pair_from_dat = bool(app.single_compare_style_preview_available)
+
+        app.single_compare_style_preview_var.set(False)
+        app.perform_analysis("spectral", quiet=True)
+        dat_plain_contract = dict(app.current_point_count_contract)
+        dat_plain_status_text = app.status_var.get()
+        dat_plain_diag_text = app.diagnostic_var.get()
+        dat_plain_plot_kind = app.current_plot_kind
+
+        app.single_compare_style_preview_var.set(True)
+        app.perform_analysis("spectral", quiet=True)
+        dat_preview_contract = dict(app.current_point_count_contract)
+        dat_preview_status_text = app.status_var.get()
+        dat_preview_diag_text = app.diagnostic_var.get()
+        dat_preview_plot_kind = app.current_plot_kind
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "preview_requires_pairable_txt_dat_inputs",
+            preview_unavailable_without_pair and preview_available_with_pair and preview_available_with_pair_from_dat,
+            {
+                "preview_unavailable_without_pair": preview_unavailable_without_pair,
+                "preview_available_with_pair": preview_available_with_pair,
+                "preview_available_with_pair_from_dat": preview_available_with_pair_from_dat,
+            },
+        ),
+        (
+            "preview_off_still_single_series_from_ygas",
+            plain_plot_kind == "spectral"
+            and int(plain_contract["global"]["series_count"]) == 1
+            and "txt" not in plain_contract
+            and "dat" not in plain_contract,
+            {
+                "plain_plot_kind": plain_plot_kind,
+                "plain_contract": plain_contract,
+            },
+        ),
+        (
+            "preview_off_status_has_no_compare_style_tag_from_ygas",
+            compare_style_status_tag not in plain_status_text and compare_style_diag_tag not in plain_diag_text,
+            {
+                "plain_status": plain_status_text,
+                "plain_diag": plain_diag_text,
+            },
+        ),
+        (
+            "preview_on_uses_compare_render_kind_from_ygas",
+            preview_plot_kind == "dual_psd_compare",
+            {"preview_plot_kind": preview_plot_kind},
+        ),
+        (
+            "preview_on_status_marks_compare_style_from_ygas",
+            compare_style_status_tag in preview_status_text and compare_style_diag_tag in preview_diag_text,
+            {
+                "preview_status": preview_status_text,
+                "preview_diag": preview_diag_text,
+            },
+        ),
+        (
+            "preview_off_still_single_series_from_dat",
+            dat_plain_plot_kind == "spectral"
+            and int(dat_plain_contract["global"]["series_count"]) == 1
+            and "txt" not in dat_plain_contract
+            and "dat" not in dat_plain_contract,
+            {
+                "dat_plain_plot_kind": dat_plain_plot_kind,
+                "dat_plain_contract": dat_plain_contract,
+            },
+        ),
+        (
+            "preview_off_status_has_no_compare_style_tag_from_dat",
+            compare_style_status_tag not in dat_plain_status_text and compare_style_diag_tag not in dat_plain_diag_text,
+            {
+                "dat_plain_status": dat_plain_status_text,
+                "dat_plain_diag": dat_plain_diag_text,
+            },
+        ),
+        (
+            "preview_on_uses_compare_render_kind_from_dat",
+            dat_preview_plot_kind == "dual_psd_compare",
+            {"dat_preview_plot_kind": dat_preview_plot_kind},
+        ),
+        (
+            "preview_on_status_marks_compare_style_from_dat",
+            compare_style_status_tag in dat_preview_status_text and compare_style_diag_tag in dat_preview_diag_text,
+            {
+                "dat_preview_status": dat_preview_status_text,
+                "dat_preview_diag": dat_preview_diag_text,
+            },
+        ),
+        (
+            "preview_on_total_rendered_matches_compare_from_ygas",
+            int(preview_contract["global"]["total_rendered_point_count_across_series"])
+            == int(compare_contract["global"]["total_rendered_point_count_across_series"]),
+            {
+                "preview_global": preview_contract.get("global"),
+                "compare_global": compare_contract.get("global"),
+            },
+        ),
+        (
+            "preview_on_total_rendered_matches_compare_from_dat",
+            int(dat_preview_contract["global"]["total_rendered_point_count_across_series"])
+            == int(compare_contract["global"]["total_rendered_point_count_across_series"]),
+            {
+                "dat_preview_global": dat_preview_contract.get("global"),
+                "compare_global": compare_contract.get("global"),
+            },
+        ),
+        (
+            "preview_on_total_valid_matches_compare_from_ygas",
+            int(preview_contract["global"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["global"]["total_valid_freq_points_across_series"])
+            and int(preview_contract["global"]["total_frequency_points_across_series"])
+            == int(compare_contract["global"]["total_frequency_points_across_series"]),
+            {
+                "preview_global": preview_contract.get("global"),
+                "compare_global": compare_contract.get("global"),
+            },
+        ),
+        (
+            "preview_on_total_valid_matches_compare_from_dat",
+            int(dat_preview_contract["global"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["global"]["total_valid_freq_points_across_series"])
+            and int(dat_preview_contract["global"]["total_frequency_points_across_series"])
+            == int(compare_contract["global"]["total_frequency_points_across_series"]),
+            {
+                "dat_preview_global": dat_preview_contract.get("global"),
+                "compare_global": compare_contract.get("global"),
+            },
+        ),
+        (
+            "preview_on_txt_side_matches_compare_from_ygas",
+            int(preview_contract["txt"]["total_rendered_point_count_across_series"]) == int(len(dual_ygas["freq"]))
+            and int(preview_contract["txt"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["txt"]["total_valid_freq_points_across_series"])
+            and int(preview_contract["txt"]["total_frequency_points_across_series"])
+            == int(compare_contract["txt"]["total_frequency_points_across_series"]),
+            {
+                "preview_txt": preview_contract.get("txt"),
+                "compare_txt": compare_contract.get("txt"),
+                "expected_txt_rendered": len(dual_ygas["freq"]),
+            },
+        ),
+        (
+            "preview_on_txt_side_matches_compare_from_dat",
+            int(dat_preview_contract["txt"]["total_rendered_point_count_across_series"]) == int(len(dual_ygas["freq"]))
+            and int(dat_preview_contract["txt"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["txt"]["total_valid_freq_points_across_series"])
+            and int(dat_preview_contract["txt"]["total_frequency_points_across_series"])
+            == int(compare_contract["txt"]["total_frequency_points_across_series"]),
+            {
+                "dat_preview_txt": dat_preview_contract.get("txt"),
+                "compare_txt": compare_contract.get("txt"),
+                "expected_txt_rendered": len(dual_ygas["freq"]),
+            },
+        ),
+        (
+            "preview_on_dat_side_matches_compare_from_ygas",
+            int(preview_contract["dat"]["total_rendered_point_count_across_series"]) == int(len(dual_dat["freq"]))
+            and int(preview_contract["dat"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["dat"]["total_valid_freq_points_across_series"])
+            and int(preview_contract["dat"]["total_frequency_points_across_series"])
+            == int(compare_contract["dat"]["total_frequency_points_across_series"]),
+            {
+                "preview_dat": preview_contract.get("dat"),
+                "compare_dat": compare_contract.get("dat"),
+                "expected_dat_rendered": len(dual_dat["freq"]),
+            },
+        ),
+        (
+            "preview_on_dat_side_matches_compare_from_dat",
+            int(dat_preview_contract["dat"]["total_rendered_point_count_across_series"]) == int(len(dual_dat["freq"]))
+            and int(dat_preview_contract["dat"]["total_valid_freq_points_across_series"])
+            == int(compare_contract["dat"]["total_valid_freq_points_across_series"])
+            and int(dat_preview_contract["dat"]["total_frequency_points_across_series"])
+            == int(compare_contract["dat"]["total_frequency_points_across_series"]),
+            {
+                "dat_preview_dat": dat_preview_contract.get("dat"),
+                "compare_dat": compare_contract.get("dat"),
+                "expected_dat_rendered": len(dual_dat["freq"]),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_compare_style_preview_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"plain_contract={plain_contract}")
+    print(f"preview_contract={preview_contract}")
+    print(f"dat_plain_contract={dat_plain_contract}")
+    print(f"dat_preview_contract={dat_preview_contract}")
+    print(f"compare_contract={compare_contract}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_txt_compare_side_equivalence_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-txt-compare-side-equivalence-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    required_status_tokens = [
+        "single_txt_execution_path=compare_side_equivalent",
+        "single_txt_selection_scope=merged_ygas_compare_scope",
+        "single_txt_time_range_policy=txt_dat_common_window",
+    ]
+    required_diag_tokens = [*required_status_tokens, "plot_execution_path=single_txt_compare_side_equivalent"]
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+
+        def configure_single_source(source_path: Path, parsed_source: ParsedFileResult, selected_column: str) -> None:
+            app.current_data_source_kind = "file"
+            app.current_data_source_label = f"当前文件：{source_path.name}"
+            app.current_file = source_path
+            app.current_file_parsed = parsed_source
+            app.current_layout_label = parsed_source.profile_name
+            app.raw_data = parsed_source.dataframe.copy()
+            app.column_vars = {selected_column: tk.BooleanVar(master=root, value=True)}
+
+        def get_export_plot_execution_path() -> str:
+            if app.current_result_frame.empty or "plot_execution_path" not in app.current_result_frame.columns:
+                return ""
+            return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
+
+        configure_single_source(ygas_path, parsed_a, str(col_a))
+        app.auto_prepare_payload = None
+        app.auto_dat_options = {}
+        app.selected_dat_var.set("")
+        app.refresh_single_compare_style_preview_state()
+        preview_unavailable_without_pair = not bool(app.single_compare_style_preview_available)
+
+        app.single_compare_style_preview_var.set(True)
+        fallback_payload_without_pair = app.build_single_txt_compare_equivalent_payload(str(col_a))
+        app.perform_analysis("spectral", quiet=True)
+        fallback_without_pair_contract = dict(app.current_point_count_contract)
+        fallback_without_pair_status_text = app.status_var.get()
+        fallback_without_pair_diag_text = app.diagnostic_var.get()
+        fallback_without_pair_plot_kind = app.current_plot_kind
+        fallback_without_pair_export_path = get_export_plot_execution_path()
+
+        auto_payload = app.prepare_folder_auto_selection_payload([ygas_path, dat_path])
+        app.auto_prepare_payload = auto_payload
+        app.auto_dat_options = {app.build_dat_option_label(info): Path(info["path"]) for info in auto_payload["dat_infos"]}
+        selected_dat_path = Path(auto_payload["selected_dat_path"])
+        selected_dat_label = next(
+            label for label, path in app.auto_dat_options.items() if Path(path) == selected_dat_path
+        )
+        app.selected_dat_var.set(selected_dat_label)
+        app.refresh_single_compare_style_preview_state()
+        preview_available_with_pair = bool(app.single_compare_style_preview_available)
+
+        app.single_compare_style_preview_var.set(True)
+        single_payload = app.build_single_txt_compare_equivalent_payload(str(col_a))
+        app.perform_analysis("spectral", quiet=True)
+        single_contract = dict(app.current_point_count_contract)
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+        single_plot_kind = app.current_plot_kind
+        single_rendered_freq = np.asarray(app.current_result_freq, dtype=float)
+        single_rendered_density = np.asarray(app.current_result_values, dtype=float)
+        single_export_plot_execution_path = get_export_plot_execution_path()
+
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": col_a, "b_col": col_b, "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_context={
+                "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                "has_txt_dat_context": bool(
+                    selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+                ),
+            },
+        )
+        dual_ygas = next(
+            item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == col_a
+        )
+
+        configure_single_source(dat_path, parsed_b, str(col_b))
+        app.refresh_single_compare_style_preview_state()
+        preview_available_from_dat = bool(app.single_compare_style_preview_available)
+        app.single_compare_style_preview_var.set(True)
+        dat_payload = app.build_single_txt_compare_equivalent_payload(str(col_b))
+        app.perform_analysis("spectral", quiet=True)
+        dat_fallback_contract = dict(app.current_point_count_contract)
+        dat_fallback_status_text = app.status_var.get()
+        dat_fallback_diag_text = app.diagnostic_var.get()
+        dat_fallback_plot_kind = app.current_plot_kind
+        dat_fallback_export_path = get_export_plot_execution_path()
+    finally:
+        root.destroy()
+
+    if single_payload is None:
+        raise ValueError("expected single txt compare-side equivalent payload under pairable context.")
+
+    single_details = dict(single_payload["details"])
+    compare_txt_details = dict(dual_ygas["details"])
+    checks = [
+        (
+            "fallback_without_dat_context_uses_legacy_single_path",
+            preview_unavailable_without_pair
+            and fallback_payload_without_pair is None
+            and fallback_without_pair_plot_kind == "spectral"
+            and int(fallback_without_pair_contract["global"]["series_count"]) == 1
+            and "single_txt_execution_path=" not in fallback_without_pair_status_text
+            and "single_txt_execution_path=" not in fallback_without_pair_diag_text
+            and fallback_without_pair_export_path == "single_file_base_spectrum",
+            {
+                "fallback_without_pair_contract": fallback_without_pair_contract,
+                "fallback_without_pair_status": fallback_without_pair_status_text,
+                "fallback_without_pair_diag": fallback_without_pair_diag_text,
+                "fallback_without_pair_export_path": fallback_without_pair_export_path,
+            },
+        ),
+        (
+            "pairable_context_enables_equivalent_path",
+            preview_available_with_pair,
+            {"preview_available_with_pair": preview_available_with_pair},
+        ),
+        (
+            "single_txt_equivalent_still_renders_single_series",
+            single_plot_kind == "spectral"
+            and int(single_contract["global"]["series_count"]) == 1
+            and "txt" not in single_contract
+            and "dat" not in single_contract,
+            {"single_contract": single_contract, "single_plot_kind": single_plot_kind},
+        ),
+        (
+            "single_txt_equivalent_status_and_diag_visible",
+            all(token in single_status_text for token in required_status_tokens)
+            and all(token in single_diag_text for token in required_diag_tokens),
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+        (
+            "single_txt_equivalent_export_metadata_visible",
+            single_export_plot_execution_path == "single_txt_compare_side_equivalent",
+            {"single_export_plot_execution_path": single_export_plot_execution_path},
+        ),
+        (
+            "single_txt_compare_side_valid_points_equal",
+            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
+            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
+        ),
+        (
+            "single_txt_compare_side_nperseg_equal",
+            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
+            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
+        ),
+        (
+            "single_txt_compare_side_valid_freq_points_equal",
+            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
+            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
+        ),
+        (
+            "single_txt_compare_side_frequency_point_count_equal",
+            int(single_details.get("frequency_point_count", 0)) == int(compare_txt_details.get("frequency_point_count", 0)),
+            {"single_frequency_point_count": single_details.get("frequency_point_count"), "compare_frequency_point_count": compare_txt_details.get("frequency_point_count")},
+        ),
+        (
+            "single_txt_compare_side_freq_equal",
+            np.array_equal(np.asarray(single_payload["freq"], dtype=float), np.asarray(dual_ygas["freq"], dtype=float)),
+            {"single_points": len(single_payload["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "single_txt_compare_side_density_allclose",
+            np.allclose(
+                np.asarray(single_payload["density"], dtype=float),
+                np.asarray(dual_ygas["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            ),
+            {
+                "single_first5": np.asarray(single_payload["density"], dtype=float)[:5].tolist(),
+                "compare_first5": np.asarray(dual_ygas["density"], dtype=float)[:5].tolist(),
+            },
+        ),
+        (
+            "single_txt_compare_side_rendered_point_count_equal",
+            int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(dual_ygas["freq"]))
+            and np.array_equal(single_rendered_freq, np.asarray(dual_ygas["freq"], dtype=float))
+            and np.allclose(single_rendered_density, np.asarray(dual_ygas["density"], dtype=float), rtol=1e-12, atol=1e-12),
+            {
+                "single_rendered_points": len(single_rendered_freq),
+                "compare_rendered_points": len(dual_ygas["freq"]),
+                "single_contract": single_contract,
+            },
+        ),
+        (
+            "single_txt_compare_side_policy_tags_match_compare_txt_side",
+            str(single_details.get("single_txt_time_range_policy")) == str(compare_txt_details.get("time_range_policy"))
+            and str(single_details.get("plot_execution_path")) == "single_txt_compare_side_equivalent",
+            {"single_details": single_details, "compare_txt_details": compare_txt_details},
+        ),
+        (
+            "current_dat_file_falls_back_to_legacy_single_path",
+            not preview_available_from_dat
+            and dat_payload is None
+            and dat_fallback_plot_kind == "spectral"
+            and int(dat_fallback_contract["global"]["series_count"]) == 1
+            and "single_txt_execution_path=" not in dat_fallback_status_text
+            and "single_txt_execution_path=" not in dat_fallback_diag_text
+            and dat_fallback_export_path == "single_file_base_spectrum",
+            {
+                "preview_available_from_dat": preview_available_from_dat,
+                "dat_fallback_contract": dat_fallback_contract,
+                "dat_fallback_status": dat_fallback_status_text,
+                "dat_fallback_diag": dat_fallback_diag_text,
+                "dat_fallback_export_path": dat_fallback_export_path,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_txt_compare_side_equivalence_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"single_details={single_details}")
+    print(f"compare_txt_details={compare_txt_details}")
+    print(f"single_contract={single_contract}")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -3138,6 +3774,8 @@ def main() -> int:
             "device-group-spectral-check",
             "single-compare-base-spectrum-check",
             "single-device-selection-scope-check",
+            "single-txt-compare-side-equivalence-check",
+            "single-compare-style-preview-check",
             "single-vs-compare-point-display-contract-check",
             "time-range-metadata-check",
             "repo-fixture-smoke",
@@ -3199,6 +3837,10 @@ def main() -> int:
             return run_single_compare_base_spectrum_core_metadata_check_mode(args)
         if mode == "single-device-selection-scope-check":
             return run_single_device_selection_scope_check_mode(args)
+        if mode == "single-txt-compare-side-equivalence-check":
+            return run_single_txt_compare_side_equivalence_check_mode(args)
+        if mode == "single-compare-style-preview-check":
+            return run_single_compare_style_preview_check_mode(args)
         if mode == "single-vs-compare-point-display-contract-check":
             return run_single_vs_compare_point_display_contract_check_mode(args)
         if mode == "time-range-metadata-check":
