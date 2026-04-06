@@ -38,14 +38,23 @@ def clone_args(args: argparse.Namespace, **overrides: object) -> argparse.Namesp
 
 def configure_auto_compare_context(app: object, ygas_path: Path, dat_path: Path) -> dict[str, object]:
     auto_payload = app.prepare_folder_auto_selection_payload([ygas_path, dat_path])
-    app.auto_prepare_payload = auto_payload
-    app.auto_dat_options = {app.build_dat_option_label(info): Path(info["path"]) for info in auto_payload["dat_infos"]}
     selected_dat_path = Path(auto_payload["selected_dat_path"])
-    selected_dat_label = next(
-        label for label, path in app.auto_dat_options.items() if Path(path) == selected_dat_path
-    )
-    app.selected_dat_var.set(selected_dat_label)
-    app.refresh_single_compare_style_preview_state()
+    if hasattr(app, "cache_auto_compare_context_payload"):
+        app.cache_auto_compare_context_payload(
+            auto_payload,
+            source="smoke_manual_configure",
+            selected_dat_path=selected_dat_path,
+        )
+        selected_dat_label = str(app.selected_dat_var.get())
+        app.refresh_single_compare_style_preview_state()
+    else:
+        app.auto_prepare_payload = auto_payload
+        app.auto_dat_options = {app.build_dat_option_label(info): Path(info["path"]) for info in auto_payload["dat_infos"]}
+        selected_dat_label = next(
+            label for label, path in app.auto_dat_options.items() if Path(path) == selected_dat_path
+        )
+        app.selected_dat_var.set(selected_dat_label)
+        app.refresh_single_compare_style_preview_state()
     return {
         "auto_payload": auto_payload,
         "selected_dat_path": selected_dat_path,
@@ -59,6 +68,19 @@ def get_export_plot_execution_path(app: object) -> str:
     if "plot_execution_path" not in app.current_result_frame.columns:
         return ""
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
+
+
+def simulate_single_file_open(app: object, source_path: Path) -> None:
+    if hasattr(app, "reset_auto_compare_context"):
+        app.reset_auto_compare_context()
+    app.current_folder = source_path.parent
+    files = app.get_supported_files(app.current_folder)
+    app.populate_file_list(files)
+    if not app.select_file_in_list(source_path):
+        raise ValueError(f"Failed to select {source_path.name} in the current file list.")
+    app.apply_file_read_defaults(source_path)
+    load_result = app.load_file_with_file_settings(source_path)
+    app.on_file_loaded(source_path, load_result)
 
 
 def extract_markdown_section_items(path: Path, heading: str) -> list[str]:
@@ -357,6 +379,28 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-txt-compare-side-equivalence-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_file_open_auto_bootstrap_compare_context",
+            run_single_file_open_auto_bootstrap_compare_context_check_mode,
+            clone_args(
+                args,
+                mode="single-file-open-auto-bootstrap-compare-context-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_no_visible_change_regression",
+            run_single_device_no_visible_change_regression_check_mode,
+            clone_args(
+                args,
+                mode="single-device-no-visible-change-regression-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -2274,6 +2318,299 @@ def run_single_txt_compare_side_equivalence_check_mode(args: argparse.Namespace)
     return 1 if failed else 0
 
 
+def run_single_file_open_auto_bootstrap_compare_context_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-file-open-auto-bootstrap-compare-context-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    if not col_a:
+        raise ValueError("Unable to resolve matching txt column for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+
+        pre_open_context_missing = app.auto_prepare_payload is None and not bool(app.auto_compare_context_available)
+        simulate_single_file_open(app, ygas_path)
+        snapshot = app.build_auto_compare_selection_snapshot()
+        payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+    finally:
+        root.destroy()
+
+    if len(payload["series_results"]) != 1:
+        raise ValueError("single-file-open-auto-bootstrap-compare-context-check expects exactly one single-device series.")
+    details = dict(payload["series_results"][0]["details"])
+    checks = [
+        (
+            "pre_open_context_missing",
+            pre_open_context_missing,
+            {"auto_prepare_payload_is_none": pre_open_context_missing},
+        ),
+        (
+            "single_file_open_bootstraps_auto_compare_context",
+            app.auto_prepare_payload is not None
+            and bool(app.auto_compare_context_available)
+            and str(app.auto_compare_context_source) == "single_file_auto_bootstrap"
+            and snapshot is not None,
+            {
+                "auto_compare_context_available": app.auto_compare_context_available,
+                "auto_compare_context_source": app.auto_compare_context_source,
+                "snapshot": snapshot,
+            },
+        ),
+        (
+            "bootstrapped_context_points_to_expected_dat",
+            snapshot is not None
+            and str(Path(snapshot["dat_path"]).resolve()) == str(dat_path.resolve())
+            and str(ygas_path.resolve()) in {str(Path(path).resolve()) for path in snapshot["ygas_paths"]},
+            {"snapshot": snapshot, "expected_dat": str(dat_path)},
+        ),
+        (
+            "single_device_path_uses_compare_txt_side_after_single_file_open",
+            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
+            and str(details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            {"details": details},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_auto_bootstrap_compare_context_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"snapshot={snapshot}")
+    print(f"details={details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_no_visible_change_regression_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-no-visible-change-regression-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    compare_mode = "时间段内 PSD 对比"
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        pre_open_context_missing = app.auto_prepare_payload is None and not bool(app.auto_compare_context_available)
+        simulate_single_file_open(app, ygas_path)
+        snapshot = app.build_auto_compare_selection_snapshot()
+        single_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        app.plot_multi_spectral_results(
+            str(col_a),
+            list(single_payload["series_results"]),
+            list(single_payload["skipped_files"]),
+            payload=single_payload,
+        )
+        single_contract = dict(app.current_point_count_contract)
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+
+        dual_base = app.prepare_dual_compare_payload(
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            selected_paths=[ygas_path, dat_path],
+            compare_mode=compare_mode,
+            start_dt=None,
+            end_dt=None,
+        )
+        selection_meta = dict(dual_base["selection_meta"])
+        if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+            start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+        else:
+            start_dt, end_dt = None, None
+        dual_plot_payload = app.prepare_dual_plot_payload(
+            parsed_a=dual_base["parsed_a"],
+            label_a=str(dual_base["label_a"]),
+            parsed_b=dual_base["parsed_b"],
+            label_b=str(dual_base["label_b"]),
+            pairs=[{"a_col": str(col_a), "b_col": str(col_b), "label": f"{col_a} vs {col_b}"}],
+            selection_meta=selection_meta,
+            compare_mode=compare_mode,
+            compare_scope="单对单",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            mapping_name=str(args.element),
+            scheme_name="smoke",
+            alignment_strategy=app.get_alignment_strategy(compare_mode),
+            plot_style=app.resolve_plot_style(compare_mode),
+            plot_layout=app.resolve_plot_layout(compare_mode),
+            fs_ui=args.fs,
+            requested_nsegment=args.nsegment,
+            overlap_ratio=args.overlap_ratio,
+            match_tolerance=0.2,
+            spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+            time_range_context={
+                "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+                "has_txt_dat_context": bool(
+                    selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+                ),
+            },
+        )
+        dual_ygas = next(
+            item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == str(col_a)
+        )
+    finally:
+        root.destroy()
+
+    if len(single_payload["series_results"]) != 1:
+        raise ValueError("single-device-no-visible-change-regression-check expects exactly one single-device series.")
+    single_details = dict(single_payload["series_results"][0]["details"])
+    compare_txt_details = dict(dual_ygas["details"])
+    checks = [
+        (
+            "pre_open_context_missing",
+            pre_open_context_missing,
+            {
+                "auto_prepare_payload_is_none": pre_open_context_missing,
+            },
+        ),
+        (
+            "single_file_open_bootstraps_compare_context_before_single_device_plot",
+            app.auto_prepare_payload is not None
+            and bool(app.auto_compare_context_available)
+            and str(app.auto_compare_context_source) == "single_file_auto_bootstrap"
+            and snapshot is not None,
+            {
+                "auto_compare_context_available": app.auto_compare_context_available,
+                "auto_compare_context_source": app.auto_compare_context_source,
+                "snapshot": snapshot,
+            },
+        ),
+        (
+            "fixed_single_device_uses_compare_txt_side_equivalent",
+            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
+            and str(single_details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            {"single_details": single_details},
+        ),
+        (
+            "single_device_valid_points_equal_compare_txt",
+            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
+            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
+        ),
+        (
+            "single_device_nperseg_equal_compare_txt",
+            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
+            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
+        ),
+        (
+            "single_device_valid_freq_points_equal_compare_txt",
+            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
+            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
+        ),
+        (
+            "single_device_freq_equal_compare_txt",
+            np.array_equal(
+                np.asarray(single_payload["series_results"][0]["freq"], dtype=float),
+                np.asarray(dual_ygas["freq"], dtype=float),
+            ),
+            {"single_points": len(single_payload["series_results"][0]["freq"]), "compare_points": len(dual_ygas["freq"])},
+        ),
+        (
+            "single_device_density_allclose_compare_txt",
+            np.allclose(
+                np.asarray(single_payload["series_results"][0]["density"], dtype=float),
+                np.asarray(dual_ygas["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            ),
+            {
+                "single_first5": np.asarray(single_payload["series_results"][0]["density"], dtype=float)[:5].tolist(),
+                "compare_first5": np.asarray(dual_ygas["density"], dtype=float)[:5].tolist(),
+            },
+        ),
+        (
+            "single_device_rendered_point_count_equal_compare_txt",
+            int(single_details.get("rendered_point_count", 0)) == int(len(dual_ygas["freq"]))
+            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(dual_ygas["freq"])),
+            {
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(dual_ygas["freq"]),
+                "single_contract": single_contract,
+            },
+        ),
+        (
+            "single_device_status_and_diag_report_auto_bootstrap",
+            "auto_compare_context_built=true" in single_status_text
+            and f"auto_compare_context_dat_file_name={dat_path.name}" in single_status_text
+            and "auto_compare_context_source=single_file_auto_bootstrap" in single_diag_text,
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+    ]
+
+    failed = False
+    print("[single_device_no_visible_change_regression_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"snapshot={snapshot}")
+    print(f"single_details={single_details}")
+    print(f"compare_txt_details={compare_txt_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
         raise ValueError("single-device-txt-compare-side-equivalence-check needs --ygas and --dat.")
@@ -2313,17 +2650,17 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
         app.element_preset_var.set(str(args.element or "H2O"))
         app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
 
-        app.auto_prepare_payload = None
-        app.auto_dat_options = {}
-        app.selected_dat_var.set("")
-        app.refresh_single_compare_style_preview_state()
-        fallback_payload = app.prepare_multi_spectral_compare_payload(
-            [ygas_path],
-            str(col_a),
-            args.fs,
-            args.nsegment,
-            args.overlap_ratio,
-        )
+        with tempfile.TemporaryDirectory(prefix="single_device_no_dat_context_") as temp_dir:
+            isolated_ygas_path = Path(temp_dir) / ygas_path.name
+            shutil.copy2(ygas_path, isolated_ygas_path)
+            simulate_single_file_open(app, isolated_ygas_path)
+            fallback_payload = app.prepare_multi_spectral_compare_payload(
+                [isolated_ygas_path],
+                str(col_a),
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
         if len(fallback_payload["series_results"]) != 1:
             raise ValueError("single-device fallback payload should contain exactly one series.")
         fallback_series = fallback_payload["series_results"][0]
@@ -3214,11 +3551,11 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             },
         ),
         (
-            "single_full_file_policy",
-            single_full_ygas["details"].get("time_range_policy") == "full_file",
+            "single_auto_reuse_common_window_policy",
+            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
             {
-                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
-                "single_full_label": single_full_ygas["details"].get("time_range_policy_label"),
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
             },
         ),
         (
@@ -3232,12 +3569,14 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             },
         ),
         (
-            "single_full_vs_compare_window_distinguished",
-            single_full_ygas["details"].get("time_range_policy") != dual_ygas["details"].get("time_range_policy"),
+            "single_auto_reuse_matches_compare_window",
+            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
+            and single_full_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and single_full_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
             {
-                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
                 "compare_policy": dual_ygas["details"].get("time_range_policy"),
-                "single_full_actual": (
+                "single_actual": (
                     single_full_ygas["details"].get("base_actual_start"),
                     single_full_ygas["details"].get("base_actual_end"),
                 ),
@@ -3248,11 +3587,12 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             },
         ),
         (
-            "single_full_window_note_visible",
-            ("当前单图使用全文件" in single_diag_text) or ("当前单图使用全文件" in single_status_text),
+            "single_auto_reuse_note_visible",
+            ("双设备 PSD 对比使用txt+dat 共同时间范围" in single_diag_text)
+            or ("时间窗=txt+dat 共同时间范围" in single_status_text),
             {
-                "diagnostic_contains_note": "当前单图使用全文件" in single_diag_text,
-                "status_contains_note": "当前单图使用全文件" in single_status_text,
+                "diagnostic_contains_note": "双设备 PSD 对比使用txt+dat 共同时间范围" in single_diag_text,
+                "status_contains_label": "时间窗=txt+dat 共同时间范围" in single_status_text,
                 "single_status": single_status_text,
             },
         ),
@@ -3803,11 +4143,11 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
             },
         ),
         (
-            "single_full_file_policy",
-            single_full_ygas["details"].get("time_range_policy") == "full_file",
+            "single_auto_reuse_common_window_policy",
+            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
             {
-                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
-                "single_full_label": single_full_ygas["details"].get("time_range_policy_label"),
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
             },
         ),
         (
@@ -3821,11 +4161,21 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
             },
         ),
         (
-            "single_full_vs_compare_window_distinguished",
-            single_full_ygas["details"].get("time_range_policy") != dual_ygas["details"].get("time_range_policy"),
+            "single_auto_reuse_matches_compare_window",
+            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
+            and single_full_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and single_full_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
             {
-                "single_full_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
                 "compare_policy": dual_ygas["details"].get("time_range_policy"),
+                "single_actual": (
+                    single_full_ygas["details"].get("base_actual_start"),
+                    single_full_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
             },
         ),
         (
@@ -4152,6 +4502,8 @@ def main() -> int:
             "device-group-spectral-check",
             "single-compare-base-spectrum-check",
             "single-device-selection-scope-check",
+            "single-file-open-auto-bootstrap-compare-context-check",
+            "single-device-no-visible-change-regression-check",
             "single-device-txt-compare-side-equivalence-check",
             "single-device-default-reuse-enabled-check",
             "single-txt-compare-side-equivalence-check",
@@ -4217,6 +4569,10 @@ def main() -> int:
             return run_single_compare_base_spectrum_core_metadata_check_mode(args)
         if mode == "single-device-selection-scope-check":
             return run_single_device_selection_scope_check_mode(args)
+        if mode == "single-file-open-auto-bootstrap-compare-context-check":
+            return run_single_file_open_auto_bootstrap_compare_context_check_mode(args)
+        if mode == "single-device-no-visible-change-regression-check":
+            return run_single_device_no_visible_change_regression_check_mode(args)
         if mode == "single-device-txt-compare-side-equivalence-check":
             return run_single_device_txt_compare_side_equivalence_check_mode(args)
         if mode == "single-device-default-reuse-enabled-check":

@@ -294,8 +294,23 @@ def build_execution_items(
     return items
 
 
+def build_auto_compare_context_items(details: dict[str, Any]) -> list[str]:
+    items: list[str] = []
+    if "auto_compare_context_built" in details:
+        built_value = bool(details.get("auto_compare_context_built"))
+        items.append(f"auto_compare_context_built={'true' if built_value else 'false'}")
+    if "auto_compare_context_available" in details:
+        available_value = bool(details.get("auto_compare_context_available"))
+        items.append(f"auto_compare_context_available={'true' if available_value else 'false'}")
+    for key in ("auto_compare_context_source", "auto_compare_context_dat_file_name", "auto_compare_context_txt_count"):
+        value = details.get(key)
+        if value is not None and value != "":
+            items.append(f"{key}={value}")
+    return items
+
+
 def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
-    return build_execution_items(
+    items = build_execution_items(
         details,
         (
             "single_txt_execution_path",
@@ -304,10 +319,12 @@ def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_ex
         ),
         include_plot_execution_path=include_plot_execution_path,
     )
+    items.extend(build_auto_compare_context_items(details))
+    return items
 
 
 def build_single_device_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
-    return build_execution_items(
+    items = build_execution_items(
         details,
         (
             "single_device_execution_path",
@@ -317,6 +334,8 @@ def build_single_device_execution_items(details: dict[str, Any], *, include_plot
         ),
         include_plot_execution_path=include_plot_execution_path,
     )
+    items.extend(build_auto_compare_context_items(details))
+    return items
 
 
 def get_resource_path(*parts: str) -> Path:
@@ -636,6 +655,10 @@ class FileViewerApp:
         self.separate_plot_windows: list[tk.Toplevel] = []
         self.auto_prepare_payload: dict[str, Any] | None = None
         self.auto_dat_options: dict[str, Path] = {}
+        self.auto_compare_context_available = False
+        self.auto_compare_context_source = ""
+        self.auto_compare_context_dat_file_name = ""
+        self.auto_compare_context_txt_count = 0
         self.target_group_forceable_map: dict[str, bool] = {}
         self.pending_target_group_override_keys: set[str] = set()
         self.no_header_prompt_state: dict[str, str] = {}
@@ -2012,6 +2035,104 @@ class FileViewerApp:
             return [{"a_col": a_col, "b_col": b_values[0], "label": f"{a_col} vs {b_values[0]}"} for a_col in a_values]
         return [{"a_col": a_col, "b_col": b_col, "label": f"{a_col} vs {b_col}"} for a_col, b_col in zip(a_values, b_values)]
 
+    def reset_auto_compare_context(self, *, clear_selected_dat: bool = True) -> None:
+        self.auto_prepare_payload = None
+        self.auto_dat_options = {}
+        self.auto_compare_context_available = False
+        self.auto_compare_context_source = ""
+        self.auto_compare_context_dat_file_name = ""
+        self.auto_compare_context_txt_count = 0
+        if hasattr(self, "selected_dat_combo") and self.selected_dat_combo is not None:
+            self.selected_dat_combo.configure(values=[])
+        if clear_selected_dat:
+            self.selected_dat_var.set("")
+
+    def cache_auto_compare_context_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str,
+        selected_dat_path: Path | None = None,
+    ) -> dict[str, Any] | None:
+        self.auto_prepare_payload = payload
+        ygas_infos = list(payload.get("ygas_infos", []))
+        dat_infos = list(payload.get("dat_infos", []))
+        self.auto_dat_options = {self.build_dat_option_label(info): Path(info["path"]) for info in dat_infos}
+        if hasattr(self, "selected_dat_combo") and self.selected_dat_combo is not None:
+            self.selected_dat_combo.configure(values=list(self.auto_dat_options.keys()))
+
+        chosen_path = selected_dat_path or payload.get("selected_dat_path")
+        if chosen_path is None:
+            chosen_info = self.choose_best_dat_info(ygas_infos, dat_infos)
+            chosen_path = Path(chosen_info["path"]) if chosen_info is not None else None
+        if chosen_path is not None:
+            chosen_path = Path(chosen_path)
+            dat_label = next((label for label, path in self.auto_dat_options.items() if path == chosen_path), chosen_path.name)
+            self.selected_dat_var.set(dat_label)
+        else:
+            self.selected_dat_var.set("")
+
+        selection: dict[str, Any] | None = None
+        if ygas_infos and dat_infos and chosen_path is not None:
+            try:
+                selection = self.build_auto_selection_for_dat(payload, chosen_path)
+            except Exception:
+                selection = None
+
+        self.auto_compare_context_available = bool(selection is not None)
+        self.auto_compare_context_source = str(source or "")
+        self.auto_compare_context_dat_file_name = str(chosen_path.name if chosen_path is not None else "")
+        self.auto_compare_context_txt_count = (
+            int(len(selection.get("selected_ygas_paths", []))) if selection is not None else 0
+        )
+        return selection
+
+    def build_auto_compare_bootstrap_files(self, selection_paths: list[Path]) -> list[Path]:
+        normalized_selection = [Path(path) for path in selection_paths]
+        if self.current_folder is not None and normalized_selection:
+            current_folder_resolved = self.current_folder.resolve()
+            selection_parents = {path.parent.resolve() for path in normalized_selection}
+            if selection_parents == {current_folder_resolved}:
+                if self.file_paths:
+                    return list(self.file_paths)
+                return self.get_supported_files(self.current_folder)
+
+        selection_parents = {path.parent.resolve() for path in normalized_selection}
+        if len(selection_parents) == 1:
+            parent = Path(next(iter(selection_parents)))
+            return self.get_supported_files(parent)
+        return normalized_selection
+
+    def ensure_auto_compare_context_for_selection(
+        self,
+        selection_paths: list[Path],
+        *,
+        source: str,
+    ) -> bool:
+        normalized_selection = [Path(path) for path in selection_paths]
+        if not normalized_selection:
+            return False
+
+        existing_context = self.build_auto_compare_selection_snapshot()
+        if existing_context is not None:
+            ygas_keys = {str(Path(path).resolve()) for path in existing_context.get("ygas_paths", [])}
+            selection_keys = {str(path.resolve()) for path in normalized_selection}
+            if selection_keys.issubset(ygas_keys):
+                return True
+
+        candidate_files = self.build_auto_compare_bootstrap_files(normalized_selection)
+        if len(candidate_files) < 2:
+            self.auto_compare_context_available = False
+            self.auto_compare_context_source = str(source or "")
+            self.auto_compare_context_dat_file_name = ""
+            self.auto_compare_context_txt_count = 0
+            return False
+
+        payload = self.prepare_folder_auto_selection_payload(candidate_files)
+        selection = self.cache_auto_compare_context_payload(payload, source=source)
+        self.refresh_single_compare_style_preview_state()
+        return bool(selection is not None)
+
     def build_auto_compare_selection_snapshot(self) -> dict[str, Any] | None:
         payload = self.auto_prepare_payload
         if payload is None:
@@ -2047,6 +2168,10 @@ class FileViewerApp:
             "ygas_paths": selected_ygas_paths,
             "dat_path": resolved_dat_path,
             "selected_paths": [*selected_ygas_paths, resolved_dat_path],
+            "auto_compare_context_available": bool(self.auto_compare_context_available),
+            "auto_compare_context_source": str(self.auto_compare_context_source or ""),
+            "auto_compare_context_dat_file_name": str(self.auto_compare_context_dat_file_name or resolved_dat_path.name),
+            "auto_compare_context_txt_count": int(self.auto_compare_context_txt_count or len(selected_ygas_paths)),
         }
 
     def build_compare_side_candidate_contexts(self) -> list[dict[str, Any]]:
@@ -2220,6 +2345,17 @@ class FileViewerApp:
         details["compare_dat_source_label"] = str(dat_label)
         details["compare_txt_file_count"] = int(len(context["ygas_paths"]))
         details["compare_dat_file_name"] = str(Path(context["dat_path"]).name)
+        details["auto_compare_context_built"] = True
+        details["auto_compare_context_available"] = bool(context.get("auto_compare_context_available", True))
+        details["auto_compare_context_source"] = str(
+            context.get("auto_compare_context_source") or self.auto_compare_context_source or ""
+        )
+        details["auto_compare_context_dat_file_name"] = str(
+            context.get("auto_compare_context_dat_file_name") or Path(context["dat_path"]).name
+        )
+        details["auto_compare_context_txt_count"] = int(
+            context.get("auto_compare_context_txt_count") or len(context["ygas_paths"])
+        )
         details["raw_source_rows"] = int(txt_summary.get("raw_rows", merged_ygas.source_row_count or len(merged_ygas.dataframe)))
         details["merged_rows"] = int(txt_summary.get("total_points", len(merged_ygas.dataframe)))
         details["rendered_point_count"] = int(len(payload["freq"]))
@@ -2768,6 +2904,7 @@ class FileViewerApp:
         end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
+        self.ensure_auto_compare_context_for_selection(selected_files, source="single_device_button_bootstrap")
         compare_side_payload, compare_side_fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
             selected_files,
             target_column=target_column,
@@ -2858,6 +2995,11 @@ class FileViewerApp:
                 single_details.get("selection_merge_scope") or "device_group"
             )
             single_details["single_device_time_range_policy"] = str(single_details.get("time_range_policy") or "")
+            single_details["auto_compare_context_built"] = bool(self.auto_compare_context_available)
+            single_details["auto_compare_context_available"] = bool(self.auto_compare_context_available)
+            single_details["auto_compare_context_source"] = str(self.auto_compare_context_source or "")
+            single_details["auto_compare_context_dat_file_name"] = str(self.auto_compare_context_dat_file_name or "")
+            single_details["auto_compare_context_txt_count"] = int(self.auto_compare_context_txt_count or 0)
             if compare_side_fallback_reason:
                 single_details["single_device_compare_side_fallback_reason"] = compare_side_fallback_reason
 
@@ -4879,12 +5021,20 @@ class FileViewerApp:
             payload["selection"] = None
         return payload
 
-    def apply_auto_prepared_selection(self, payload: dict[str, Any], *, selected_dat_path: Path | None = None) -> None:
-        self.auto_prepare_payload = payload
+    def apply_auto_prepared_selection(
+        self,
+        payload: dict[str, Any],
+        *,
+        selected_dat_path: Path | None = None,
+        source: str = "directory_auto_prepare",
+    ) -> None:
+        selection = self.cache_auto_compare_context_payload(
+            payload,
+            source=source,
+            selected_dat_path=selected_dat_path,
+        )
         ygas_infos = list(payload.get("ygas_infos", []))
         dat_infos = list(payload.get("dat_infos", []))
-        self.auto_dat_options = {self.build_dat_option_label(info): Path(info["path"]) for info in dat_infos}
-        self.selected_dat_combo.configure(values=list(self.auto_dat_options.keys()))
 
         if not ygas_infos:
             if dat_infos:
@@ -4911,7 +5061,8 @@ class FileViewerApp:
             self.status_var.set("自动准备失败：未找到可用 dat 文件")
             return
 
-        selection = self.build_auto_selection_for_dat(payload, Path(chosen_path))
+        if selection is None:
+            selection = self.build_auto_selection_for_dat(payload, Path(chosen_path))
         dat_label = next((label for label, path in self.auto_dat_options.items() if path == chosen_path), chosen_path.name)
         self.selected_dat_var.set(dat_label)
         self.element_preset_var.set("CO2")
@@ -4975,6 +5126,7 @@ class FileViewerApp:
         self.remember_current_selection()
         self.remember_current_read_settings()
         self.current_folder = Path(folder)
+        self.reset_auto_compare_context()
         self.current_target_group_preview_frame = None
         self.update_target_group_qc_panel(None)
         files = self.get_supported_files(self.current_folder)
@@ -4995,7 +5147,7 @@ class FileViewerApp:
             self.start_background_task(
                 status_text="正在自动识别文件…",
                 worker=lambda reporter: self.prepare_folder_auto_selection_payload(files, reporter),
-                on_success=lambda payload: self.apply_auto_prepared_selection(payload),
+                on_success=lambda payload: self.apply_auto_prepared_selection(payload, source="directory_auto_prepare"),
                 error_title="自动准备文件夹",
             )
         else:
@@ -5028,6 +5180,7 @@ class FileViewerApp:
         self.remember_current_selection()
         self.remember_current_read_settings()
         self.current_folder = chosen_path.parent
+        self.reset_auto_compare_context()
         self.current_target_group_preview_frame = None
         self.update_target_group_qc_panel(None)
         files = self.get_supported_files(self.current_folder)
@@ -5049,7 +5202,11 @@ class FileViewerApp:
         if dat_path is None:
             return
         try:
-            self.apply_auto_prepared_selection(self.auto_prepare_payload, selected_dat_path=dat_path)
+            self.apply_auto_prepared_selection(
+                self.auto_prepare_payload,
+                selected_dat_path=dat_path,
+                source=self.auto_compare_context_source or "directory_auto_prepare",
+            )
             self.status_var.set(f"已切换 dat：{dat_path.name}")
         except Exception as exc:
             self.render_plot_message(f"切换 dat 失败：{exc}", level="warning")
@@ -5424,6 +5581,9 @@ class FileViewerApp:
         self.create_column_selector()
         self.update_table_view()
         self.refresh_compare_column_options()
+        if path.suffix.lower() in TEXT_LIKE_SUFFIXES:
+            self.ensure_auto_compare_context_for_selection([path], source="single_file_auto_bootstrap")
+            self.refresh_single_compare_style_preview_state()
 
         numeric_count = len(self.column_data)
         non_numeric_count = len(self.non_numeric_cols)
@@ -8439,6 +8599,8 @@ class FileViewerApp:
             if len(skipped_files) > 3:
                 preview += " 等"
             status += f" | 已跳过 {len(skipped_files)} 个文件：{preview}"
+        if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "no_compare_dat_context":
+            status += " | 当前没有建立 compare 上下文，已回退旧单设备路径"
         self.status_var.set(status)
 
     def perform_multi_spectral_compare(self) -> None:
