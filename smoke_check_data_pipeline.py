@@ -70,6 +70,39 @@ def get_export_plot_execution_path(app: object) -> str:
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
 
 
+def configure_compare_psd_render_test_state(app: object) -> None:
+    app.plot_style_var.set("散点图")
+    app.plot_layout_var.set("叠加同图")
+    app.reference_slope_mode_var.set("两条都显示")
+    app.use_separate_zoom_windows_var.set(False)
+
+
+def extract_axis_render_state(ax: object) -> dict[str, object]:
+    scatter_offsets = [
+        np.asarray(collection.get_offsets(), dtype=float)
+        for collection in list(getattr(ax, "collections", []))
+    ]
+    reference_slope_lines = []
+    for line in list(getattr(ax, "lines", [])):
+        if str(line.get_linestyle()) != "--":
+            continue
+        reference_slope_lines.append(
+            {
+                "label": str(line.get_label()),
+                "x": np.asarray(line.get_xdata(), dtype=float),
+                "y": np.asarray(line.get_ydata(), dtype=float),
+            }
+        )
+    return {
+        "xlim": tuple(float(value) for value in ax.get_xlim()),
+        "ylim": tuple(float(value) for value in ax.get_ylim()),
+        "scatter_offsets": scatter_offsets,
+        "reference_slope_lines": reference_slope_lines,
+        "legend_labels": list(ax.get_legend_handles_labels()[1]),
+        "title": str(ax.get_title()),
+    }
+
+
 def render_prepared_multi_spectral_payload(app: object, payload: dict[str, object]) -> None:
     app.on_multi_spectral_compare_ready(payload)
 
@@ -156,6 +189,65 @@ def prepare_compare_txt_side_reference(
         "end_dt": end_dt,
         "dual_plot_payload": dual_plot_payload,
         "dual_ygas": dual_ygas,
+    }
+
+
+def capture_single_device_and_dual_compare_psd_render_states(
+    app: object,
+    *,
+    ygas_paths: list[Path],
+    selected_files: list[Path],
+    dat_path: Path,
+    col_a: str,
+    col_b: str,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    single_payload = app.prepare_multi_spectral_compare_payload(
+        selected_files,
+        str(col_a),
+        args.fs,
+        args.nsegment,
+        args.overlap_ratio,
+    )
+    render_prepared_multi_spectral_payload(app, single_payload)
+    if not app.figure.axes:
+        raise ValueError("Single-device compare-style render did not produce a visible axis.")
+    single_axis_state = extract_axis_render_state(app.figure.axes[0])
+    single_status_text = app.status_var.get()
+    single_diag_text = app.diagnostic_var.get()
+    single_plot_kind = app.current_plot_kind
+    single_plot_style = app.current_plot_style_label
+    single_plot_layout = app.current_plot_layout_label
+    single_export_plot_execution_path = get_export_plot_execution_path(app)
+    single_details = dict(single_payload["series_results"][0]["details"])
+
+    compare_reference = prepare_compare_txt_side_reference(
+        app,
+        ygas_paths=ygas_paths,
+        dat_path=dat_path,
+        col_a=str(col_a),
+        col_b=str(col_b),
+        args=args,
+    )
+    render_prepared_dual_plot_payload(app, compare_reference["dual_plot_payload"])
+    if not app.figure.axes:
+        raise ValueError("Dual compare PSD render did not produce a visible axis.")
+    dual_axis_state = extract_axis_render_state(app.figure.axes[0])
+
+    return {
+        "single_payload": single_payload,
+        "single_details": single_details,
+        "single_axis_state": single_axis_state,
+        "single_status_text": single_status_text,
+        "single_diag_text": single_diag_text,
+        "single_plot_kind": single_plot_kind,
+        "single_plot_style": single_plot_style,
+        "single_plot_layout": single_plot_layout,
+        "single_export_plot_execution_path": single_export_plot_execution_path,
+        "compare_reference": compare_reference,
+        "dual_axis_state": dual_axis_state,
+        "dual_plot_style": app.current_plot_style_label,
+        "dual_plot_layout": app.current_plot_layout_label,
     }
 
 
@@ -567,6 +659,39 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-device-vs-compare-render-style-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_vs_dual_compare_axis_geometry",
+            run_single_device_vs_dual_compare_axis_geometry_check_mode,
+            clone_args(
+                args,
+                mode="single-device-vs-dual-compare-axis-geometry-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_vs_dual_compare_reference_slope",
+            run_single_device_vs_dual_compare_reference_slope_check_mode,
+            clone_args(
+                args,
+                mode="single-device-vs-dual-compare-reference-slope-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_vs_dual_compare_visible_scatter_subset",
+            run_single_device_vs_dual_compare_visible_scatter_subset_check_mode,
+            clone_args(
+                args,
+                mode="single-device-vs-dual-compare-visible-scatter-subset-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -4187,6 +4312,232 @@ def run_single_device_vs_compare_render_style_check_mode(args: argparse.Namespac
     return 1 if failed else 0
 
 
+def run_single_device_vs_dual_compare_axis_geometry_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-vs-dual-compare-axis-geometry-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        configure_compare_psd_render_test_state(app)
+        configure_auto_compare_context(app, ygas_path, dat_path)
+        render_state = capture_single_device_and_dual_compare_psd_render_states(
+            app,
+            ygas_paths=[ygas_path],
+            selected_files=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+    finally:
+        root.destroy()
+
+    single_axis_state = dict(render_state["single_axis_state"])
+    dual_axis_state = dict(render_state["dual_axis_state"])
+    single_details = dict(render_state["single_details"])
+    checks = [
+        (
+            "single_device_compare_psd_axis_geometry_matches_dual_compare",
+            np.allclose(np.asarray(single_axis_state["xlim"], dtype=float), np.asarray(dual_axis_state["xlim"], dtype=float), rtol=1e-12, atol=1e-12)
+            and np.allclose(np.asarray(single_axis_state["ylim"], dtype=float), np.asarray(dual_axis_state["ylim"], dtype=float), rtol=1e-12, atol=1e-12),
+            {
+                "single_xlim": single_axis_state["xlim"],
+                "dual_xlim": dual_axis_state["xlim"],
+                "single_ylim": single_axis_state["ylim"],
+                "dual_ylim": dual_axis_state["ylim"],
+                "single_details": single_details,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_vs_dual_compare_axis_geometry_check]")
+    print(f"single_axis_state={single_axis_state}")
+    print(f"dual_axis_state={dual_axis_state}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_vs_dual_compare_reference_slope_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-vs-dual-compare-reference-slope-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        configure_compare_psd_render_test_state(app)
+        configure_auto_compare_context(app, ygas_path, dat_path)
+        render_state = capture_single_device_and_dual_compare_psd_render_states(
+            app,
+            ygas_paths=[ygas_path],
+            selected_files=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+    finally:
+        root.destroy()
+
+    single_lines = list(render_state["single_axis_state"]["reference_slope_lines"])
+    dual_lines = list(render_state["dual_axis_state"]["reference_slope_lines"])
+    same_line_count = len(single_lines) == len(dual_lines)
+    same_line_data = same_line_count and all(
+        str(single["label"]) == str(dual["label"])
+        and np.array_equal(np.asarray(single["x"], dtype=float), np.asarray(dual["x"], dtype=float))
+        and np.allclose(np.asarray(single["y"], dtype=float), np.asarray(dual["y"], dtype=float), rtol=1e-12, atol=1e-12)
+        for single, dual in zip(single_lines, dual_lines)
+    )
+    checks = [
+        (
+            "single_device_compare_psd_reference_slope_matches_dual_compare",
+            same_line_data,
+            {
+                "single_reference_slope_lines": single_lines,
+                "dual_reference_slope_lines": dual_lines,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_vs_dual_compare_reference_slope_check]")
+    print(f"single_reference_slope_lines={single_lines}")
+    print(f"dual_reference_slope_lines={dual_lines}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_vs_dual_compare_visible_scatter_subset_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-vs-dual-compare-visible-scatter-subset-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        configure_compare_psd_render_test_state(app)
+        configure_auto_compare_context(app, ygas_path, dat_path)
+        render_state = capture_single_device_and_dual_compare_psd_render_states(
+            app,
+            ygas_paths=[ygas_path],
+            selected_files=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+    finally:
+        root.destroy()
+
+    single_offsets = list(render_state["single_axis_state"]["scatter_offsets"])
+    dual_offsets = list(render_state["dual_axis_state"]["scatter_offsets"])
+    txt_subset_match = (
+        len(single_offsets) == 1
+        and len(dual_offsets) == 2
+        and np.array_equal(np.asarray(single_offsets[0], dtype=float), np.asarray(dual_offsets[0], dtype=float))
+    )
+    checks = [
+        (
+            "single_device_compare_psd_visible_scatter_is_dual_compare_minus_dat",
+            len(single_offsets) == len(dual_offsets) - 1 and txt_subset_match,
+            {
+                "single_collection_count": len(single_offsets),
+                "dual_collection_count": len(dual_offsets),
+                "single_offsets": single_offsets,
+                "dual_offsets": dual_offsets,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_vs_dual_compare_visible_scatter_subset_check]")
+    print(f"single_offsets={single_offsets}")
+    print(f"dual_offsets={dual_offsets}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_fallback_still_legacy_render_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas:
         raise ValueError("single-device-fallback-still-legacy-render-check needs --ygas.")
@@ -5824,6 +6175,9 @@ def main() -> int:
             "single-device-default-reuse-enabled-check",
             "single-device-render-semantic-equivalence-check",
             "single-device-vs-compare-render-style-check",
+            "single-device-vs-dual-compare-axis-geometry-check",
+            "single-device-vs-dual-compare-reference-slope-check",
+            "single-device-vs-dual-compare-visible-scatter-subset-check",
             "single-device-fallback-still-legacy-render-check",
             "single-device-active-dat-sync-check",
             "single-device-active-time-range-sync-check",
@@ -5909,6 +6263,12 @@ def main() -> int:
             return run_single_device_render_semantic_equivalence_check_mode(args)
         if mode == "single-device-vs-compare-render-style-check":
             return run_single_device_vs_compare_render_style_check_mode(args)
+        if mode == "single-device-vs-dual-compare-axis-geometry-check":
+            return run_single_device_vs_dual_compare_axis_geometry_check_mode(args)
+        if mode == "single-device-vs-dual-compare-reference-slope-check":
+            return run_single_device_vs_dual_compare_reference_slope_check_mode(args)
+        if mode == "single-device-vs-dual-compare-visible-scatter-subset-check":
+            return run_single_device_vs_dual_compare_visible_scatter_subset_check_mode(args)
         if mode == "single-device-fallback-still-legacy-render-check":
             return run_single_device_fallback_still_legacy_render_check_mode(args)
         if mode == "single-device-active-dat-sync-check":

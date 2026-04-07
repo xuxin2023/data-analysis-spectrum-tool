@@ -2609,6 +2609,13 @@ class FileViewerApp:
         details["single_device_selection_filtered_to_txt_side"] = bool(
             selection_summary.get("single_device_selection_filtered_to_txt_side", False)
         )
+        compare_geometry_series_results = self.build_compare_geometry_series_results(
+            context=context,
+            target_column=target_column,
+            fs_ui=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+        )
 
         series_result = {
             "label": device_label,
@@ -2645,7 +2652,82 @@ class FileViewerApp:
             "file_count": int(selection_summary.get("selected_file_count", file_count)),
             "start_dt": payload.get("start_dt"),
             "end_dt": payload.get("end_dt"),
+            "compare_geometry_series_results": compare_geometry_series_results,
         }, None
+
+    def build_compare_geometry_series_results(
+        self,
+        *,
+        context: dict[str, Any],
+        target_column: str,
+        fs_ui: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+    ) -> list[dict[str, Any]]:
+        compare_selection = context.get("compare_selection")
+        if not isinstance(compare_selection, tuple) or len(compare_selection) != 5:
+            return []
+
+        merged_ygas, txt_label, parsed_dat, dat_label, selection_meta = compare_selection
+        compare_mode = "时间段内 PSD 对比"
+        relevant_pairs = [
+            dict(pair)
+            for pair in self.build_compare_pairs()
+            if str(pair.get("a_col") or "").strip() == str(target_column).strip()
+        ]
+        if not relevant_pairs:
+            hit_a, hit_b, _mapping_name = self.resolve_compare_mapping_hits(merged_ygas, parsed_dat)
+            current_dat_column = self.device_b_column_var.get().strip() or str(hit_b or "").strip()
+            current_txt_column = self.device_a_column_var.get().strip() or str(hit_a or "").strip()
+            if current_txt_column and current_txt_column != str(target_column).strip():
+                current_dat_column = ""
+            if current_dat_column:
+                relevant_pairs = [
+                    {
+                        "a_col": str(target_column),
+                        "b_col": current_dat_column,
+                        "label": f"{target_column} vs {current_dat_column}",
+                    }
+                ]
+        if not relevant_pairs:
+            return []
+
+        geometry_payload = self.prepare_dual_plot_payload(
+            parsed_a=merged_ygas,
+            label_a=str(txt_label),
+            parsed_b=parsed_dat,
+            label_b=str(dat_label),
+            pairs=relevant_pairs,
+            selection_meta=dict(selection_meta or {}),
+            compare_mode=compare_mode,
+            compare_scope=self.compare_scope_var.get().strip() or "单对单",
+            start_dt=context.get("start_dt"),
+            end_dt=context.get("end_dt"),
+            mapping_name=(
+                self.element_preset_var.get().strip()
+                if self.mapping_mode_var.get().strip() == "预设映射"
+                else str(target_column)
+            )
+            or str(target_column),
+            scheme_name=self.scheme_name_var.get().strip() or "默认方案",
+            alignment_strategy=self.get_alignment_strategy(compare_mode),
+            plot_style=self.resolve_plot_style(compare_mode),
+            plot_layout=self.resolve_plot_layout(compare_mode),
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            match_tolerance=self.get_match_tolerance_seconds(default_value=0.2),
+            spectrum_type=self.get_selected_cross_spectrum_type(compare_mode),
+            time_range_context={
+                "strategy_label": str(
+                    context.get("compare_context_strategy_label")
+                    or self.time_range_strategy_var.get().strip()
+                    or "使用 txt+dat 共同时间范围"
+                ),
+                "has_txt_dat_context": True,
+            },
+        )
+        return list(geometry_payload.get("series_results", []))
 
     def apply_recent_time_range(self, minutes: int) -> None:
         try:
@@ -8139,6 +8221,7 @@ class FileViewerApp:
     ) -> None:
         self.render_psd_series_with_compare_semantics(
             series_results=series_results,
+            geometry_reference_series_results=series_results,
             mapping_name=mapping_name,
             start_dt=start_dt,
             end_dt=end_dt,
@@ -8172,6 +8255,7 @@ class FileViewerApp:
         ) or str(payload.get("target_column") or first_details.get("base_value_column") or "PSD")
         self.render_psd_series_with_compare_semantics(
             series_results=series_results,
+            geometry_reference_series_results=list(payload.get("compare_geometry_series_results", [])),
             mapping_name=mapping_name,
             start_dt=payload.get("start_dt"),
             end_dt=payload.get("end_dt"),
@@ -8182,10 +8266,131 @@ class FileViewerApp:
             render_semantics="compare_psd_single_side",
         )
 
+    def normalize_compare_psd_series_results(
+        self,
+        series_results: list[dict[str, Any]],
+        *,
+        single_side_compare: bool,
+        annotate_single_side_details: bool,
+        preserve_original_side: bool = False,
+    ) -> list[dict[str, Any]]:
+        normalized_series_results: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(series_results, start=1):
+            item = dict(raw_item)
+            details = dict(raw_item.get("details", {}))
+            raw_side = str(item.get("side") or details.get("device_source") or details.get("group_device_source") or "")
+            side = raw_side or ("txt" if single_side_compare and not preserve_original_side else "")
+            column = str(
+                item.get("column")
+                or details.get("base_value_column")
+                or details.get("target_column")
+                or f"series_{index}"
+            )
+            label = str(item.get("label") or column)
+            if single_side_compare and annotate_single_side_details:
+                source_label = str(details.get("compare_txt_source_label") or label or "txt")
+                label = f"{source_label} - {column}" if column else source_label
+                side = "txt"
+                details["single_device_render_semantics"] = "compare_psd_single_side"
+                details["plot_execution_path"] = "single_device_compare_psd_render"
+            if not side:
+                side = "txt"
+            item["side"] = side
+            item["column"] = column
+            item["label"] = label
+            item["details"] = details
+            normalized_series_results.append(item)
+        return normalized_series_results
+
+    def build_compare_psd_geometry_state(
+        self,
+        series_results: list[dict[str, Any]],
+        *,
+        style: str,
+        color_offset: int = 0,
+    ) -> dict[str, Any] | None:
+        if not series_results:
+            return None
+
+        geometry_figure = Figure(figsize=(6, 4), dpi=100)
+        geometry_axis = geometry_figure.add_subplot(111)
+        try:
+            for index, item in enumerate(series_results):
+                color = SERIES_COLORS[(index + color_offset) % len(SERIES_COLORS)]
+                self.apply_series_style(
+                    geometry_axis,
+                    item["freq"],
+                    item["density"],
+                    color=color,
+                    label=str(item["label"]),
+                    style=style,
+                )
+            reference_lines_start = len(geometry_axis.lines)
+            self.add_selected_reference_slopes(
+                geometry_axis,
+                np.concatenate([np.asarray(item["freq"], dtype=float) for item in series_results]),
+                np.concatenate([np.asarray(item["density"], dtype=float) for item in series_results]),
+                is_psd=True,
+            )
+            geometry_axis.set_xscale("log")
+            geometry_axis.set_yscale("log")
+            geometry_axis.grid(True, which="both", linestyle="--", alpha=0.3)
+            geometry_axis.autoscale(enable=True, axis="both", tight=False)
+            reference_lines = []
+            for line in geometry_axis.lines[reference_lines_start:]:
+                reference_lines.append(
+                    {
+                        "x": np.asarray(line.get_xdata(), dtype=float),
+                        "y": np.asarray(line.get_ydata(), dtype=float),
+                        "label": str(line.get_label()),
+                        "color": str(line.get_color()),
+                        "linestyle": str(line.get_linestyle()),
+                        "linewidth": float(line.get_linewidth()),
+                        "alpha": None if line.get_alpha() is None else float(line.get_alpha()),
+                        "zorder": None if line.get_zorder() is None else float(line.get_zorder()),
+                    }
+                )
+            return {
+                "xlim": tuple(float(value) for value in geometry_axis.get_xlim()),
+                "ylim": tuple(float(value) for value in geometry_axis.get_ylim()),
+                "reference_lines": reference_lines,
+            }
+        finally:
+            geometry_figure.clf()
+
+    def apply_compare_psd_geometry_state(self, ax: Any, geometry_state: dict[str, Any] | None) -> None:
+        if not geometry_state:
+            return
+        for line_info in geometry_state.get("reference_lines", []):
+            plot_kwargs: dict[str, Any] = {
+                "linestyle": str(line_info.get("linestyle") or "--"),
+                "linewidth": float(line_info.get("linewidth") or 1.4),
+                "color": str(line_info.get("color") or "#d65f5f"),
+                "label": str(line_info.get("label") or ""),
+            }
+            alpha = line_info.get("alpha")
+            zorder = line_info.get("zorder")
+            if alpha is not None:
+                plot_kwargs["alpha"] = float(alpha)
+            if zorder is not None:
+                plot_kwargs["zorder"] = float(zorder)
+            ax.plot(
+                np.asarray(line_info.get("x", []), dtype=float),
+                np.asarray(line_info.get("y", []), dtype=float),
+                **plot_kwargs,
+            )
+        xlim = geometry_state.get("xlim")
+        ylim = geometry_state.get("ylim")
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
     def render_psd_series_with_compare_semantics(
         self,
         *,
         series_results: list[dict[str, Any]],
+        geometry_reference_series_results: list[dict[str, Any]] | None = None,
         mapping_name: str,
         start_dt: pd.Timestamp | None,
         end_dt: pd.Timestamp | None,
@@ -8206,32 +8411,27 @@ class FileViewerApp:
         layout = self.resolve_plot_layout("时间段内 PSD 对比")
         self.reset_plot_output_state()
         single_side_compare = render_semantics == "compare_psd_single_side"
-        normalized_series_results: list[dict[str, Any]] = []
-        for index, raw_item in enumerate(series_results, start=1):
-            item = dict(raw_item)
-            details = dict(raw_item.get("details", {}))
-            side = str(item.get("side") or ("txt" if single_side_compare else ""))
-            column = str(
-                item.get("column")
-                or details.get("base_value_column")
-                or details.get("target_column")
-                or f"series_{index}"
-            )
-            label = str(item.get("label") or column)
-            if single_side_compare:
-                source_label = str(details.get("compare_txt_source_label") or label or "txt")
-                label = f"{source_label} - {column}" if column else source_label
-                side = "txt"
-                details["single_device_render_semantics"] = "compare_psd_single_side"
-                details["plot_execution_path"] = "single_device_compare_psd_render"
-            item["side"] = side
-            item["column"] = column
-            item["label"] = label
-            item["details"] = details
-            normalized_series_results.append(item)
+        normalized_series_results = self.normalize_compare_psd_series_results(
+            series_results,
+            single_side_compare=single_side_compare,
+            annotate_single_side_details=single_side_compare,
+        )
+        geometry_reference_raw = list(geometry_reference_series_results or series_results)
+        normalized_geometry_reference_series_results = self.normalize_compare_psd_series_results(
+            geometry_reference_raw,
+            single_side_compare=single_side_compare,
+            annotate_single_side_details=False,
+            preserve_original_side=True,
+        )
 
         txt_series = [item for item in normalized_series_results if item["side"] == "txt"]
         dat_series = [item for item in normalized_series_results if item["side"] == "dat"]
+        geometry_txt_series = [
+            item for item in normalized_geometry_reference_series_results if str(item.get("side")) == "txt"
+        ]
+        geometry_dat_series = [
+            item for item in normalized_geometry_reference_series_results if str(item.get("side")) == "dat"
+        ]
         first_details = dict(normalized_series_results[0].get("details", {}))
         time_range_meta = core.extract_time_range_metadata(first_details)
         time_range_display_suffix = core.build_time_range_display_suffix(first_details)
@@ -8256,12 +8456,19 @@ class FileViewerApp:
             for index, item in enumerate(normalized_series_results):
                 color = SERIES_COLORS[index % len(SERIES_COLORS)]
                 self.apply_series_style(ax, item["freq"], item["density"], color=color, label=item["label"], style=style)
-            self.add_selected_reference_slopes(
-                ax,
-                np.concatenate([item["freq"] for item in normalized_series_results]),
-                np.concatenate([item["density"] for item in normalized_series_results]),
-                is_psd=True,
+            geometry_state = self.build_compare_psd_geometry_state(
+                normalized_geometry_reference_series_results or normalized_series_results,
+                style=style,
             )
+            if geometry_state is not None:
+                self.apply_compare_psd_geometry_state(ax, geometry_state)
+            else:
+                self.add_selected_reference_slopes(
+                    ax,
+                    np.concatenate([item["freq"] for item in normalized_series_results]),
+                    np.concatenate([item["density"] for item in normalized_series_results]),
+                    is_psd=True,
+                )
             ax.set_xscale("log")
             ax.set_yscale("log")
             title = f"时间段内 PSD 对比{time_range_display_suffix}"
@@ -8276,11 +8483,25 @@ class FileViewerApp:
             self.figure.tight_layout()
             self.refresh_canvas()
         else:
-            def plot_group(ax: Any, group_series: list[dict[str, Any]], *, title: str, color_offset: int = 0) -> None:
+            def plot_group(
+                ax: Any,
+                group_series: list[dict[str, Any]],
+                *,
+                geometry_series: list[dict[str, Any]] | None,
+                title: str,
+                color_offset: int = 0,
+            ) -> None:
                 for index, item in enumerate(group_series):
                     color = SERIES_COLORS[(index + color_offset) % len(SERIES_COLORS)]
                     self.apply_series_style(ax, item["freq"], item["density"], color=color, label=item["label"], style=style)
-                if group_series:
+                geometry_state = self.build_compare_psd_geometry_state(
+                    list(geometry_series or group_series),
+                    style=style,
+                    color_offset=color_offset,
+                )
+                if geometry_state is not None:
+                    self.apply_compare_psd_geometry_state(ax, geometry_state)
+                elif group_series:
                     self.add_selected_reference_slopes(
                         ax,
                         np.concatenate([item["freq"] for item in group_series]),
@@ -8300,6 +8521,7 @@ class FileViewerApp:
                 {
                     "title": f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}{time_range_display_suffix}",
                     "series": txt_series,
+                    "geometry_series": geometry_txt_series or txt_series,
                     "window_title": f"设备A - PSD 对比{time_range_display_suffix}",
                     "window_filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
                     "color_offset": 0,
@@ -8310,6 +8532,7 @@ class FileViewerApp:
                     {
                         "title": f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}{time_range_display_suffix}",
                         "series": dat_series,
+                        "geometry_series": geometry_dat_series or dat_series,
                         "window_title": f"设备B - PSD 对比{time_range_display_suffix}",
                         "window_filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
                         "color_offset": len(txt_series),
@@ -8322,6 +8545,7 @@ class FileViewerApp:
                 plot_group(
                     ax,
                     visible_groups[0]["series"],
+                    geometry_series=list(visible_groups[0].get("geometry_series") or []),
                     title=visible_groups[0]["title"],
                     color_offset=int(visible_groups[0]["color_offset"]),
                 )
@@ -8332,6 +8556,7 @@ class FileViewerApp:
                     plot_group(
                         ax,
                         group["series"],
+                        geometry_series=list(group.get("geometry_series") or []),
                         title=group["title"],
                         color_offset=int(group["color_offset"]),
                     )
@@ -8347,6 +8572,7 @@ class FileViewerApp:
                     plot_group(
                         ax_zoom,
                         group["series"],
+                        geometry_series=list(group.get("geometry_series") or []),
                         title=group["title"].replace(time_range_display_suffix, ""),
                         color_offset=int(group["color_offset"]),
                     )
