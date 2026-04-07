@@ -276,6 +276,50 @@ def build_series_point_count_status_items(
     return items
 
 
+def annotate_compare_geometry_point_count_fields(
+    details: dict[str, Any],
+    *,
+    visible_contract: dict[str, Any],
+    geometry_contract: dict[str, Any],
+) -> None:
+    details["visible_single_side_valid_freq_points"] = int(
+        visible_contract.get("single_series_valid_freq_points", 0)
+    )
+    details["visible_single_side_frequency_point_count"] = int(
+        visible_contract.get("single_series_frequency_point_count", 0)
+    )
+    details["compare_geometry_total_valid_freq_points"] = int(
+        geometry_contract.get("total_valid_freq_points_across_series", 0)
+    )
+    details["compare_geometry_total_frequency_points"] = int(
+        geometry_contract.get("total_frequency_points_across_series", 0)
+    )
+
+
+def build_compare_geometry_point_count_items(details: dict[str, Any]) -> list[str]:
+    items: list[str] = []
+    if "visible_single_side_valid_freq_points" in details:
+        items.append(
+            f"visible_single_side_valid_freq_points={_coerce_optional_int(details.get('visible_single_side_valid_freq_points'))}"
+        )
+    if "visible_single_side_frequency_point_count" in details:
+        items.append(
+            "visible_single_side_frequency_point_count="
+            f"{_coerce_optional_int(details.get('visible_single_side_frequency_point_count'))}"
+        )
+    if "compare_geometry_total_valid_freq_points" in details:
+        items.append(
+            "compare_geometry_total_valid_freq_points="
+            f"{_coerce_optional_int(details.get('compare_geometry_total_valid_freq_points'))}"
+        )
+    if "compare_geometry_total_frequency_points" in details:
+        items.append(
+            "compare_geometry_total_frequency_points="
+            f"{_coerce_optional_int(details.get('compare_geometry_total_frequency_points'))}"
+        )
+    return items
+
+
 def build_execution_items(
     details: dict[str, Any],
     keys: tuple[str, ...],
@@ -2077,6 +2121,48 @@ class FileViewerApp:
             return [{"a_col": a_col, "b_col": b_values[0], "label": f"{a_col} vs {b_values[0]}"} for a_col in a_values]
         return [{"a_col": a_col, "b_col": b_col, "label": f"{a_col} vs {b_col}"} for a_col, b_col in zip(a_values, b_values)]
 
+    def resolve_compare_pair_for_target_column(
+        self,
+        parsed_a: ParsedFileResult,
+        parsed_b: ParsedFileResult,
+        target_column: str,
+    ) -> dict[str, str] | None:
+        normalized_target = str(target_column).strip()
+        if not normalized_target:
+            return None
+
+        relevant_pairs = [
+            dict(pair)
+            for pair in self.build_compare_pairs()
+            if str(pair.get("a_col") or "").strip() == normalized_target
+        ]
+        if relevant_pairs:
+            return relevant_pairs[0]
+
+        hit_a, hit_b, mapping_name = self.resolve_compare_mapping_hits(parsed_a, parsed_b)
+        current_dat_column = self.device_b_column_var.get().strip() or str(hit_b or "").strip()
+        current_txt_column = self.device_a_column_var.get().strip() or str(hit_a or "").strip()
+        if current_txt_column and current_txt_column == normalized_target and current_dat_column:
+            return {
+                "a_col": normalized_target,
+                "b_col": current_dat_column,
+                "label": f"{normalized_target} vs {current_dat_column}",
+            }
+
+        normalized_target_lower = normalized_target.lower()
+        for preset_name, preset in ELEMENT_PRESETS.items():
+            a_candidates = [str(value).strip() for value in preset.get("A", []) if str(value).strip()]
+            if normalized_target_lower not in {value.lower() for value in a_candidates}:
+                continue
+            preset_dat_column = self.select_first_matching_column(parsed_b.suggested_columns, preset.get("B", []))
+            if preset_dat_column:
+                return {
+                    "a_col": normalized_target,
+                    "b_col": preset_dat_column,
+                    "label": f"{normalized_target} vs {preset_dat_column}",
+                }
+        return None
+
     def reset_auto_compare_context(self, *, clear_selected_dat: bool = True) -> None:
         self.auto_prepare_payload = None
         self.auto_dat_options = {}
@@ -2513,6 +2599,39 @@ class FileViewerApp:
         details["raw_source_rows"] = int(txt_summary.get("raw_rows", merged_ygas.source_row_count or len(merged_ygas.dataframe)))
         details["merged_rows"] = int(txt_summary.get("total_points", len(merged_ygas.dataframe)))
         details["rendered_point_count"] = int(len(payload["freq"]))
+        visible_point_count_contract = build_series_point_count_contract(
+            [
+                {
+                    "label": str(txt_label),
+                    "column": str(selected_column),
+                    "freq": np.asarray(payload["freq"], dtype=float),
+                    "details": details,
+                }
+            ]
+        )
+        compare_geometry_series_results = self.build_compare_geometry_series_results(
+            context=context,
+            target_column=selected_column,
+            fs_ui=fs_ui,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+        )
+        geometry_point_count_contract = build_series_point_count_contract(
+            list(compare_geometry_series_results)
+            or [
+                {
+                    "label": str(txt_label),
+                    "column": str(selected_column),
+                    "freq": np.asarray(payload["freq"], dtype=float),
+                    "details": details,
+                }
+            ]
+        )
+        annotate_compare_geometry_point_count_fields(
+            details,
+            visible_contract=visible_point_count_contract,
+            geometry_contract=geometry_point_count_contract,
+        )
         if compare_context_key_prefix:
             details[f"{compare_context_key_prefix}_source"] = str(context.get("compare_context_source") or "")
             details[f"{compare_context_key_prefix}_dat_file_name"] = str(Path(context["dat_path"]).name)
@@ -2537,6 +2656,7 @@ class FileViewerApp:
             "dat_label": str(dat_label),
             "start_dt": start_dt,
             "end_dt": end_dt,
+            "compare_geometry_series_results": compare_geometry_series_results,
         }, None
 
     def build_single_txt_compare_equivalent_payload(self, selected_column: str) -> dict[str, Any] | None:
@@ -2609,13 +2729,15 @@ class FileViewerApp:
         details["single_device_selection_filtered_to_txt_side"] = bool(
             selection_summary.get("single_device_selection_filtered_to_txt_side", False)
         )
-        compare_geometry_series_results = self.build_compare_geometry_series_results(
-            context=context,
-            target_column=target_column,
-            fs_ui=fs,
-            requested_nsegment=requested_nsegment,
-            overlap_ratio=overlap_ratio,
-        )
+        compare_geometry_series_results = list(payload.get("compare_geometry_series_results", []))
+        if not compare_geometry_series_results:
+            compare_geometry_series_results = self.build_compare_geometry_series_results(
+                context=context,
+                target_column=target_column,
+                fs_ui=fs,
+                requested_nsegment=requested_nsegment,
+                overlap_ratio=overlap_ratio,
+            )
 
         series_result = {
             "label": device_label,
@@ -2670,25 +2792,12 @@ class FileViewerApp:
 
         merged_ygas, txt_label, parsed_dat, dat_label, selection_meta = compare_selection
         compare_mode = "时间段内 PSD 对比"
-        relevant_pairs = [
-            dict(pair)
-            for pair in self.build_compare_pairs()
-            if str(pair.get("a_col") or "").strip() == str(target_column).strip()
-        ]
-        if not relevant_pairs:
-            hit_a, hit_b, _mapping_name = self.resolve_compare_mapping_hits(merged_ygas, parsed_dat)
-            current_dat_column = self.device_b_column_var.get().strip() or str(hit_b or "").strip()
-            current_txt_column = self.device_a_column_var.get().strip() or str(hit_a or "").strip()
-            if current_txt_column and current_txt_column != str(target_column).strip():
-                current_dat_column = ""
-            if current_dat_column:
-                relevant_pairs = [
-                    {
-                        "a_col": str(target_column),
-                        "b_col": current_dat_column,
-                        "label": f"{target_column} vs {current_dat_column}",
-                    }
-                ]
+        resolved_pair = self.resolve_compare_pair_for_target_column(
+            merged_ygas,
+            parsed_dat,
+            str(target_column),
+        )
+        relevant_pairs = [resolved_pair] if resolved_pair is not None else []
         if not relevant_pairs:
             return []
 
@@ -8439,6 +8548,9 @@ class FileViewerApp:
         point_count_contract = build_series_point_count_contract(normalized_series_results)
         txt_point_count_contract = build_series_point_count_contract(txt_series)
         dat_point_count_contract = build_series_point_count_contract(dat_series)
+        geometry_point_count_contract = build_series_point_count_contract(
+            normalized_geometry_reference_series_results or normalized_series_results
+        )
         total_valid_freq_points_across_series = int(point_count_contract["total_valid_freq_points_across_series"])
         quality_warnings: list[str] = []
         if total_valid_freq_points_across_series < 10:
@@ -8609,9 +8721,16 @@ class FileViewerApp:
         ]
         self.register_plot_style_layout(style, layout)
         if single_side_compare:
+            annotate_compare_geometry_point_count_fields(
+                first_details,
+                visible_contract=txt_point_count_contract or point_count_contract,
+                geometry_contract=geometry_point_count_contract,
+            )
+            compare_geometry_point_count_items = build_compare_geometry_point_count_items(first_details)
             extra_items = [
                 f"当前要素映射={mapping_name}",
                 "当前谱类型=PSD",
+                *compare_geometry_point_count_items,
                 *build_series_point_count_items(point_count_contract),
                 *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
@@ -8639,10 +8758,9 @@ class FileViewerApp:
                 extra_items=extra_items,
             )
             status_items = [
+                *compare_geometry_point_count_items,
                 *build_series_point_count_status_items(txt_point_count_contract, prefix="txt", include_totals=False),
                 f"series_count={point_count_contract['series_count']}",
-                f"total_valid_freq_points_across_series={point_count_contract['total_valid_freq_points_across_series']}",
-                f"total_frequency_points_across_series={point_count_contract['total_frequency_points_across_series']}",
                 *build_single_device_execution_items(first_details, include_plot_execution_path=True),
             ]
             status = (
@@ -8831,6 +8949,9 @@ class FileViewerApp:
                 ]
             )
             quality_items.append("当前谱类型=PSD")
+            compare_geometry_point_count_items = build_compare_geometry_point_count_items(details)
+            if compare_geometry_point_count_items:
+                quality_items.extend(compare_geometry_point_count_items)
             quality_items.extend(build_series_point_count_items(point_count_contract))
             if details.get("base_spectrum_builder") is not None:
                 quality_items.append(f"base_spectrum_builder={details.get('base_spectrum_builder')}")
@@ -8998,7 +9119,16 @@ class FileViewerApp:
         )
         if analysis_type == "spectral":
             policy_label = str(details.get("time_range_policy_label") or "默认")
-            spectral_status_items = build_series_point_count_status_items(point_count_contract)
+            spectral_status_items: list[str] = []
+            compare_geometry_point_count_items = build_compare_geometry_point_count_items(details)
+            if compare_geometry_point_count_items:
+                spectral_status_items.extend(compare_geometry_point_count_items)
+                spectral_status_items.extend(
+                    build_series_point_count_status_items(point_count_contract, include_totals=False)
+                )
+                spectral_status_items.append(f"series_count={int(point_count_contract.get('series_count', 0))}")
+            else:
+                spectral_status_items.extend(build_series_point_count_status_items(point_count_contract))
             spectral_status_items.extend(build_single_txt_execution_items(details))
             self.status_var.set(
                 f"图已生成：功率谱密度 / {columns[0]} | 时间窗={policy_label} | "

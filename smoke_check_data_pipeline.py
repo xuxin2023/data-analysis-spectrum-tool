@@ -1734,8 +1734,17 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
         "single_series_valid_freq_points=",
         "single_series_frequency_point_count=",
         "series_count=",
-        "total_valid_freq_points_across_series=",
-        "total_frequency_points_across_series=",
+    ]
+    explicit_single_tokens = [
+        "visible_single_side_valid_freq_points=",
+        "visible_single_side_frequency_point_count=",
+        "compare_geometry_total_valid_freq_points=",
+        "compare_geometry_total_frequency_points=",
+    ]
+    single_overlay_tokens = [
+        "txt_single_series_valid_freq_points=",
+        "txt_single_series_frequency_point_count=",
+        "series_count=",
     ]
     compare_tokens = [
         "txt_single_series_valid_freq_points=",
@@ -1778,6 +1787,7 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
         if len(single_scope_payload["series_results"]) != 1:
             raise ValueError("single-vs-compare-point-display-contract-check expects exactly one synced single series.")
         single_scope_series = single_scope_payload["series_results"][0]
+        single_scope_details = dict(single_scope_series["details"])
 
         app.current_file = ygas_path
         app.plot_results(
@@ -1785,7 +1795,7 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
             np.asarray(single_scope_series["freq"], dtype=float),
             np.asarray(single_scope_series["density"], dtype=float),
             [col_a],
-            dict(single_scope_series["details"]),
+            dict(single_scope_details),
         )
         single_plot_diag_text = app.diagnostic_var.get()
         single_plot_status_text = app.status_var.get()
@@ -1848,6 +1858,8 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
         for item in dual_plot_payload["series_results"]
     )
     expected_compare_rendered = sum(len(item["freq"]) for item in dual_plot_payload["series_results"])
+    expected_single_visible_valid = int(dual_ygas["details"].get("valid_freq_points", 0))
+    expected_single_visible_frequency = int(dual_ygas["details"].get("frequency_point_count", 0))
 
     checks = [
         (
@@ -1861,14 +1873,32 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
             {"status": single_plot_status_text},
         ),
         (
+            "single_plot_explicit_visible_vs_geometry_tokens_visible",
+            all(token in single_plot_diag_text for token in explicit_single_tokens)
+            and all(token in single_plot_status_text for token in explicit_single_tokens),
+            {
+                "single_plot_status": single_plot_status_text,
+                "single_plot_diag": single_plot_diag_text,
+            },
+        ),
+        (
             "single_overlay_contract_tokens_visible_in_diag",
-            all(token in single_overlay_diag_text for token in single_tokens),
+            all(token in single_overlay_diag_text for token in single_overlay_tokens),
             {"diag": single_overlay_diag_text},
         ),
         (
             "single_overlay_contract_tokens_visible_in_status",
-            all(token in single_overlay_status_text for token in single_tokens),
+            all(token in single_overlay_status_text for token in single_overlay_tokens),
             {"status": single_overlay_status_text},
+        ),
+        (
+            "single_overlay_explicit_visible_vs_geometry_tokens_visible",
+            all(token in single_overlay_diag_text for token in explicit_single_tokens)
+            and all(token in single_overlay_status_text for token in explicit_single_tokens),
+            {
+                "single_overlay_status": single_overlay_status_text,
+                "single_overlay_diag": single_overlay_diag_text,
+            },
         ),
         (
             "compare_contract_tokens_visible_in_diag",
@@ -1891,6 +1921,30 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
             {
                 "single_plot_status": single_plot_status_text,
                 "single_overlay_status": single_overlay_status_text,
+            },
+        ),
+        (
+            "single_visible_and_compare_geometry_labels_are_distinct",
+            "visible_single_side_valid_freq_points=" in single_plot_status_text
+            and "compare_geometry_total_valid_freq_points=" in single_plot_status_text
+            and "visible_single_side_valid_freq_points=" in single_overlay_status_text
+            and "compare_geometry_total_valid_freq_points=" in single_overlay_status_text
+            and int(single_scope_details.get("visible_single_side_valid_freq_points", 0))
+            == int(expected_single_visible_valid)
+            and int(single_scope_details.get("visible_single_side_frequency_point_count", 0))
+            == int(expected_single_visible_frequency)
+            and int(single_scope_details.get("compare_geometry_total_valid_freq_points", 0))
+            == int(expected_compare_total_valid)
+            and int(single_scope_details.get("compare_geometry_total_frequency_points", 0))
+            == int(expected_compare_total_frequency)
+            and int(single_scope_details.get("compare_geometry_total_valid_freq_points", 0))
+            > int(single_scope_details.get("visible_single_side_valid_freq_points", 0)),
+            {
+                "single_scope_details": single_scope_details,
+                "expected_single_visible_valid": expected_single_visible_valid,
+                "expected_single_visible_frequency": expected_single_visible_frequency,
+                "expected_compare_total_valid": expected_compare_total_valid,
+                "expected_compare_total_frequency": expected_compare_total_frequency,
             },
         ),
         (
