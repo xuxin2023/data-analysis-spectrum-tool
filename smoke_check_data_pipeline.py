@@ -70,6 +70,14 @@ def get_export_plot_execution_path(app: object) -> str:
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
 
 
+def render_prepared_multi_spectral_payload(app: object, payload: dict[str, object]) -> None:
+    app.on_multi_spectral_compare_ready(payload)
+
+
+def render_prepared_dual_plot_payload(app: object, payload: dict[str, object]) -> None:
+    app.on_prepared_dual_plot_ready(payload)
+
+
 def find_dat_option_label(app: object, dat_path: Path) -> str:
     target_key = str(Path(dat_path).resolve())
     for label, option_path in getattr(app, "auto_dat_options", {}).items():
@@ -537,6 +545,39 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-device-default-reuse-enabled-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_render_semantic_equivalence",
+            run_single_device_render_semantic_equivalence_check_mode,
+            clone_args(
+                args,
+                mode="single-device-render-semantic-equivalence-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_vs_compare_render_style",
+            run_single_device_vs_compare_render_style_check_mode,
+            clone_args(
+                args,
+                mode="single-device-vs-compare-render-style-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_fallback_still_legacy_render",
+            run_single_device_fallback_still_legacy_render_check_mode,
+            clone_args(
+                args,
+                mode="single-device-fallback-still-legacy-render-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -1625,12 +1666,7 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
         single_plot_status_text = app.status_var.get()
         single_plot_contract = dict(app.current_point_count_contract)
 
-        app.plot_multi_spectral_results(
-            col_a,
-            single_scope_payload["series_results"],
-            single_scope_payload["skipped_files"],
-            payload=single_scope_payload,
-        )
+        render_prepared_multi_spectral_payload(app, single_scope_payload)
         single_overlay_diag_text = app.diagnostic_var.get()
         single_overlay_status_text = app.status_var.get()
         single_overlay_contract = dict(app.current_point_count_contract)
@@ -2504,6 +2540,10 @@ def run_single_file_open_auto_bootstrap_compare_context_check_mode(args: argpars
             args.nsegment,
             args.overlap_ratio,
         )
+        render_prepared_multi_spectral_payload(app, payload)
+        plot_kind = app.current_plot_kind
+        export_plot_execution_path = get_export_plot_execution_path(app)
+        status_text = app.status_var.get()
     finally:
         root.destroy()
 
@@ -2537,8 +2577,7 @@ def run_single_file_open_auto_bootstrap_compare_context_check_mode(args: argpars
         ),
         (
             "single_device_path_uses_compare_txt_side_after_single_file_open",
-            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
-            and str(details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
             {"details": details},
         ),
     ]
@@ -2599,12 +2638,7 @@ def run_single_device_no_visible_change_regression_check_mode(args: argparse.Nam
             args.nsegment,
             args.overlap_ratio,
         )
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(single_payload["series_results"]),
-            list(single_payload["skipped_files"]),
-            payload=single_payload,
-        )
+        render_prepared_multi_spectral_payload(app, single_payload)
         single_contract = dict(app.current_point_count_contract)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
@@ -2683,7 +2717,8 @@ def run_single_device_no_visible_change_regression_check_mode(args: argparse.Nam
         (
             "fixed_single_device_uses_compare_txt_side_equivalent",
             str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
-            and str(single_details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            and "single_device_render_semantics=compare_psd_single_side" in single_status_text
+            and "plot_execution_path=single_device_compare_psd_render" in single_diag_text,
             {"single_details": single_details},
         ),
         (
@@ -2784,10 +2819,11 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
     compare_mode = "时间段内 PSD 对比"
     required_status_tokens = [
         "single_device_execution_path=compare_txt_side_equivalent",
+        "single_device_render_semantics=compare_psd_single_side",
         "single_device_selection_scope=merged_ygas_compare_scope",
         "single_device_time_range_policy=txt_dat_common_window",
     ]
-    required_diag_tokens = [*required_status_tokens, "plot_execution_path=single_device_compare_txt_side_equivalent"]
+    required_diag_tokens = [*required_status_tokens, "plot_execution_path=single_device_compare_psd_render"]
 
     root = tk.Tk()
     root.withdraw()
@@ -2812,12 +2848,7 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
             raise ValueError("single-device fallback payload should contain exactly one series.")
         fallback_series = fallback_payload["series_results"][0]
         fallback_details = dict(fallback_series["details"])
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(fallback_payload["series_results"]),
-            list(fallback_payload["skipped_files"]),
-            payload=fallback_payload,
-        )
+        render_prepared_multi_spectral_payload(app, fallback_payload)
         fallback_status_text = app.status_var.get()
         fallback_diag_text = app.diagnostic_var.get()
         fallback_contract = dict(app.current_point_count_contract)
@@ -2837,12 +2868,7 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
             raise ValueError("single-device compare-side equivalent payload should contain exactly one series.")
         single_series = single_payload["series_results"][0]
         single_details = dict(single_series["details"])
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(single_payload["series_results"]),
-            list(single_payload["skipped_files"]),
-            payload=single_payload,
-        )
+        render_prepared_multi_spectral_payload(app, single_payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
         single_contract = dict(app.current_point_count_contract)
@@ -2923,7 +2949,7 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
         ),
         (
             "single_device_compare_side_equivalent_still_renders_single_series",
-            single_plot_kind == "multi_spectral" and int(single_contract["global"]["series_count"]) == 1,
+            single_plot_kind == "single_device_compare_psd" and int(single_contract["global"]["series_count"]) == 1,
             {"single_plot_kind": single_plot_kind, "single_contract": single_contract},
         ),
         (
@@ -2934,7 +2960,7 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
         ),
         (
             "single_device_compare_side_export_metadata_visible",
-            single_export_plot_execution_path == "single_device_compare_txt_side_equivalent",
+            single_export_plot_execution_path == "single_device_compare_psd_render",
             {"single_export_plot_execution_path": single_export_plot_execution_path},
         ),
         (
@@ -2996,8 +3022,14 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
             str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
             and str(single_details.get("single_device_selection_scope")) == "merged_ygas_compare_scope"
             and str(single_details.get("single_device_time_range_policy")) == str(compare_txt_details.get("time_range_policy"))
-            and str(single_details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
-            {"single_details": single_details, "compare_txt_details": compare_txt_details},
+            and "single_device_render_semantics=compare_psd_single_side" in single_status_text
+            and "plot_execution_path=single_device_compare_psd_render" in single_diag_text,
+            {
+                "single_details": single_details,
+                "compare_txt_details": compare_txt_details,
+                "single_status": single_status_text,
+                "single_diag": single_diag_text,
+            },
         ),
     ]
 
@@ -3063,12 +3095,7 @@ def run_single_device_mixed_selection_txt_dat_reuse_check_mode(args: argparse.Na
             raise ValueError("single-device mixed txt+dat reuse check expects exactly one single-device series.")
         single_series = payload["series_results"][0]
         single_details = dict(single_series["details"])
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(payload["series_results"]),
-            list(payload["skipped_files"]),
-            payload=payload,
-        )
+        render_prepared_multi_spectral_payload(app, payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
         single_contract = dict(app.current_point_count_contract)
@@ -3088,8 +3115,7 @@ def run_single_device_mixed_selection_txt_dat_reuse_check_mode(args: argparse.Na
     checks = [
         (
             "mixed_selection_reuses_compare_txt_side",
-            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
-            and str(single_details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
             {"single_details": single_details},
         ),
         (
@@ -3237,12 +3263,7 @@ def run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode(args: 
                 raise ValueError("single-device mixed multi-txt + dat reuse check expects exactly one series.")
             single_series = payload["series_results"][0]
             single_details = dict(single_series["details"])
-            app.plot_multi_spectral_results(
-                str(col_a),
-                list(payload["series_results"]),
-                list(payload["skipped_files"]),
-                payload=payload,
-            )
+            render_prepared_multi_spectral_payload(app, payload)
             single_status_text = app.status_var.get()
             single_diag_text = app.diagnostic_var.get()
             single_contract = dict(app.current_point_count_contract)
@@ -3388,12 +3409,7 @@ def run_single_device_only_dat_still_fallback_check_mode(args: argparse.Namespac
         if len(payload["series_results"]) != 1:
             raise ValueError("single-device only-dat fallback check expects exactly one series.")
         single_details = dict(payload["series_results"][0]["details"])
-        app.plot_multi_spectral_results(
-            str(col_b),
-            list(payload["series_results"]),
-            list(payload["skipped_files"]),
-            payload=payload,
-        )
+        render_prepared_multi_spectral_payload(app, payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
     finally:
@@ -3493,12 +3509,7 @@ def run_single_device_active_dat_sync_check_mode(args: argparse.Namespace) -> in
                 raise ValueError("single-device active dat sync check expects exactly one series.")
             single_series = payload["series_results"][0]
             single_details = dict(single_series["details"])
-            app.plot_multi_spectral_results(
-                str(col_a),
-                list(payload["series_results"]),
-                list(payload["skipped_files"]),
-                payload=payload,
-            )
+            render_prepared_multi_spectral_payload(app, payload)
             single_status_text = app.status_var.get()
             single_diag_text = app.diagnostic_var.get()
             single_contract = dict(app.current_point_count_contract)
@@ -3573,9 +3584,11 @@ def run_single_device_active_dat_sync_check_mode(args: argparse.Namespace) -> in
         (
             "active_dat_sync_status_and_diag_visible",
             "single_device_compare_context_source=active_compare_ui" in single_status_text
+            and "single_device_render_semantics=compare_psd_single_side" in single_status_text
             and f"single_device_compare_context_dat_file_name={dat_b_path.name}" in single_status_text
             and "single_device_compare_context_dat_matches_selected_dat=true" in single_diag_text
-            and "single_device_compare_context_matches_current_compare_ui=true" in single_diag_text,
+            and "single_device_compare_context_matches_current_compare_ui=true" in single_diag_text
+            and "plot_execution_path=single_device_compare_psd_render" in single_diag_text,
             {
                 "single_status": single_status_text,
                 "single_diag": single_diag_text,
@@ -3650,12 +3663,7 @@ def run_single_device_active_time_range_sync_check_mode(args: argparse.Namespace
             raise ValueError("single-device active time-range sync check expects exactly one series.")
         single_series = payload["series_results"][0]
         single_details = dict(single_series["details"])
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(payload["series_results"]),
-            list(payload["skipped_files"]),
-            payload=payload,
-        )
+        render_prepared_multi_spectral_payload(app, payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
         compare_reference = prepare_compare_txt_side_reference(
@@ -3724,9 +3732,11 @@ def run_single_device_active_time_range_sync_check_mode(args: argparse.Namespace
         (
             "active_time_range_status_and_diag_visible",
             "single_device_compare_context_source=active_compare_ui" in single_status_text
+            and "single_device_render_semantics=compare_psd_single_side" in single_status_text
             and "single_device_compare_context_time_range_policy=" in single_status_text
             and "single_device_compare_context_start=" in single_diag_text
-            and "single_device_compare_context_end=" in single_diag_text,
+            and "single_device_compare_context_end=" in single_diag_text
+            and "plot_execution_path=single_device_compare_psd_render" in single_diag_text,
             {
                 "single_status": single_status_text,
                 "single_diag": single_diag_text,
@@ -3790,12 +3800,7 @@ def run_single_device_auto_bootstrap_fallback_check_mode(args: argparse.Namespac
             raise ValueError("single-device auto-bootstrap fallback check expects exactly one series.")
         single_series = payload["series_results"][0]
         single_details = dict(single_series["details"])
-        app.plot_multi_spectral_results(
-            str(col_a),
-            list(payload["series_results"]),
-            list(payload["skipped_files"]),
-            payload=payload,
-        )
+        render_prepared_multi_spectral_payload(app, payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
         compare_reference = prepare_compare_txt_side_reference(
@@ -3835,8 +3840,10 @@ def run_single_device_auto_bootstrap_fallback_check_mode(args: argparse.Namespac
         (
             "single_device_auto_bootstrap_fallback_status_visible",
             "single_device_compare_context_source=auto_bootstrap_fallback" in single_status_text
+            and "single_device_render_semantics=compare_psd_single_side" in single_status_text
             and "当前 compare UI 状态不完整，单设备暂用 auto bootstrap 上下文" in single_status_text
-            and "single_device_compare_context_matches_current_compare_ui=false" in single_diag_text,
+            and "single_device_compare_context_matches_current_compare_ui=false" in single_diag_text
+            and "plot_execution_path=single_device_compare_psd_render" in single_diag_text,
             {"single_status": single_status_text, "single_diag": single_diag_text},
         ),
     ]
@@ -3889,6 +3896,10 @@ def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace)
             args.nsegment,
             args.overlap_ratio,
         )
+        render_prepared_multi_spectral_payload(app, payload)
+        plot_kind = app.current_plot_kind
+        export_plot_execution_path = get_export_plot_execution_path(app)
+        status_text = app.status_var.get()
     finally:
         root.destroy()
 
@@ -3903,9 +3914,19 @@ def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace)
         ),
         (
             "single_device_default_reuse_path_active",
-            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
-            and str(details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
             {"details": details},
+        ),
+        (
+            "single_device_default_reuse_uses_compare_render_semantics",
+            plot_kind == "single_device_compare_psd"
+            and export_plot_execution_path == "single_device_compare_psd_render"
+            and "single_device_render_semantics=compare_psd_single_side" in status_text,
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "status_text": status_text,
+            },
         ),
     ]
 
@@ -3923,6 +3944,327 @@ def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace)
     return 1 if failed else 0
 
 
+def run_single_device_render_semantic_equivalence_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-render-semantic-equivalence-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("?? txt+dat ??????")
+        configure_auto_compare_context(app, ygas_path, dat_path)
+
+        single_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        if len(single_payload["series_results"]) != 1:
+            raise ValueError("single-device render semantic equivalence check expects exactly one single-device series.")
+        render_prepared_multi_spectral_payload(app, single_payload)
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+        single_plot_kind = app.current_plot_kind
+        single_plot_style = app.current_plot_style_label
+        single_plot_layout = app.current_plot_layout_label
+        single_export_plot_execution_path = get_export_plot_execution_path(app)
+        single_titles = [axis.get_title() for axis in app.figure.axes]
+        single_compare_files = list(app.current_compare_files)
+
+        compare_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+        render_prepared_dual_plot_payload(app, compare_reference["dual_plot_payload"])
+        compare_plot_style = app.current_plot_style_label
+        compare_plot_layout = app.current_plot_layout_label
+        compare_titles = [axis.get_title() for axis in app.figure.axes]
+    finally:
+        root.destroy()
+
+    compare_plot_name = "时间段内 PSD 对比"
+    overlay_layout = single_plot_layout == "叠加同图"
+    title_semantics_match = (
+        bool(single_titles)
+        and bool(compare_titles)
+        and (
+            (
+                overlay_layout
+                and single_titles[0].startswith("时间段内 PSD 对比（txt侧）")
+                and compare_titles[0].startswith("时间段内 PSD 对比")
+            )
+            or (
+                (not overlay_layout)
+                and single_titles[0].startswith("设备A：")
+                and any(title.startswith("设备A：") for title in compare_titles)
+            )
+        )
+    )
+    status_semantics_match = (
+        "single_device_render_semantics=compare_psd_single_side" in single_status_text
+        and "plot_execution_path=single_device_compare_psd_render" in single_diag_text
+        and "图已生成：时间段内 PSD 对比 /" in single_status_text
+    )
+    style_layout_match = (
+        single_plot_style == compare_plot_style
+        and single_plot_layout == compare_plot_layout
+        and single_plot_style == app.resolve_plot_style(compare_plot_name)
+        and single_plot_layout == app.resolve_plot_layout(compare_plot_name)
+    )
+    checks = [
+        (
+            "single_device_compare_equivalent_uses_compare_render_path",
+            single_plot_kind == "single_device_compare_psd"
+            and single_export_plot_execution_path == "single_device_compare_psd_render",
+            {
+                "single_plot_kind": single_plot_kind,
+                "single_export_plot_execution_path": single_export_plot_execution_path,
+            },
+        ),
+        (
+            "single_device_compare_equivalent_status_and_diag_expose_render_semantics",
+            status_semantics_match,
+            {
+                "single_status": single_status_text,
+                "single_diag": single_diag_text,
+            },
+        ),
+        (
+            "single_device_compare_equivalent_style_layout_match_compare_renderer",
+            style_layout_match,
+            {
+                "single_plot_style": single_plot_style,
+                "single_plot_layout": single_plot_layout,
+                "compare_plot_style": compare_plot_style,
+                "compare_plot_layout": compare_plot_layout,
+            },
+        ),
+        (
+            "single_device_compare_equivalent_title_semantics_match_compare",
+            title_semantics_match and len(single_compare_files) == 1,
+            {
+                "single_titles": single_titles,
+                "compare_titles": compare_titles,
+                "single_compare_files": single_compare_files,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_render_semantic_equivalence_check]")
+    print(f"single_titles={single_titles}")
+    print(f"compare_titles={compare_titles}")
+    print(f"single_status={single_status_text}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+def run_single_device_vs_compare_render_style_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-vs-compare-render-style-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("浣跨敤 txt+dat 鍏卞悓鏃堕棿鑼冨洿")
+        configure_auto_compare_context(app, ygas_path, dat_path)
+
+        single_payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        render_prepared_multi_spectral_payload(app, single_payload)
+        single_style = app.current_plot_style_label
+        single_layout = app.current_plot_layout_label
+        single_titles = [axis.get_title() for axis in app.figure.axes]
+
+        compare_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+        render_prepared_dual_plot_payload(app, compare_reference["dual_plot_payload"])
+        compare_style = app.current_plot_style_label
+        compare_layout = app.current_plot_layout_label
+        compare_titles = [axis.get_title() for axis in app.figure.axes]
+        expected_short_label = str(compare_reference["dual_ygas"]["details"].get("time_range_short_label") or "")
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "single_device_compare_style_uses_same_plot_style",
+            single_style == compare_style,
+            {"single_style": single_style, "compare_style": compare_style},
+        ),
+        (
+            "single_device_compare_style_uses_same_plot_layout_semantics",
+            single_layout == compare_layout,
+            {"single_layout": single_layout, "compare_layout": compare_layout},
+        ),
+        (
+            "single_device_compare_style_uses_same_time_range_title_semantics",
+            (
+                not expected_short_label
+                or (
+                    expected_short_label in " ".join(single_titles)
+                    and expected_short_label in " ".join(compare_titles)
+                )
+            ),
+            {
+                "expected_short_label": expected_short_label,
+                "single_titles": single_titles,
+                "compare_titles": compare_titles,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_vs_compare_render_style_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_fallback_still_legacy_render_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas:
+        raise ValueError("single-device-fallback-still-legacy-render-check needs --ygas.")
+
+    ygas_path = Path(args.ygas[0])
+    parsed_a = parse_supported_file(ygas_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    if not col_a:
+        raise ValueError("Unable to resolve matching txt column for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        with tempfile.TemporaryDirectory(prefix="single_device_legacy_render_") as temp_dir:
+            isolated_ygas_path = Path(temp_dir) / ygas_path.name
+            shutil.copy2(ygas_path, isolated_ygas_path)
+            simulate_single_file_open(app, isolated_ygas_path)
+            payload = app.prepare_multi_spectral_compare_payload(
+                [isolated_ygas_path],
+                str(col_a),
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            if len(payload["series_results"]) != 1:
+                raise ValueError("single-device fallback legacy render check expects exactly one series.")
+            details = dict(payload["series_results"][0]["details"])
+            render_prepared_multi_spectral_payload(app, payload)
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            title = app.figure.axes[0].get_title() if app.figure.axes else ""
+            status_text = app.status_var.get()
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "single_device_fallback_keeps_legacy_execution_path",
+            str(details.get("single_device_execution_path")) == "legacy_device_group_scope"
+            and str(details.get("single_device_compare_side_fallback_reason")) == "no_compare_dat_context",
+            {"details": details},
+        ),
+        (
+            "single_device_fallback_keeps_legacy_render_kind_and_export_path",
+            plot_kind == "multi_spectral" and export_plot_execution_path == "single_device_grouped_spectrum",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+            },
+        ),
+        (
+            "single_device_fallback_keeps_legacy_title_semantics",
+            title.startswith("单台设备图谱 -") and "图已生成：单台设备图谱 /" in status_text,
+            {"title": title, "status_text": status_text},
+        ),
+    ]
+
+    failed = False
+    print("[single_device_fallback_still_legacy_render_check]")
+    print(f"details={details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
 def run_single_device_selection_scope_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
         raise ValueError("single-device-selection-scope-check needs --ygas and --dat.")
@@ -4414,12 +4756,7 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             time_range_meta=compare_time_range_meta,
         )
 
-        app.plot_multi_spectral_results(
-            col_a,
-            single_full_ygas_payload["series_results"],
-            single_full_ygas_payload["skipped_files"],
-            payload=single_full_ygas_payload,
-        )
+        render_prepared_multi_spectral_payload(app, single_full_ygas_payload)
         single_title = app.figure.axes[0].get_title() if app.figure.axes else ""
         single_diag_text = app.diagnostic_var.get()
         single_status_text = app.status_var.get()
@@ -4947,12 +5284,7 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
             },
         )
 
-        app.plot_multi_spectral_results(
-            col_a,
-            single_full_ygas_payload["series_results"],
-            single_full_ygas_payload["skipped_files"],
-            payload=single_full_ygas_payload,
-        )
+        render_prepared_multi_spectral_payload(app, single_full_ygas_payload)
         single_overlay_title = app.figure.axes[0].get_title() if app.figure.axes else ""
         single_overlay_diag_text = app.diagnostic_var.get()
         single_overlay_status_text = app.status_var.get()
@@ -5490,6 +5822,9 @@ def main() -> int:
             "single-device-mixed-selection-multi-txt-plus-dat-reuse-check",
             "single-device-only-dat-still-fallback-check",
             "single-device-default-reuse-enabled-check",
+            "single-device-render-semantic-equivalence-check",
+            "single-device-vs-compare-render-style-check",
+            "single-device-fallback-still-legacy-render-check",
             "single-device-active-dat-sync-check",
             "single-device-active-time-range-sync-check",
             "single-device-auto-bootstrap-fallback-check",
@@ -5570,6 +5905,12 @@ def main() -> int:
             return run_single_device_only_dat_still_fallback_check_mode(args)
         if mode == "single-device-default-reuse-enabled-check":
             return run_single_device_default_reuse_enabled_check_mode(args)
+        if mode == "single-device-render-semantic-equivalence-check":
+            return run_single_device_render_semantic_equivalence_check_mode(args)
+        if mode == "single-device-vs-compare-render-style-check":
+            return run_single_device_vs_compare_render_style_check_mode(args)
+        if mode == "single-device-fallback-still-legacy-render-check":
+            return run_single_device_fallback_still_legacy_render_check_mode(args)
         if mode == "single-device-active-dat-sync-check":
             return run_single_device_active_dat_sync_check_mode(args)
         if mode == "single-device-active-time-range-sync-check":

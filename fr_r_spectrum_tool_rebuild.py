@@ -328,6 +328,7 @@ def build_single_device_execution_items(details: dict[str, Any], *, include_plot
         details,
         (
             "single_device_execution_path",
+            "single_device_render_semantics",
             "single_device_selection_scope",
             "single_device_time_range_policy",
             "single_device_compare_side_fallback_reason",
@@ -341,6 +342,8 @@ def build_single_device_execution_items(details: dict[str, Any], *, include_plot
         "single_device_compare_context_source",
         "single_device_compare_context_dat_file_name",
         "single_device_compare_context_time_range_policy",
+        "single_device_compare_context_start",
+        "single_device_compare_context_end",
     ):
         value = details.get(key)
         if value is not None and value != "":
@@ -2609,6 +2612,8 @@ class FileViewerApp:
 
         series_result = {
             "label": device_label,
+            "side": "txt",
+            "column": str(target_column),
             "freq": np.asarray(payload["freq"], dtype=float),
             "density": np.asarray(payload["density"], dtype=float),
             "details": details,
@@ -3243,6 +3248,9 @@ class FileViewerApp:
         mode_title = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
         self.status_var.set(f"正在生成图：{mode_title} / {target_column}")
         self.root.update_idletasks()
+        if self.should_render_single_device_with_compare_psd_semantics(payload):
+            self.render_single_device_compare_psd_payload(payload)
+            return
         self.plot_multi_spectral_results(target_column, series_results, skipped_files, payload=payload)
 
     def prepare_dual_compare_payload(
@@ -8129,27 +8137,113 @@ class FileViewerApp:
         fs_a_last: float,
         fs_b_last: float,
     ) -> None:
+        self.render_psd_series_with_compare_semantics(
+            series_results=series_results,
+            mapping_name=mapping_name,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            txt_points=txt_points,
+            dat_points=dat_points,
+            fs_a_last=fs_a_last,
+            fs_b_last=fs_b_last,
+            render_semantics="compare_psd_dual",
+            label_a=label_a,
+            label_b=label_b,
+            parsed_a=parsed_a,
+            parsed_b=parsed_b,
+        )
+
+    def should_render_single_device_with_compare_psd_semantics(self, payload: dict[str, Any]) -> bool:
+        series_results = list(payload.get("series_results", []))
+        if len(series_results) != 1:
+            return False
+        first_details = dict(series_results[0].get("details", {}))
+        return str(first_details.get("single_device_execution_path") or "") == "compare_txt_side_equivalent"
+
+    def render_single_device_compare_psd_payload(self, payload: dict[str, Any]) -> None:
+        series_results = list(payload.get("series_results", []))
+        if not series_results:
+            raise ValueError("单设备 compare-style PSD 渲染缺少有效系列。")
+        first_details = dict(series_results[0].get("details", {}))
+        mapping_name = (
+            self.element_preset_var.get().strip()
+            if self.mapping_mode_var.get() == "预设映射"
+            else str(payload.get("target_column") or first_details.get("base_value_column") or "PSD")
+        ) or str(payload.get("target_column") or first_details.get("base_value_column") or "PSD")
+        self.render_psd_series_with_compare_semantics(
+            series_results=series_results,
+            mapping_name=mapping_name,
+            start_dt=payload.get("start_dt"),
+            end_dt=payload.get("end_dt"),
+            txt_points=int(first_details.get("valid_points", 0) or 0),
+            dat_points=int(first_details.get("compare_dat_valid_points", 0) or 0),
+            fs_a_last=float(first_details.get("effective_fs") or first_details.get("fs") or DEFAULT_FS),
+            fs_b_last=float(first_details.get("compare_dat_effective_fs") or 0.0),
+            render_semantics="compare_psd_single_side",
+        )
+
+    def render_psd_series_with_compare_semantics(
+        self,
+        *,
+        series_results: list[dict[str, Any]],
+        mapping_name: str,
+        start_dt: pd.Timestamp | None,
+        end_dt: pd.Timestamp | None,
+        txt_points: int,
+        dat_points: int,
+        fs_a_last: float,
+        fs_b_last: float,
+        render_semantics: str,
+        label_a: str | None = None,
+        label_b: str | None = None,
+        parsed_a: ParsedFileResult | None = None,
+        parsed_b: ParsedFileResult | None = None,
+    ) -> None:
         if not series_results:
             raise ValueError("时间段内 PSD 对比没有得到可用的有效谱值。")
 
         style = self.resolve_plot_style("时间段内 PSD 对比")
         layout = self.resolve_plot_layout("时间段内 PSD 对比")
         self.reset_plot_output_state()
+        single_side_compare = render_semantics == "compare_psd_single_side"
+        normalized_series_results: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(series_results, start=1):
+            item = dict(raw_item)
+            details = dict(raw_item.get("details", {}))
+            side = str(item.get("side") or ("txt" if single_side_compare else ""))
+            column = str(
+                item.get("column")
+                or details.get("base_value_column")
+                or details.get("target_column")
+                or f"series_{index}"
+            )
+            label = str(item.get("label") or column)
+            if single_side_compare:
+                source_label = str(details.get("compare_txt_source_label") or label or "txt")
+                label = f"{source_label} - {column}" if column else source_label
+                side = "txt"
+                details["single_device_render_semantics"] = "compare_psd_single_side"
+                details["plot_execution_path"] = "single_device_compare_psd_render"
+            item["side"] = side
+            item["column"] = column
+            item["label"] = label
+            item["details"] = details
+            normalized_series_results.append(item)
 
-        txt_series = [item for item in series_results if item["side"] == "txt"]
-        dat_series = [item for item in series_results if item["side"] == "dat"]
-        first_details = dict(series_results[0].get("details", {}))
+        txt_series = [item for item in normalized_series_results if item["side"] == "txt"]
+        dat_series = [item for item in normalized_series_results if item["side"] == "dat"]
+        first_details = dict(normalized_series_results[0].get("details", {}))
         time_range_meta = core.extract_time_range_metadata(first_details)
         time_range_display_suffix = core.build_time_range_display_suffix(first_details)
         time_range_filename_suffix = core.build_time_range_filename_suffix(first_details)
-        point_count_contract = build_series_point_count_contract(series_results)
+        point_count_contract = build_series_point_count_contract(normalized_series_results)
         txt_point_count_contract = build_series_point_count_contract(txt_series)
         dat_point_count_contract = build_series_point_count_contract(dat_series)
         total_valid_freq_points_across_series = int(point_count_contract["total_valid_freq_points_across_series"])
         quality_warnings: list[str] = []
         if total_valid_freq_points_across_series < 10:
             quality_warnings.append("有效频点偏少，请检查时间范围、FS 或 NSEGMENT 设置。")
-        if txt_points < 32 or dat_points < 32:
+        if txt_points < 32 or (not single_side_compare and dat_points < 32):
             quality_warnings.append("有效点数偏少，当前 PSD 结果可能不稳定。")
         if start_dt is not None and end_dt is not None:
             span_seconds = (pd.Timestamp(end_dt) - pd.Timestamp(start_dt)).total_seconds()
@@ -8159,18 +8253,21 @@ class FileViewerApp:
         if layout == "叠加同图":
             self.figure.clear()
             ax = self.figure.add_subplot(111)
-            for index, item in enumerate(series_results):
+            for index, item in enumerate(normalized_series_results):
                 color = SERIES_COLORS[index % len(SERIES_COLORS)]
                 self.apply_series_style(ax, item["freq"], item["density"], color=color, label=item["label"], style=style)
             self.add_selected_reference_slopes(
                 ax,
-                np.concatenate([item["freq"] for item in series_results]),
-                np.concatenate([item["density"] for item in series_results]),
+                np.concatenate([item["freq"] for item in normalized_series_results]),
+                np.concatenate([item["density"] for item in normalized_series_results]),
                 is_psd=True,
             )
             ax.set_xscale("log")
             ax.set_yscale("log")
-            ax.set_title(f"时间段内 PSD 对比{time_range_display_suffix}")
+            title = f"时间段内 PSD 对比{time_range_display_suffix}"
+            if single_side_compare:
+                title = f"时间段内 PSD 对比（txt侧）{time_range_display_suffix}"
+            ax.set_title(title)
             ax.set_xlabel("Frequency (Hz)")
             ax.set_ylabel("Density")
             ax.grid(True, which="both", linestyle="--", alpha=0.3)
@@ -8179,34 +8276,17 @@ class FileViewerApp:
             self.figure.tight_layout()
             self.refresh_canvas()
         else:
-            vertical_main_preview = layout in {"上下分图", "分别生成两张图"}
-            self.figure.clear()
-            axes = self.figure.subplots(2, 1) if vertical_main_preview else self.figure.subplots(1, 2)
-            ax_a, ax_b = axes[0], axes[1]
-            for index, item in enumerate(txt_series):
-                color = SERIES_COLORS[index % len(SERIES_COLORS)]
-                self.apply_series_style(ax_a, item["freq"], item["density"], color=color, label=item["label"], style=style)
-            for index, item in enumerate(dat_series):
-                color = SERIES_COLORS[(index + len(txt_series)) % len(SERIES_COLORS)]
-                self.apply_series_style(ax_b, item["freq"], item["density"], color=color, label=item["label"], style=style)
-            if txt_series:
-                self.add_selected_reference_slopes(
-                    ax_a,
-                    np.concatenate([item["freq"] for item in txt_series]),
-                    np.concatenate([item["density"] for item in txt_series]),
-                    is_psd=True,
-                )
-            if dat_series:
-                self.add_selected_reference_slopes(
-                    ax_b,
-                    np.concatenate([item["freq"] for item in dat_series]),
-                    np.concatenate([item["density"] for item in dat_series]),
-                    is_psd=True,
-                )
-            for ax, title in (
-                (ax_a, f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}{time_range_display_suffix}"),
-                (ax_b, f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}{time_range_display_suffix}"),
-            ):
+            def plot_group(ax: Any, group_series: list[dict[str, Any]], *, title: str, color_offset: int = 0) -> None:
+                for index, item in enumerate(group_series):
+                    color = SERIES_COLORS[(index + color_offset) % len(SERIES_COLORS)]
+                    self.apply_series_style(ax, item["freq"], item["density"], color=color, label=item["label"], style=style)
+                if group_series:
+                    self.add_selected_reference_slopes(
+                        ax,
+                        np.concatenate([item["freq"] for item in group_series]),
+                        np.concatenate([item["density"] for item in group_series]),
+                        is_psd=True,
+                    )
                 ax.set_xscale("log")
                 ax.set_yscale("log")
                 ax.set_title(title)
@@ -8215,134 +8295,191 @@ class FileViewerApp:
                 ax.grid(True, which="both", linestyle="--", alpha=0.3)
                 if ax.get_legend_handles_labels()[1]:
                     ax.legend(loc="upper right")
+
+            visible_groups: list[dict[str, Any]] = [
+                {
+                    "title": f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}{time_range_display_suffix}",
+                    "series": txt_series,
+                    "window_title": f"设备A - PSD 对比{time_range_display_suffix}",
+                    "window_filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
+                    "color_offset": 0,
+                }
+            ]
+            if not single_side_compare:
+                visible_groups.append(
+                    {
+                        "title": f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}{time_range_display_suffix}",
+                        "series": dat_series,
+                        "window_title": f"设备B - PSD 对比{time_range_display_suffix}",
+                        "window_filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
+                        "color_offset": len(txt_series),
+                    }
+                )
+
+            self.figure.clear()
+            if len(visible_groups) == 1:
+                ax = self.figure.add_subplot(111)
+                plot_group(
+                    ax,
+                    visible_groups[0]["series"],
+                    title=visible_groups[0]["title"],
+                    color_offset=int(visible_groups[0]["color_offset"]),
+                )
+            else:
+                vertical_main_preview = layout in {"上下分图", "分别生成两张图"}
+                axes = self.figure.subplots(2, 1) if vertical_main_preview else self.figure.subplots(1, 2)
+                for ax, group in zip(list(axes), visible_groups):
+                    plot_group(
+                        ax,
+                        group["series"],
+                        title=group["title"],
+                        color_offset=int(group["color_offset"]),
+                    )
             self.figure.tight_layout()
             overview_title = "图形结果：主页面总览图" if layout == "分别生成两张图" else None
             self.refresh_canvas(title=overview_title)
 
             if layout == "分别生成两张图" and self.use_separate_zoom_windows_var.get():
                 entries: list[dict[str, Any]] = []
-                fig_a = Figure(figsize=(6, 4), dpi=100)
-                ax_zoom_a = fig_a.add_subplot(111)
-                for index, item in enumerate(txt_series):
-                    color = SERIES_COLORS[index % len(SERIES_COLORS)]
-                    self.apply_series_style(ax_zoom_a, item["freq"], item["density"], color=color, label=item["label"], style=style)
-                if txt_series:
-                    self.add_selected_reference_slopes(
-                        ax_zoom_a,
-                        np.concatenate([item["freq"] for item in txt_series]),
-                        np.concatenate([item["density"] for item in txt_series]),
-                        is_psd=True,
+                for group in visible_groups:
+                    fig_zoom = Figure(figsize=(6, 4), dpi=100)
+                    ax_zoom = fig_zoom.add_subplot(111)
+                    plot_group(
+                        ax_zoom,
+                        group["series"],
+                        title=group["title"].replace(time_range_display_suffix, ""),
+                        color_offset=int(group["color_offset"]),
                     )
-                ax_zoom_a.set_xscale("log")
-                ax_zoom_a.set_yscale("log")
-                ax_zoom_a.set_title(f"设备A：{','.join(item['column'] for item in txt_series) or '无数据'}")
-                ax_zoom_a.set_xlabel("Frequency (Hz)")
-                ax_zoom_a.set_ylabel("Density")
-                ax_zoom_a.grid(True, which="both", linestyle="--", alpha=0.3)
-                if ax_zoom_a.get_legend_handles_labels()[1]:
-                    ax_zoom_a.legend(loc="upper right")
-                fig_a.tight_layout()
-                entries.append(
-                    {
-                        "figure": fig_a,
-                        "title": f"设备A - PSD 对比{time_range_display_suffix}",
-                        "filename": f"deviceA_{sanitize_filename(txt_series[0]['column'] if txt_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
-                    }
-                )
-
-                fig_b = Figure(figsize=(6, 4), dpi=100)
-                ax_zoom_b = fig_b.add_subplot(111)
-                for index, item in enumerate(dat_series):
-                    color = SERIES_COLORS[index % len(SERIES_COLORS)]
-                    self.apply_series_style(ax_zoom_b, item["freq"], item["density"], color=color, label=item["label"], style=style)
-                if dat_series:
-                    self.add_selected_reference_slopes(
-                        ax_zoom_b,
-                        np.concatenate([item["freq"] for item in dat_series]),
-                        np.concatenate([item["density"] for item in dat_series]),
-                        is_psd=True,
+                    fig_zoom.tight_layout()
+                    entries.append(
+                        {
+                            "figure": fig_zoom,
+                            "title": group["window_title"],
+                            "filename": group["window_filename"],
+                        }
                     )
-                ax_zoom_b.set_xscale("log")
-                ax_zoom_b.set_yscale("log")
-                ax_zoom_b.set_title(f"设备B：{','.join(item['column'] for item in dat_series) or '无数据'}")
-                ax_zoom_b.set_xlabel("Frequency (Hz)")
-                ax_zoom_b.set_ylabel("Density")
-                ax_zoom_b.grid(True, which="both", linestyle="--", alpha=0.3)
-                if ax_zoom_b.get_legend_handles_labels()[1]:
-                    ax_zoom_b.legend(loc="upper right")
-                fig_b.tight_layout()
-                entries.append(
-                    {
-                        "figure": fig_b,
-                        "title": f"设备B - PSD 对比{time_range_display_suffix}",
-                        "filename": f"deviceB_{sanitize_filename(dat_series[0]['column'] if dat_series else 'psd')}_{self.get_plot_style_tag(style)}{time_range_filename_suffix}.png",
-                    }
-                )
-                self.show_separate_plot_windows(entries)
+                if entries:
+                    self.show_separate_plot_windows(entries)
 
-        self.current_plot_kind = "dual_psd_compare"
-        self.current_plot_columns = [item["label"] for item in series_results]
+        self.current_plot_kind = "single_device_compare_psd" if single_side_compare else "dual_psd_compare"
+        self.current_plot_columns = [item["label"] for item in normalized_series_results]
         self.current_result_freq = None
         self.current_result_values = None
         self.current_aligned_frame = None
         self.current_aligned_metadata = {}
-        self.current_compare_files = [label_a, label_b]
-        self.current_result_frame = self.build_overlay_export_frame(series_results)
-        self.current_point_count_contract = {
-            "global": dict(point_count_contract),
-            "txt": dict(txt_point_count_contract),
-            "dat": dict(dat_point_count_contract),
-        }
+        self.current_compare_files = (
+            [str(first_details.get("compare_txt_source_label") or normalized_series_results[0]["label"])]
+            if single_side_compare
+            else [label_a, label_b]
+        )
+        self.current_result_frame = self.build_overlay_export_frame(normalized_series_results)
+        self.current_point_count_contract = {"global": dict(point_count_contract), "txt": dict(txt_point_count_contract)}
+        if dat_series:
+            self.current_point_count_contract["dat"] = dict(dat_point_count_contract)
         series_point_items = [
             f"{item['label']} | valid_freq_points={item.get('details', {}).get('valid_freq_points')} | "
             f"frequency_point_count={item.get('details', {}).get('frequency_point_count')}"
-            for item in series_results
+            for item in normalized_series_results
         ]
         self.register_plot_style_layout(style, layout)
-        extra_items = [
-            f"当前要素映射={mapping_name}",
-            f"当前谱类型=PSD",
-            *build_series_point_count_items(point_count_contract),
-            *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
-            *build_series_point_count_items(dat_point_count_contract, prefix="dat"),
-            f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
-            f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
-            f"设备B_base_fs_source={next((item['details'].get('base_fs_source') for item in dat_series if item.get('details')), None)}",
-            *core.build_time_range_diagnostic_items(first_details),
-            f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
-            f"实际命中设备B列={','.join(sorted({item['column'] for item in dat_series}))}",
-            "对齐策略=时间窗裁切后独立PSD",
-            f"出图样式={style}",
-            f"出图布局={layout}",
-            f"compare_common_time_range={start_dt or '自动'} ~ {end_dt or '自动'}",
-            f"txt 合并后点数={txt_points}",
-            f"dat 裁切后点数={dat_points}",
-            f"txt_FS={fs_a_last:g}",
-            f"dat_FS={fs_b_last:g}",
-            f"成功系列数={len(series_results)}",
-            *series_point_items,
-        ] + self.build_timestamp_quality_items(parsed_a, parsed_b)
-        extra_items.extend(quality_warnings)
-        self.update_diagnostic_info(
-            layout=f"{parsed_a.profile_name} / {parsed_b.profile_name}",
-            analysis_label="；".join(item["label"] for item in series_results),
-            extra_items=extra_items,
-        )
-        status = (
-            f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(series_results)}"
-            f" | {' | '.join(build_series_point_count_status_items(txt_point_count_contract, prefix='txt', include_totals=False))}"
-            f" | {' | '.join(build_series_point_count_status_items(dat_point_count_contract, prefix='dat', include_totals=False))}"
-            f" | series_count={point_count_contract['series_count']}"
-            f" | total_valid_freq_points_across_series={point_count_contract['total_valid_freq_points_across_series']}"
-            f" | total_frequency_points_across_series={point_count_contract['total_frequency_points_across_series']}"
-            f" | 时间窗={time_range_meta.get('time_range_policy_label', first_details.get('time_range_policy_label', '默认'))}"
-            f" | {time_range_meta.get('time_range_difference_hint', core.TIME_RANGE_DIFFERENCE_HINT)}"
-        )
+        if single_side_compare:
+            extra_items = [
+                f"当前要素映射={mapping_name}",
+                "当前谱类型=PSD",
+                *build_series_point_count_items(point_count_contract),
+                *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
+                f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
+                f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
+                *core.build_time_range_diagnostic_items(first_details),
+                f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
+                "对齐策略=时间窗裁切后独立PSD",
+                f"出图样式={style}",
+                f"出图布局={layout}",
+                f"compare_common_time_range={start_dt or '自动'} ~ {end_dt or '自动'}",
+                f"txt 合并后点数={txt_points}",
+                f"txt_FS={fs_a_last:g}",
+                f"成功系列数={len(normalized_series_results)}",
+                *build_single_device_execution_items(first_details, include_plot_execution_path=True),
+                *series_point_items,
+            ]
+            if dat_points > 0:
+                extra_items.append(f"compare_dat_reference_points={dat_points}")
+            if fs_b_last > 0:
+                extra_items.append(f"compare_dat_reference_fs={fs_b_last:g}")
+            extra_items.extend(quality_warnings)
+            self.update_diagnostic_info(
+                layout="时间段内 PSD 对比（单侧）",
+                analysis_label="；".join(item["label"] for item in normalized_series_results),
+                extra_items=extra_items,
+            )
+            status_items = [
+                *build_series_point_count_status_items(txt_point_count_contract, prefix="txt", include_totals=False),
+                f"series_count={point_count_contract['series_count']}",
+                f"total_valid_freq_points_across_series={point_count_contract['total_valid_freq_points_across_series']}",
+                f"total_frequency_points_across_series={point_count_contract['total_frequency_points_across_series']}",
+                *build_single_device_execution_items(first_details, include_plot_execution_path=True),
+            ]
+            status = (
+                f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(normalized_series_results)}"
+                f" | {' | '.join(status_items)}"
+                f" | 时间窗={time_range_meta.get('time_range_policy_label', first_details.get('time_range_policy_label', '默认'))}"
+                f" | {time_range_meta.get('time_range_difference_hint', core.TIME_RANGE_DIFFERENCE_HINT)}"
+            )
+        else:
+            extra_items = [
+                f"当前要素映射={mapping_name}",
+                f"当前谱类型=PSD",
+                *build_series_point_count_items(point_count_contract),
+                *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
+                *build_series_point_count_items(dat_point_count_contract, prefix="dat"),
+                f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
+                f"设备A_base_fs_source={next((item['details'].get('base_fs_source') for item in txt_series if item.get('details')), None)}",
+                f"设备B_base_fs_source={next((item['details'].get('base_fs_source') for item in dat_series if item.get('details')), None)}",
+                *core.build_time_range_diagnostic_items(first_details),
+                f"实际命中设备A列={','.join(sorted({item['column'] for item in txt_series}))}",
+                f"实际命中设备B列={','.join(sorted({item['column'] for item in dat_series}))}",
+                "对齐策略=时间窗裁切后独立PSD",
+                f"出图样式={style}",
+                f"出图布局={layout}",
+                f"compare_common_time_range={start_dt or '自动'} ~ {end_dt or '自动'}",
+                f"txt 合并后点数={txt_points}",
+                f"dat 裁切后点数={dat_points}",
+                f"txt_FS={fs_a_last:g}",
+                f"dat_FS={fs_b_last:g}",
+                f"成功系列数={len(normalized_series_results)}",
+                *series_point_items,
+            ] + self.build_timestamp_quality_items(parsed_a, parsed_b)
+            extra_items.extend(quality_warnings)
+            self.update_diagnostic_info(
+                layout=f"{parsed_a.profile_name} / {parsed_b.profile_name}",
+                analysis_label="；".join(item["label"] for item in normalized_series_results),
+                extra_items=extra_items,
+            )
+            status = (
+                f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(normalized_series_results)}"
+                f" | {' | '.join(build_series_point_count_status_items(txt_point_count_contract, prefix='txt', include_totals=False))}"
+                f" | {' | '.join(build_series_point_count_status_items(dat_point_count_contract, prefix='dat', include_totals=False))}"
+                f" | series_count={point_count_contract['series_count']}"
+                f" | total_valid_freq_points_across_series={point_count_contract['total_valid_freq_points_across_series']}"
+                f" | total_frequency_points_across_series={point_count_contract['total_frequency_points_across_series']}"
+                f" | 时间窗={time_range_meta.get('time_range_policy_label', first_details.get('time_range_policy_label', '默认'))}"
+                f" | {time_range_meta.get('time_range_difference_hint', core.TIME_RANGE_DIFFERENCE_HINT)}"
+            )
         if layout == "分别生成两张图":
             if self.separate_plot_windows:
                 status += f" | 已生成独立图窗口：{len(self.separate_plot_windows)} 个"
             else:
                 status += " | 主页面保留总览，未弹出独立窗口"
+        if single_side_compare and bool(first_details.get("single_device_selection_filtered_to_txt_side")):
+            status += " | 当前 selection 包含 dat，已自动忽略 dat 并按 txt-side 复用"
+        if single_side_compare and str(first_details.get("single_device_compare_context_source") or "") == "auto_bootstrap_fallback":
+            status += " | 当前 compare UI 状态不完整，单设备暂用 auto bootstrap 上下文"
+        if (
+            single_side_compare
+            and "single_device_compare_context_dat_matches_selected_dat" in first_details
+            and not bool(first_details.get("single_device_compare_context_dat_matches_selected_dat"))
+        ):
+            status += " | 警告：单设备复用的 dat 与当前 compare 页 dat 不一致"
         self.status_var.set(status)
 
     def plot_scatter_consistency_compare(
@@ -9146,6 +9283,7 @@ class FileViewerApp:
             "aligned_time_series",
             "aligned_scatter",
             "dual_psd_compare",
+            "single_device_compare_psd",
             "aligned_diff",
             "aligned_ratio",
             "aligned_cospectrum",
@@ -9173,6 +9311,7 @@ class FileViewerApp:
             "aligned_time_series",
             "aligned_scatter",
             "dual_psd_compare",
+            "single_device_compare_psd",
             "aligned_diff",
             "aligned_ratio",
             "aligned_cospectrum",
@@ -9182,12 +9321,16 @@ class FileViewerApp:
                 "aligned_time_series": "time_compare",
                 "aligned_scatter": "scatter_compare",
                 "dual_psd_compare": "psd_compare",
+                "single_device_compare_psd": "psd_compare",
                 "aligned_diff": "difference_compare",
                 "aligned_ratio": "ratio_compare",
                 "aligned_cospectrum": "cospectrum_compare",
                 "aligned_quadrature": "quadrature_compare",
             }[self.current_plot_kind]
-            return f"{kind_name}_{self.build_compare_filename_core()}{time_range_filename_suffix if self.current_plot_kind == 'dual_psd_compare' else ''}_plot.png"
+            return (
+                f"{kind_name}_{self.build_compare_filename_core()}"
+                f"{time_range_filename_suffix if self.current_plot_kind in {'dual_psd_compare', 'single_device_compare_psd'} else ''}_plot.png"
+            )
 
         return "spectral_plot.png"
 
@@ -9210,6 +9353,7 @@ class FileViewerApp:
         if self.current_file is None and self.current_plot_kind not in {
             "multi_spectral",
             "dual_psd_compare",
+            "single_device_compare_psd",
             "aligned_cospectrum",
             "aligned_quadrature",
         }:
@@ -9231,7 +9375,7 @@ class FileViewerApp:
                 return f"{device_name}_单台图谱_{col}{time_range_filename_suffix}_data.csv"
             return f"multi_device_{col}{time_range_filename_suffix}_data.csv"
 
-        if self.current_plot_kind == "dual_psd_compare":
+        if self.current_plot_kind in {"dual_psd_compare", "single_device_compare_psd"}:
             return f"psd_compare_{self.build_compare_filename_core()}{time_range_filename_suffix}_data.csv"
 
         if self.current_plot_kind == "aligned_cospectrum":
