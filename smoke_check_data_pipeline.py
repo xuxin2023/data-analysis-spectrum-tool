@@ -70,6 +70,23 @@ def get_export_plot_execution_path(app: object) -> str:
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
 
 
+def find_dat_option_label(app: object, dat_path: Path) -> str:
+    target_key = str(Path(dat_path).resolve())
+    for label, option_path in getattr(app, "auto_dat_options", {}).items():
+        if str(Path(option_path).resolve()) == target_key:
+            return str(label)
+    raise ValueError(f"Unable to resolve dat option label for {dat_path}")
+
+
+def write_truncated_dat_copy(source_path: Path, target_path: Path, *, keep_data_rows: int) -> None:
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+    header_lines = lines[:4]
+    data_lines = lines[4 : 4 + max(int(keep_data_rows), 0)]
+    if not data_lines:
+        raise ValueError("Truncated dat copy must keep at least one data row.")
+    target_path.write_text("\n".join([*header_lines, *data_lines]) + "\n", encoding="utf-8")
+
+
 def prepare_compare_txt_side_reference(
     app: object,
     *,
@@ -520,6 +537,39 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-device-default-reuse-enabled-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_active_dat_sync",
+            run_single_device_active_dat_sync_check_mode,
+            clone_args(
+                args,
+                mode="single-device-active-dat-sync-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_active_time_range_sync",
+            run_single_device_active_time_range_sync_check_mode,
+            clone_args(
+                args,
+                mode="single-device-active-time-range-sync-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_auto_bootstrap_fallback",
+            run_single_device_auto_bootstrap_fallback_check_mode,
+            clone_args(
+                args,
+                mode="single-device-auto-bootstrap-fallback-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -3387,6 +3437,421 @@ def run_single_device_only_dat_still_fallback_check_mode(args: argparse.Namespac
     return 1 if failed else 0
 
 
+def run_single_device_active_dat_sync_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-active-dat-sync-check needs --ygas and --dat.")
+
+    ygas_source = Path(args.ygas[0])
+    dat_source = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_source)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    if not col_a:
+        raise ValueError("Unable to resolve matching txt column for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    with tempfile.TemporaryDirectory() as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        ygas_path = temp_dir / "ygas_h2o_1min.log"
+        dat_a_path = temp_dir / "toa5_h2o_full.dat"
+        dat_b_path = temp_dir / "toa5_h2o_short.dat"
+        shutil.copy2(ygas_source, ygas_path)
+        shutil.copy2(dat_source, dat_a_path)
+        write_truncated_dat_copy(dat_source, dat_b_path, keep_data_rows=300)
+
+        root = tk.Tk()
+        root.withdraw()
+        app = app_mod.FileViewerApp(root)
+        try:
+            app.refresh_canvas = lambda *args, **kwargs: None
+            app.element_preset_var.set(str(args.element or "H2O"))
+            app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+            simulate_single_file_open(app, ygas_path)
+
+            default_dat_label = str(app.selected_dat_var.get())
+            default_dat_path = app.auto_dat_options.get(default_dat_label)
+            dat_b_label = find_dat_option_label(app, dat_b_path)
+            app.selected_dat_var.set(dat_b_label)
+            app.on_selected_dat_changed()
+
+            payload = app.prepare_multi_spectral_compare_payload(
+                [ygas_path],
+                str(col_a),
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            if len(payload["series_results"]) != 1:
+                raise ValueError("single-device active dat sync check expects exactly one series.")
+            single_series = payload["series_results"][0]
+            single_details = dict(single_series["details"])
+            app.plot_multi_spectral_results(
+                str(col_a),
+                list(payload["series_results"]),
+                list(payload["skipped_files"]),
+                payload=payload,
+            )
+            single_status_text = app.status_var.get()
+            single_diag_text = app.diagnostic_var.get()
+            single_contract = dict(app.current_point_count_contract)
+            compare_b = prepare_compare_txt_side_reference(
+                app,
+                ygas_paths=[ygas_path],
+                dat_path=dat_b_path,
+                col_a=str(col_a),
+                col_b=str(choose_single_column(parse_supported_file(dat_b_path), args.element, "B")),
+                args=args,
+            )
+            compare_b_txt = compare_b["dual_ygas"]
+            compare_b_details = dict(compare_b_txt["details"])
+            compare_a = prepare_compare_txt_side_reference(
+                app,
+                ygas_paths=[ygas_path],
+                dat_path=dat_a_path,
+                col_a=str(col_a),
+                col_b=str(choose_single_column(parse_supported_file(dat_a_path), args.element, "B")),
+                args=args,
+            )
+            compare_a_txt = compare_a["dual_ygas"]
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "active_compare_dat_switched_away_from_auto_default",
+            default_dat_path is not None
+            and Path(default_dat_path).resolve() == dat_a_path.resolve()
+            and str(single_details.get("single_device_compare_context_dat_file_name")) == dat_b_path.name,
+            {
+                "default_dat_label": default_dat_label,
+                "default_dat_path": str(default_dat_path) if default_dat_path is not None else "",
+                "active_dat_label": dat_b_label,
+                "single_details": single_details,
+            },
+        ),
+        (
+            "single_device_compare_context_bound_to_active_compare_ui_dat",
+            str(single_details.get("single_device_compare_context_source")) == "active_compare_ui"
+            and bool(single_details.get("single_device_compare_context_matches_current_compare_ui"))
+            and bool(single_details.get("single_device_compare_context_dat_matches_selected_dat"))
+            and str(single_details.get("single_device_compare_context_dat_file_name")) == dat_b_path.name,
+            {"single_details": single_details},
+        ),
+        (
+            "active_dat_sync_changes_reference_window",
+            int(compare_b_details.get("valid_points", 0)) != int(compare_a_txt["details"].get("valid_points", 0)),
+            {
+                "compare_a_valid_points": compare_a_txt["details"].get("valid_points"),
+                "compare_b_valid_points": compare_b_details.get("valid_points"),
+            },
+        ),
+        (
+            "single_device_compare_context_dat_matches_selected_dat",
+            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_b_txt["freq"], dtype=float))
+            and np.allclose(
+                np.asarray(single_series["density"], dtype=float),
+                np.asarray(compare_b_txt["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+            and int(single_details.get("rendered_point_count", 0)) == int(len(compare_b_txt["freq"])),
+            {
+                "single_points": len(single_series["freq"]),
+                "compare_points": len(compare_b_txt["freq"]),
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(compare_b_txt["freq"]),
+            },
+        ),
+        (
+            "active_dat_sync_status_and_diag_visible",
+            "single_device_compare_context_source=active_compare_ui" in single_status_text
+            and f"single_device_compare_context_dat_file_name={dat_b_path.name}" in single_status_text
+            and "single_device_compare_context_dat_matches_selected_dat=true" in single_diag_text
+            and "single_device_compare_context_matches_current_compare_ui=true" in single_diag_text,
+            {
+                "single_status": single_status_text,
+                "single_diag": single_diag_text,
+                "single_contract": single_contract,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_active_dat_sync_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_a_path={dat_a_path}")
+    print(f"dat_b_path={dat_b_path}")
+    print(f"single_details={single_details}")
+    print(f"compare_b_details={compare_b_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_active_time_range_sync_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-active-time-range-sync-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    timestamps = core.parse_mixed_timestamp_series(parsed_b.dataframe[parsed_b.timestamp_col]).dropna()
+    if timestamps.empty:
+        raise ValueError("Unable to resolve dat timestamps for manual range sync check.")
+    manual_start = pd.Timestamp(timestamps.min()) + pd.Timedelta(seconds=10)
+    manual_end = pd.Timestamp(timestamps.min()) + pd.Timedelta(seconds=29.9)
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        configure_auto_compare_context(app, ygas_path, dat_path)
+        app.time_range_strategy_var.set("手动输入时间范围")
+        app.time_start_var.set(manual_start.strftime("%Y-%m-%d %H:%M:%S"))
+        app.time_end_var.set(manual_end.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip("."))
+
+        payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        if len(payload["series_results"]) != 1:
+            raise ValueError("single-device active time-range sync check expects exactly one series.")
+        single_series = payload["series_results"][0]
+        single_details = dict(single_series["details"])
+        app.plot_multi_spectral_results(
+            str(col_a),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+        compare_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+        compare_txt = compare_reference["dual_ygas"]
+        compare_txt_details = dict(compare_txt["details"])
+
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        full_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "single_device_time_range_bound_to_active_compare_ui",
+            str(single_details.get("single_device_compare_context_source")) == "active_compare_ui"
+            and bool(single_details.get("single_device_compare_context_matches_current_compare_ui"))
+            and str(single_details.get("single_device_compare_context_time_range_policy"))
+            == str(compare_txt_details.get("time_range_policy"))
+            and pd.Timestamp(single_details.get("single_device_compare_context_start")) == pd.Timestamp(compare_reference["start_dt"])
+            and pd.Timestamp(single_details.get("single_device_compare_context_end")) == pd.Timestamp(compare_reference["end_dt"]),
+            {
+                "single_details": single_details,
+                "compare_start": compare_reference["start_dt"],
+                "compare_end": compare_reference["end_dt"],
+            },
+        ),
+        (
+            "single_device_active_time_range_matches_compare_txt_side",
+            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float))
+            and np.allclose(
+                np.asarray(single_series["density"], dtype=float),
+                np.asarray(compare_txt["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+            and int(single_details.get("rendered_point_count", 0)) == int(len(compare_txt["freq"])),
+            {
+                "single_valid_points": single_details.get("valid_points"),
+                "compare_valid_points": compare_txt_details.get("valid_points"),
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(compare_txt["freq"]),
+            },
+        ),
+        (
+            "manual_range_is_meaningfully_different_from_common_window",
+            int(compare_txt_details.get("valid_points", 0)) != int(full_reference["dual_ygas"]["details"].get("valid_points", 0)),
+            {
+                "manual_valid_points": compare_txt_details.get("valid_points"),
+                "common_valid_points": full_reference["dual_ygas"]["details"].get("valid_points"),
+            },
+        ),
+        (
+            "active_time_range_status_and_diag_visible",
+            "single_device_compare_context_source=active_compare_ui" in single_status_text
+            and "single_device_compare_context_time_range_policy=" in single_status_text
+            and "single_device_compare_context_start=" in single_diag_text
+            and "single_device_compare_context_end=" in single_diag_text,
+            {
+                "single_status": single_status_text,
+                "single_diag": single_diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_active_time_range_sync_check]")
+    print(f"single_details={single_details}")
+    print(f"compare_txt_details={compare_txt_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_auto_bootstrap_fallback_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-auto-bootstrap-fallback-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        configure_auto_compare_context(app, ygas_path, dat_path)
+        app.selected_dat_var.set("")
+        app.select_paths_in_list([ygas_path], active_path=ygas_path)
+
+        payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        if len(payload["series_results"]) != 1:
+            raise ValueError("single-device auto-bootstrap fallback check expects exactly one series.")
+        single_series = payload["series_results"][0]
+        single_details = dict(single_series["details"])
+        app.plot_multi_spectral_results(
+            str(col_a),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+        compare_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+        compare_txt = compare_reference["dual_ygas"]
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "single_device_auto_bootstrap_fallback_tagged",
+            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
+            and str(single_details.get("single_device_compare_context_source")) == "auto_bootstrap_fallback"
+            and not bool(single_details.get("single_device_compare_context_matches_current_compare_ui")),
+            {"single_details": single_details},
+        ),
+        (
+            "single_device_auto_bootstrap_fallback_arrays_match_compare_txt",
+            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float))
+            and np.allclose(
+                np.asarray(single_series["density"], dtype=float),
+                np.asarray(compare_txt["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            ),
+            {
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(compare_txt["freq"]),
+            },
+        ),
+        (
+            "single_device_auto_bootstrap_fallback_status_visible",
+            "single_device_compare_context_source=auto_bootstrap_fallback" in single_status_text
+            and "当前 compare UI 状态不完整，单设备暂用 auto bootstrap 上下文" in single_status_text
+            and "single_device_compare_context_matches_current_compare_ui=false" in single_diag_text,
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+    ]
+
+    failed = False
+    print("[single_device_auto_bootstrap_fallback_check]")
+    print(f"single_details={single_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
         raise ValueError("single-device-default-reuse-enabled-check needs --ygas and --dat.")
@@ -5025,6 +5490,9 @@ def main() -> int:
             "single-device-mixed-selection-multi-txt-plus-dat-reuse-check",
             "single-device-only-dat-still-fallback-check",
             "single-device-default-reuse-enabled-check",
+            "single-device-active-dat-sync-check",
+            "single-device-active-time-range-sync-check",
+            "single-device-auto-bootstrap-fallback-check",
             "single-txt-compare-side-equivalence-check",
             "single-compare-style-preview-check",
             "single-vs-compare-point-display-contract-check",
@@ -5102,6 +5570,12 @@ def main() -> int:
             return run_single_device_only_dat_still_fallback_check_mode(args)
         if mode == "single-device-default-reuse-enabled-check":
             return run_single_device_default_reuse_enabled_check_mode(args)
+        if mode == "single-device-active-dat-sync-check":
+            return run_single_device_active_dat_sync_check_mode(args)
+        if mode == "single-device-active-time-range-sync-check":
+            return run_single_device_active_time_range_sync_check_mode(args)
+        if mode == "single-device-auto-bootstrap-fallback-check":
+            return run_single_device_auto_bootstrap_fallback_check_mode(args)
         if mode == "single-txt-compare-side-equivalence-check":
             return run_single_txt_compare_side_equivalence_check_mode(args)
         if mode == "single-compare-style-preview-check":

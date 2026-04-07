@@ -337,6 +337,20 @@ def build_single_device_execution_items(details: dict[str, Any], *, include_plot
         ),
         include_plot_execution_path=include_plot_execution_path,
     )
+    for key in (
+        "single_device_compare_context_source",
+        "single_device_compare_context_dat_file_name",
+        "single_device_compare_context_time_range_policy",
+    ):
+        value = details.get(key)
+        if value is not None and value != "":
+            items.append(f"{key}={value}")
+    for key in (
+        "single_device_compare_context_matches_current_compare_ui",
+        "single_device_compare_context_dat_matches_selected_dat",
+    ):
+        if key in details:
+            items.append(f"{key}={'true' if bool(details.get(key)) else 'false'}")
     if "single_device_selection_filtered_to_txt_side" in details:
         filtered_value = bool(details.get("single_device_selection_filtered_to_txt_side"))
         items.append(f"single_device_selection_filtered_to_txt_side={'true' if filtered_value else 'false'}")
@@ -2199,6 +2213,64 @@ class FileViewerApp:
             "auto_compare_context_txt_count": int(self.auto_compare_context_txt_count or len(selected_ygas_paths)),
         }
 
+    def resolve_selected_dat_path_from_current_compare_ui(self) -> tuple[Path | None, str]:
+        selected_dat_label = self.selected_dat_var.get().strip()
+        if selected_dat_label:
+            dat_path = self.auto_dat_options.get(selected_dat_label)
+            if dat_path is not None:
+                return Path(dat_path), "selected_dat_var"
+
+        selection_info = self.extract_single_device_txt_selection(self.get_selected_file_paths())
+        selected_dat_paths = list(selection_info["selected_dat_paths"])
+        if selected_dat_paths:
+            return Path(selected_dat_paths[0]), "selected_file_selection"
+
+        return None, ""
+
+    def build_compare_context_from_current_ui_state(self) -> dict[str, Any] | None:
+        selection_info = self.extract_single_device_txt_selection(self.get_selected_file_paths())
+        selected_txt_paths = [Path(path) for path in selection_info["selected_txt_paths"]]
+        selected_dat_paths = [Path(path) for path in selection_info["selected_dat_paths"]]
+
+        dat_path, dat_resolution = self.resolve_selected_dat_path_from_current_compare_ui()
+        if dat_path is None:
+            return None
+
+        compare_txt_paths = list(selected_txt_paths)
+        if not compare_txt_paths and self.auto_prepare_payload is not None:
+            try:
+                auto_selection = self.build_auto_selection_for_dat(self.auto_prepare_payload, Path(dat_path))
+            except Exception:
+                auto_selection = None
+            if auto_selection is not None:
+                compare_txt_paths = [Path(path) for path in auto_selection.get("selected_ygas_paths", [])]
+
+        if not compare_txt_paths:
+            return None
+
+        selected_dat_label = self.selected_dat_var.get().strip()
+        selected_dat_from_label = self.auto_dat_options.get(selected_dat_label) if selected_dat_label else None
+        selected_dat_reference = (
+            Path(selected_dat_from_label)
+            if selected_dat_from_label is not None
+            else (Path(selected_dat_paths[0]) if selected_dat_paths else None)
+        )
+        dat_matches_selected_dat = bool(
+            selected_dat_reference is not None and Path(dat_path).resolve() == Path(selected_dat_reference).resolve()
+        )
+
+        return {
+            "ygas_paths": compare_txt_paths,
+            "dat_path": Path(dat_path),
+            "selected_paths": [*compare_txt_paths, Path(dat_path)],
+            "compare_context_source": "active_compare_ui",
+            "compare_context_dat_resolution": str(dat_resolution or ""),
+            "compare_context_selected_dat_label": str(selected_dat_label or ""),
+            "compare_context_selected_dat_path": Path(selected_dat_reference) if selected_dat_reference is not None else None,
+            "compare_context_matches_current_compare_ui": True,
+            "compare_context_dat_matches_selected_dat": bool(dat_matches_selected_dat),
+        }
+
     def build_compare_side_candidate_contexts(self) -> list[dict[str, Any]]:
         candidate_contexts: list[dict[str, Any]] = []
         seen_keys: set[tuple[tuple[str, ...], str]] = set()
@@ -2225,23 +2297,27 @@ class FileViewerApp:
                 }
             )
 
+        active_context = self.build_compare_context_from_current_ui_state()
+        if active_context is not None:
+            append_context(active_context)
+
+        selected_dat_path, _selected_dat_source = self.resolve_selected_dat_path_from_current_compare_ui()
         auto_context = self.build_auto_compare_selection_snapshot()
         if auto_context is not None:
+            auto_dat_path = Path(auto_context["dat_path"])
+            auto_context = {
+                **auto_context,
+                "compare_context_source": "auto_bootstrap_fallback",
+                "compare_context_matches_current_compare_ui": False,
+                "compare_context_dat_matches_selected_dat": bool(
+                    selected_dat_path is not None and auto_dat_path.resolve() == Path(selected_dat_path).resolve()
+                ),
+            }
             append_context(auto_context)
-
-        ygas_paths, dat_path, _other = self.classify_selected_compare_files()
-        if dat_path is not None and ygas_paths:
-            append_context(
-                {
-                    "ygas_paths": list(ygas_paths),
-                    "dat_path": Path(dat_path),
-                    "selected_paths": [*ygas_paths, Path(dat_path)],
-                }
-            )
 
         return candidate_contexts
 
-    def resolve_txt_compare_side_equivalent_context(self, selection_paths: list[Path]) -> dict[str, Any]:
+    def resolve_active_compare_context(self, selection_paths: list[Path]) -> dict[str, Any]:
         normalized_selection = [Path(path) for path in selection_paths]
         if not normalized_selection:
             raise ValueError("当前没有选中的 txt/ygas 文件。")
@@ -2254,9 +2330,57 @@ class FileViewerApp:
         for context in candidate_contexts:
             ygas_keys = {str(Path(path).resolve()) for path in context.get("ygas_paths", [])}
             if selection_keys.issubset(ygas_keys):
-                return context
+                compare_selection = self.build_compare_selection_from_paths(
+                    [Path(path) for path in context["ygas_paths"]],
+                    Path(context["dat_path"]),
+                )
+                _merged_ygas, _txt_label, _parsed_dat, _dat_label, selection_meta = compare_selection
+                txt_summary = selection_meta.get("txt_summary")
+                dat_summary = selection_meta.get("dat_summary")
+                if txt_summary is None or dat_summary is None:
+                    raise ValueError("当前 compare 时间范围上下文不完整。")
+
+                strategy_label = self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"
+                try:
+                    start_dt, end_dt = self.resolve_compare_time_range_for_strategy(
+                        strategy_label,
+                        self.time_start_var.get().strip(),
+                        self.time_end_var.get().strip(),
+                        txt_summary,
+                        dat_summary,
+                    )
+                except Exception as exc:
+                    raise ValueError("当前 compare 时间范围无法解析。") from exc
+
+                compare_time_range_meta = core.build_compare_time_range_metadata(
+                    strategy_label=strategy_label,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    has_txt_dat_context=True,
+                    requested_start=start_dt,
+                    requested_end=end_dt,
+                    actual_start=start_dt,
+                    actual_end=end_dt,
+                )
+                return {
+                    **context,
+                    "compare_selection": compare_selection,
+                    "selection_meta": selection_meta,
+                    "txt_summary": txt_summary,
+                    "dat_summary": dat_summary,
+                    "start_dt": start_dt,
+                    "end_dt": end_dt,
+                    "compare_context_strategy_label": str(strategy_label),
+                    "compare_context_time_range_policy": str(compare_time_range_meta.get("time_range_policy") or ""),
+                    "compare_context_time_range_policy_label": str(
+                        compare_time_range_meta.get("time_range_policy_label") or strategy_label
+                    ),
+                }
 
         raise ValueError("当前选择的文件不属于 compare 的 txt/ygas 一侧。")
+
+    def resolve_txt_compare_side_equivalent_context(self, selection_paths: list[Path]) -> dict[str, Any]:
+        return self.resolve_active_compare_context(selection_paths)
 
     def resolve_single_compare_style_preview_context(self) -> dict[str, Any]:
         if self.current_data_source_kind != "file" or self.current_file is None:
@@ -2301,24 +2425,24 @@ class FileViewerApp:
         fs_ui: float | None = None,
         requested_nsegment: int | None = None,
         overlap_ratio: float | None = None,
+        compare_context_key_prefix: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         if not self.single_compare_style_preview_var.get():
             return None, "reuse_disabled_by_user"
 
         try:
-            context = self.resolve_txt_compare_side_equivalent_context(selection_paths)
+            context = self.resolve_active_compare_context(selection_paths)
         except ValueError as exc:
             message = str(exc)
             if "dat / compare" in message:
                 return None, "no_compare_dat_context"
             if "txt/ygas 一侧" in message:
                 return None, "selection_not_txt_side"
+            if "时间范围" in message:
+                return None, "compare_time_range_unresolved"
             return None, "compare_context_unavailable"
 
-        compare_selection = self.build_compare_selection_from_paths(
-            list(context["ygas_paths"]),
-            Path(context["dat_path"]),
-        )
+        compare_selection = context["compare_selection"]
         merged_ygas, txt_label, _parsed_dat, dat_label, selection_meta = compare_selection
         valid_txt_columns = {str(column) for column in merged_ygas.dataframe.columns}
         if selected_column not in valid_txt_columns:
@@ -2329,10 +2453,8 @@ class FileViewerApp:
         if txt_summary is None or dat_summary is None:
             return None, "compare_time_range_context_missing"
 
-        try:
-            start_dt, end_dt = self.resolve_compare_time_range(txt_summary, dat_summary)
-        except Exception:
-            return None, "compare_time_range_unresolved"
+        start_dt = context.get("start_dt")
+        end_dt = context.get("end_dt")
 
         if fs_ui is None or requested_nsegment is None or overlap_ratio is None:
             fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
@@ -2349,7 +2471,11 @@ class FileViewerApp:
         details = dict(payload["details"])
         details.update(
             core.build_compare_time_range_metadata(
-                strategy_label=str(self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"),
+                strategy_label=str(
+                    context.get("compare_context_strategy_label")
+                    or self.time_range_strategy_var.get().strip()
+                    or "使用 txt+dat 共同时间范围"
+                ),
                 start_dt=start_dt,
                 end_dt=end_dt,
                 has_txt_dat_context=True,
@@ -2384,6 +2510,20 @@ class FileViewerApp:
         details["raw_source_rows"] = int(txt_summary.get("raw_rows", merged_ygas.source_row_count or len(merged_ygas.dataframe)))
         details["merged_rows"] = int(txt_summary.get("total_points", len(merged_ygas.dataframe)))
         details["rendered_point_count"] = int(len(payload["freq"]))
+        if compare_context_key_prefix:
+            details[f"{compare_context_key_prefix}_source"] = str(context.get("compare_context_source") or "")
+            details[f"{compare_context_key_prefix}_dat_file_name"] = str(Path(context["dat_path"]).name)
+            details[f"{compare_context_key_prefix}_time_range_policy"] = str(
+                context.get("compare_context_time_range_policy") or details.get("time_range_policy") or ""
+            )
+            details[f"{compare_context_key_prefix}_start"] = start_dt
+            details[f"{compare_context_key_prefix}_end"] = end_dt
+            details[f"{compare_context_key_prefix}_matches_current_compare_ui"] = bool(
+                context.get("compare_context_matches_current_compare_ui")
+            )
+            details[f"{compare_context_key_prefix}_dat_matches_selected_dat"] = bool(
+                context.get("compare_context_dat_matches_selected_dat")
+            )
         return {
             "freq": np.asarray(payload["freq"], dtype=float),
             "density": np.asarray(payload["density"], dtype=float),
@@ -2408,6 +2548,7 @@ class FileViewerApp:
             execution_path_value="compare_side_equivalent",
             selection_scope_key="single_txt_selection_scope",
             time_range_policy_key="single_txt_time_range_policy",
+            compare_context_key_prefix="single_txt_compare_context",
         )
         return payload
 
@@ -2436,6 +2577,7 @@ class FileViewerApp:
             fs_ui=fs,
             requested_nsegment=requested_nsegment,
             overlap_ratio=overlap_ratio,
+            compare_context_key_prefix="single_device_compare_context",
         )
         if payload is None:
             return None, fallback_reason
@@ -8638,6 +8780,16 @@ class FileViewerApp:
                 f"frequency_point_count={first_details.get('frequency_point_count')}",
                 f"rendered_point_count={first_details.get('rendered_point_count', len(series_results[0]['freq']))}",
                 *build_single_device_execution_items(first_details, include_plot_execution_path=True),
+                *(
+                    [f"single_device_compare_context_start={first_details.get('single_device_compare_context_start')}"]
+                    if "single_device_compare_context_start" in first_details
+                    else []
+                ),
+                *(
+                    [f"single_device_compare_context_end={first_details.get('single_device_compare_context_end')}"]
+                    if "single_device_compare_context_end" in first_details
+                    else []
+                ),
                 *core.build_time_range_diagnostic_items(first_details),
                 *group_items,
                 *series_items,
@@ -8659,6 +8811,13 @@ class FileViewerApp:
             status += f" | 已跳过 {len(skipped_files)} 个文件：{preview}"
         if bool(first_details.get("single_device_selection_filtered_to_txt_side")):
             status += " | 当前 selection 包含 dat，已自动忽略 dat 并按 txt-side 复用"
+        if str(first_details.get("single_device_compare_context_source") or "") == "auto_bootstrap_fallback":
+            status += " | 当前 compare UI 状态不完整，单设备暂用 auto bootstrap 上下文"
+        if (
+            "single_device_compare_context_dat_matches_selected_dat" in first_details
+            and not bool(first_details.get("single_device_compare_context_dat_matches_selected_dat"))
+        ):
+            status += " | 警告：单设备复用的 dat 与当前 compare 页 dat 不一致"
         if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "no_compare_dat_context":
             status += " | 当前没有建立 compare 上下文，已回退旧单设备路径"
         if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "selection_not_txt_side":
