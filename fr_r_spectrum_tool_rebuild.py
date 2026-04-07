@@ -331,9 +331,15 @@ def build_single_device_execution_items(details: dict[str, Any], *, include_plot
             "single_device_selection_scope",
             "single_device_time_range_policy",
             "single_device_compare_side_fallback_reason",
+            "selected_file_count",
+            "selected_txt_file_count",
+            "selected_dat_file_count",
         ),
         include_plot_execution_path=include_plot_execution_path,
     )
+    if "single_device_selection_filtered_to_txt_side" in details:
+        filtered_value = bool(details.get("single_device_selection_filtered_to_txt_side"))
+        items.append(f"single_device_selection_filtered_to_txt_side={'true' if filtered_value else 'false'}")
     items.extend(build_auto_compare_context_items(details))
     return items
 
@@ -1640,24 +1646,43 @@ class FileViewerApp:
         return core.load_and_merge_ygas_files(paths)
 
     def classify_selected_compare_files(self) -> tuple[list[Path], Path | None, list[Path]]:
-        selected_files = self.get_selected_file_paths()
-        ygas_paths: list[Path] = []
-        dat_path: Path | None = None
+        selection_info = self.extract_single_device_txt_selection(self.get_selected_file_paths())
+        ygas_paths = list(selection_info["selected_txt_paths"])
+        dat_paths = list(selection_info["selected_dat_paths"])
+        other_paths = list(selection_info["other_paths"])
+        dat_path = dat_paths[0] if dat_paths else None
+        if len(dat_paths) > 1:
+            other_paths.extend(dat_paths[1:])
+        return ygas_paths, dat_path, other_paths
+
+    def extract_single_device_txt_selection(self, selected_files: list[Path]) -> dict[str, Any]:
+        normalized_selection = [Path(path) for path in selected_files]
+        selected_txt_paths: list[Path] = []
+        selected_dat_paths: list[Path] = []
         other_paths: list[Path] = []
 
-        for path in selected_files:
+        for path in normalized_selection:
             profile = detect_file_profile(path, read_preview_lines(path))
-            if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"} or path.suffix.lower() in {".txt", ".log"}:
-                ygas_paths.append(path)
+            if profile in {"YGAS_MODE1_15", "YGAS_MODE1_16"} or path.suffix.lower() in TEXT_LIKE_SUFFIXES:
+                selected_txt_paths.append(path)
             elif profile == "TOA5_DAT" or path.suffix.lower() == ".dat":
-                if dat_path is None:
-                    dat_path = path
-                else:
-                    other_paths.append(path)
+                selected_dat_paths.append(path)
             else:
                 other_paths.append(path)
 
-        return ygas_paths, dat_path, other_paths
+        return {
+            "selected_paths": normalized_selection,
+            "selected_txt_paths": selected_txt_paths,
+            "selected_dat_paths": selected_dat_paths,
+            "other_paths": other_paths,
+            "selected_file_count": int(len(normalized_selection)),
+            "selected_txt_file_count": int(len(selected_txt_paths)),
+            "selected_dat_file_count": int(len(selected_dat_paths)),
+            "selected_other_file_count": int(len(other_paths)),
+            "single_device_selection_filtered_to_txt_side": bool(
+                selected_txt_paths and (selected_dat_paths or other_paths)
+            ),
+        }
 
     def ensure_legacy_target_selection_valid(
         self,
@@ -2388,15 +2413,19 @@ class FileViewerApp:
 
     def build_single_device_txt_compare_equivalent_payload(
         self,
-        selected_files: list[Path],
+        selected_txt_files: list[Path],
         *,
         target_column: str,
         fs: float,
         requested_nsegment: int,
         overlap_ratio: float,
+        selection_summary: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
+        if not selected_txt_files:
+            return None, "selection_not_txt_side"
+
         payload, fallback_reason = self.build_txt_compare_side_equivalent_payload(
-            selection_paths=selected_files,
+            selection_paths=selected_txt_files,
             selected_column=target_column,
             execution_context="single_device_compare_txt_side_equivalent",
             plot_execution_path="single_device_compare_txt_side_equivalent",
@@ -2412,6 +2441,7 @@ class FileViewerApp:
             return None, fallback_reason
 
         context = dict(payload.get("context") or {})
+        selection_summary = dict(selection_summary or self.extract_single_device_txt_selection(selected_txt_files))
         source_paths = [Path(path) for path in context.get("ygas_paths", [])]
         device_label = str(payload.get("txt_label") or "compare txt 侧")
         device_id = "compare_txt_side"
@@ -2426,6 +2456,14 @@ class FileViewerApp:
         details["device_group_merge_strategy"] = "compare_txt_side_equivalent"
         details["source_paths"] = [str(path) for path in source_paths]
         details["selection_merge_scope"] = "merged_ygas_compare_scope"
+        details["selected_file_count"] = int(selection_summary.get("selected_file_count", len(selected_txt_files)))
+        details["selected_txt_file_count"] = int(
+            selection_summary.get("selected_txt_file_count", len(selected_txt_files))
+        )
+        details["selected_dat_file_count"] = int(selection_summary.get("selected_dat_file_count", 0))
+        details["single_device_selection_filtered_to_txt_side"] = bool(
+            selection_summary.get("single_device_selection_filtered_to_txt_side", False)
+        )
 
         series_result = {
             "label": device_label,
@@ -2457,7 +2495,7 @@ class FileViewerApp:
                 }
             ],
             "device_count": 1,
-            "file_count": file_count,
+            "file_count": int(selection_summary.get("selected_file_count", file_count)),
             "start_dt": payload.get("start_dt"),
             "end_dt": payload.get("end_dt"),
         }, None
@@ -2904,14 +2942,25 @@ class FileViewerApp:
         end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
-        self.ensure_auto_compare_context_for_selection(selected_files, source="single_device_button_bootstrap")
-        compare_side_payload, compare_side_fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
-            selected_files,
-            target_column=target_column,
-            fs=fs,
-            requested_nsegment=requested_nsegment,
-            overlap_ratio=overlap_ratio,
-        )
+        selection_summary = self.extract_single_device_txt_selection(selected_files)
+        selected_txt_paths = list(selection_summary["selected_txt_paths"])
+        compare_context_paths = selected_txt_paths or [Path(path) for path in selected_files]
+        if compare_context_paths:
+            self.ensure_auto_compare_context_for_selection(compare_context_paths, source="single_device_button_bootstrap")
+
+        compare_side_payload: dict[str, Any] | None = None
+        compare_side_fallback_reason: str | None = None
+        if selected_txt_paths:
+            compare_side_payload, compare_side_fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
+                selected_txt_paths,
+                target_column=target_column,
+                fs=fs,
+                requested_nsegment=requested_nsegment,
+                overlap_ratio=overlap_ratio,
+                selection_summary=selection_summary,
+            )
+        else:
+            compare_side_fallback_reason = "selection_not_txt_side"
         if compare_side_payload is not None:
             return compare_side_payload
 
@@ -3000,6 +3049,12 @@ class FileViewerApp:
             single_details["auto_compare_context_source"] = str(self.auto_compare_context_source or "")
             single_details["auto_compare_context_dat_file_name"] = str(self.auto_compare_context_dat_file_name or "")
             single_details["auto_compare_context_txt_count"] = int(self.auto_compare_context_txt_count or 0)
+            single_details["selected_file_count"] = int(selection_summary.get("selected_file_count", len(selected_files)))
+            single_details["selected_txt_file_count"] = int(selection_summary.get("selected_txt_file_count", 0))
+            single_details["selected_dat_file_count"] = int(selection_summary.get("selected_dat_file_count", 0))
+            single_details["single_device_selection_filtered_to_txt_side"] = bool(
+                selection_summary.get("single_device_selection_filtered_to_txt_side", False)
+            )
             if compare_side_fallback_reason:
                 single_details["single_device_compare_side_fallback_reason"] = compare_side_fallback_reason
 
@@ -8567,6 +8622,9 @@ class FileViewerApp:
             batch_skips=len(skipped_files),
             extra_items=[
                 f"选中文件数={file_count}",
+                f"selected_file_count={first_details.get('selected_file_count', file_count)}",
+                f"selected_txt_file_count={first_details.get('selected_txt_file_count', 0)}",
+                f"selected_dat_file_count={first_details.get('selected_dat_file_count', 0)}",
                 f"识别设备数={device_count}",
                 *build_series_point_count_items(point_count_contract),
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
@@ -8599,8 +8657,12 @@ class FileViewerApp:
             if len(skipped_files) > 3:
                 preview += " 等"
             status += f" | 已跳过 {len(skipped_files)} 个文件：{preview}"
+        if bool(first_details.get("single_device_selection_filtered_to_txt_side")):
+            status += " | 当前 selection 包含 dat，已自动忽略 dat 并按 txt-side 复用"
         if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "no_compare_dat_context":
             status += " | 当前没有建立 compare 上下文，已回退旧单设备路径"
+        if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "selection_not_txt_side":
+            status += " | 当前 selection 不属于 txt/ygas 一侧，已回退旧单设备路径"
         self.status_var.set(status)
 
     def perform_multi_spectral_compare(self) -> None:

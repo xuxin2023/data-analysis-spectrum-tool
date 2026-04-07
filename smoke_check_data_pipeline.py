@@ -70,6 +70,70 @@ def get_export_plot_execution_path(app: object) -> str:
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
 
 
+def prepare_compare_txt_side_reference(
+    app: object,
+    *,
+    ygas_paths: list[Path],
+    dat_path: Path,
+    col_a: str,
+    col_b: str,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    compare_mode = "时间段内 PSD 对比"
+    dual_base = app.prepare_dual_compare_payload(
+        ygas_paths=ygas_paths,
+        dat_path=dat_path,
+        selected_paths=[*ygas_paths, dat_path],
+        compare_mode=compare_mode,
+        start_dt=None,
+        end_dt=None,
+    )
+    selection_meta = dict(dual_base["selection_meta"])
+    if selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None:
+        start_dt, end_dt = app.resolve_compare_time_range(selection_meta["txt_summary"], selection_meta["dat_summary"])
+    else:
+        start_dt, end_dt = None, None
+    dual_plot_payload = app.prepare_dual_plot_payload(
+        parsed_a=dual_base["parsed_a"],
+        label_a=str(dual_base["label_a"]),
+        parsed_b=dual_base["parsed_b"],
+        label_b=str(dual_base["label_b"]),
+        pairs=[{"a_col": str(col_a), "b_col": str(col_b), "label": f"{col_a} vs {col_b}"}],
+        selection_meta=selection_meta,
+        compare_mode=compare_mode,
+        compare_scope="单对单",
+        start_dt=start_dt,
+        end_dt=end_dt,
+        mapping_name=str(args.element),
+        scheme_name="smoke",
+        alignment_strategy=app.get_alignment_strategy(compare_mode),
+        plot_style=app.resolve_plot_style(compare_mode),
+        plot_layout=app.resolve_plot_layout(compare_mode),
+        fs_ui=args.fs,
+        requested_nsegment=args.nsegment,
+        overlap_ratio=args.overlap_ratio,
+        match_tolerance=0.2,
+        spectrum_type=core.CROSS_SPECTRUM_MAGNITUDE,
+        time_range_context={
+            "strategy_label": app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            "has_txt_dat_context": bool(
+                selection_meta.get("txt_summary") is not None and selection_meta.get("dat_summary") is not None
+            ),
+        },
+    )
+    dual_ygas = next(
+        item for item in dual_plot_payload["series_results"] if str(item["side"]) == "txt" and str(item["column"]) == str(col_a)
+    )
+    return {
+        "dual_base": dual_base,
+        "selection_meta": selection_meta,
+        "start_dt": start_dt,
+        "end_dt": end_dt,
+        "dual_plot_payload": dual_plot_payload,
+        "dual_ygas": dual_ygas,
+    }
+
+
 def simulate_single_file_open(app: object, source_path: Path) -> None:
     if hasattr(app, "reset_auto_compare_context"):
         app.reset_auto_compare_context()
@@ -412,6 +476,39 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-device-txt-compare-side-equivalence-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_mixed_selection_txt_dat_reuse",
+            run_single_device_mixed_selection_txt_dat_reuse_check_mode,
+            clone_args(
+                args,
+                mode="single-device-mixed-selection-txt-dat-reuse-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_mixed_selection_multi_txt_plus_dat_reuse",
+            run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode,
+            clone_args(
+                args,
+                mode="single-device-mixed-selection-multi-txt-plus-dat-reuse-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_device_only_dat_still_fallback",
+            run_single_device_only_dat_still_fallback_check_mode,
+            clone_args(
+                args,
+                mode="single-device-only-dat-still-fallback-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -2871,6 +2968,425 @@ def run_single_device_txt_compare_side_equivalence_check_mode(args: argparse.Nam
     return 1 if failed else 0
 
 
+def run_single_device_mixed_selection_txt_dat_reuse_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-mixed-selection-txt-dat-reuse-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_path)
+    parsed_b = parse_supported_file(dat_path)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        simulate_single_file_open(app, ygas_path)
+        if not app.select_paths_in_list([ygas_path, dat_path], active_path=ygas_path):
+            raise ValueError("Failed to create mixed txt+dat file selection in the current list.")
+
+        payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path, dat_path],
+            str(col_a),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        if len(payload["series_results"]) != 1:
+            raise ValueError("single-device mixed txt+dat reuse check expects exactly one single-device series.")
+        single_series = payload["series_results"][0]
+        single_details = dict(single_series["details"])
+        app.plot_multi_spectral_results(
+            str(col_a),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+        single_contract = dict(app.current_point_count_contract)
+        compare_reference = prepare_compare_txt_side_reference(
+            app,
+            ygas_paths=[ygas_path],
+            dat_path=dat_path,
+            col_a=str(col_a),
+            col_b=str(col_b),
+            args=args,
+        )
+    finally:
+        root.destroy()
+
+    compare_txt = compare_reference["dual_ygas"]
+    compare_txt_details = dict(compare_txt["details"])
+    checks = [
+        (
+            "mixed_selection_reuses_compare_txt_side",
+            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent"
+            and str(single_details.get("plot_execution_path")) == "single_device_compare_txt_side_equivalent",
+            {"single_details": single_details},
+        ),
+        (
+            "mixed_selection_does_not_report_fallback",
+            not str(single_details.get("single_device_compare_side_fallback_reason") or ""),
+            {"single_device_compare_side_fallback_reason": single_details.get("single_device_compare_side_fallback_reason")},
+        ),
+        (
+            "mixed_selection_counts_visible",
+            int(single_details.get("selected_file_count", 0)) == 2
+            and int(single_details.get("selected_txt_file_count", 0)) == 1
+            and int(single_details.get("selected_dat_file_count", 0)) == 1
+            and bool(single_details.get("single_device_selection_filtered_to_txt_side")),
+            {"single_details": single_details},
+        ),
+        (
+            "mixed_selection_status_and_diag_show_txt_filtering",
+            "single_device_selection_filtered_to_txt_side=true" in single_status_text
+            and "selected_file_count=2" in single_diag_text
+            and "selected_txt_file_count=1" in single_diag_text
+            and "selected_dat_file_count=1" in single_diag_text,
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+        (
+            "mixed_selection_valid_points_equal_compare_txt",
+            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
+            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
+        ),
+        (
+            "mixed_selection_nperseg_equal_compare_txt",
+            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
+            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
+        ),
+        (
+            "mixed_selection_valid_freq_points_equal_compare_txt",
+            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
+            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
+        ),
+        (
+            "mixed_selection_frequency_point_count_equal_compare_txt",
+            int(single_details.get("frequency_point_count", 0)) == int(compare_txt_details.get("frequency_point_count", 0)),
+            {
+                "single_frequency_point_count": single_details.get("frequency_point_count"),
+                "compare_frequency_point_count": compare_txt_details.get("frequency_point_count"),
+            },
+        ),
+        (
+            "mixed_selection_freq_equal_compare_txt",
+            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float)),
+            {"single_points": len(single_series["freq"]), "compare_points": len(compare_txt["freq"])},
+        ),
+        (
+            "mixed_selection_density_allclose_compare_txt",
+            np.allclose(
+                np.asarray(single_series["density"], dtype=float),
+                np.asarray(compare_txt["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            ),
+            {
+                "single_first5": np.asarray(single_series["density"], dtype=float)[:5].tolist(),
+                "compare_first5": np.asarray(compare_txt["density"], dtype=float)[:5].tolist(),
+            },
+        ),
+        (
+            "mixed_selection_rendered_point_count_equal_compare_txt",
+            int(single_details.get("rendered_point_count", 0)) == int(len(compare_txt["freq"]))
+            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(compare_txt["freq"])),
+            {
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(compare_txt["freq"]),
+                "single_contract": single_contract,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_mixed_selection_txt_dat_reuse_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"column_a={col_a}")
+    print(f"column_b={col_b}")
+    print(f"single_details={single_details}")
+    print(f"compare_txt_details={compare_txt_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-mixed-selection-multi-txt-plus-dat-reuse-check needs --ygas and --dat.")
+
+    ygas_source = Path(args.ygas[0])
+    dat_source = Path(args.dat)
+    parsed_a = parse_supported_file(ygas_source)
+    parsed_b = parse_supported_file(dat_source)
+    col_a = choose_single_column(parsed_a, args.element, "A")
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_a or not col_b:
+        raise ValueError("Unable to resolve matching columns for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    with tempfile.TemporaryDirectory(prefix="single_device_mixed_multi_txt_") as temp_dir:
+        temp_root = Path(temp_dir)
+        ygas_path_a = temp_root / "partA_sensorx.log"
+        ygas_path_b = temp_root / "partB_sensorx.log"
+        dat_path = temp_root / dat_source.name
+        shutil.copy2(ygas_source, ygas_path_a)
+        shutil.copy2(ygas_source, ygas_path_b)
+        shutil.copy2(dat_source, dat_path)
+
+        root = tk.Tk()
+        root.withdraw()
+        app = app_mod.FileViewerApp(root)
+        try:
+            app.refresh_canvas = lambda *args, **kwargs: None
+            app.element_preset_var.set(str(args.element or "H2O"))
+            app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+            simulate_single_file_open(app, ygas_path_a)
+            selected_paths = [ygas_path_a, ygas_path_b, dat_path]
+            if not app.select_paths_in_list(selected_paths, active_path=ygas_path_a):
+                raise ValueError("Failed to create mixed multi-txt + dat selection in the current list.")
+
+            payload = app.prepare_multi_spectral_compare_payload(
+                selected_paths,
+                str(col_a),
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            if len(payload["series_results"]) != 1:
+                raise ValueError("single-device mixed multi-txt + dat reuse check expects exactly one series.")
+            single_series = payload["series_results"][0]
+            single_details = dict(single_series["details"])
+            app.plot_multi_spectral_results(
+                str(col_a),
+                list(payload["series_results"]),
+                list(payload["skipped_files"]),
+                payload=payload,
+            )
+            single_status_text = app.status_var.get()
+            single_diag_text = app.diagnostic_var.get()
+            single_contract = dict(app.current_point_count_contract)
+            compare_reference = prepare_compare_txt_side_reference(
+                app,
+                ygas_paths=[ygas_path_a, ygas_path_b],
+                dat_path=dat_path,
+                col_a=str(col_a),
+                col_b=str(col_b),
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    compare_txt = compare_reference["dual_ygas"]
+    compare_txt_details = dict(compare_txt["details"])
+    checks = [
+        (
+            "mixed_multi_txt_reuses_compare_txt_side",
+            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
+            {"single_details": single_details},
+        ),
+        (
+            "mixed_multi_txt_counts_visible",
+            int(single_details.get("selected_file_count", 0)) == 3
+            and int(single_details.get("selected_txt_file_count", 0)) == 2
+            and int(single_details.get("selected_dat_file_count", 0)) == 1
+            and bool(single_details.get("single_device_selection_filtered_to_txt_side"))
+            and int(single_details.get("compare_txt_file_count", 0)) == 2,
+            {"single_details": single_details},
+        ),
+        (
+            "mixed_multi_txt_status_and_diag_show_txt_filtering",
+            "single_device_selection_filtered_to_txt_side=true" in single_status_text
+            and "selected_txt_file_count=2" in single_diag_text
+            and "selected_dat_file_count=1" in single_diag_text,
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+        (
+            "mixed_multi_txt_valid_points_equal_compare_txt",
+            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
+            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
+        ),
+        (
+            "mixed_multi_txt_nperseg_equal_compare_txt",
+            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
+            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
+        ),
+        (
+            "mixed_multi_txt_valid_freq_points_equal_compare_txt",
+            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
+            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
+        ),
+        (
+            "mixed_multi_txt_frequency_point_count_equal_compare_txt",
+            int(single_details.get("frequency_point_count", 0)) == int(compare_txt_details.get("frequency_point_count", 0)),
+            {
+                "single_frequency_point_count": single_details.get("frequency_point_count"),
+                "compare_frequency_point_count": compare_txt_details.get("frequency_point_count"),
+            },
+        ),
+        (
+            "mixed_multi_txt_freq_equal_compare_txt",
+            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float)),
+            {"single_points": len(single_series["freq"]), "compare_points": len(compare_txt["freq"])},
+        ),
+        (
+            "mixed_multi_txt_density_allclose_compare_txt",
+            np.allclose(
+                np.asarray(single_series["density"], dtype=float),
+                np.asarray(compare_txt["density"], dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+            ),
+            {
+                "single_first5": np.asarray(single_series["density"], dtype=float)[:5].tolist(),
+                "compare_first5": np.asarray(compare_txt["density"], dtype=float)[:5].tolist(),
+            },
+        ),
+        (
+            "mixed_multi_txt_rendered_point_count_equal_compare_txt",
+            int(single_details.get("rendered_point_count", 0)) == int(len(compare_txt["freq"]))
+            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(compare_txt["freq"])),
+            {
+                "single_rendered_point_count": single_details.get("rendered_point_count"),
+                "compare_rendered_point_count": len(compare_txt["freq"]),
+                "single_contract": single_contract,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_device_mixed_selection_multi_txt_plus_dat_reuse_check]")
+    print(f"single_details={single_details}")
+    print(f"compare_txt_details={compare_txt_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_device_only_dat_still_fallback_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("single-device-only-dat-still-fallback-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed_b = parse_supported_file(dat_path)
+    col_b = choose_single_column(parsed_b, args.element, "B")
+    if not col_b:
+        raise ValueError("Unable to resolve matching dat column for the requested element.")
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    try:
+        app.refresh_canvas = lambda *args, **kwargs: None
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+        simulate_single_file_open(app, ygas_path)
+        if not app.select_paths_in_list([dat_path], active_path=dat_path):
+            raise ValueError("Failed to create only-dat selection in the current list.")
+
+        payload = app.prepare_multi_spectral_compare_payload(
+            [dat_path],
+            str(col_b),
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        if len(payload["series_results"]) != 1:
+            raise ValueError("single-device only-dat fallback check expects exactly one series.")
+        single_details = dict(payload["series_results"][0]["details"])
+        app.plot_multi_spectral_results(
+            str(col_b),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
+        single_status_text = app.status_var.get()
+        single_diag_text = app.diagnostic_var.get()
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "only_dat_still_uses_legacy_path",
+            str(single_details.get("single_device_execution_path")) == "legacy_device_group_scope"
+            and str(single_details.get("single_device_compare_side_fallback_reason")) == "selection_not_txt_side",
+            {"single_details": single_details},
+        ),
+        (
+            "only_dat_selection_counts_visible",
+            int(single_details.get("selected_file_count", 0)) == 1
+            and int(single_details.get("selected_txt_file_count", 0)) == 0
+            and int(single_details.get("selected_dat_file_count", 0)) == 1
+            and not bool(single_details.get("single_device_selection_filtered_to_txt_side")),
+            {"single_details": single_details},
+        ),
+        (
+            "only_dat_status_and_diag_explain_fallback",
+            "single_device_compare_side_fallback_reason=selection_not_txt_side" in single_status_text
+            and "selected_txt_file_count=0" in single_diag_text
+            and "selected_dat_file_count=1" in single_diag_text
+            and "当前 selection 不属于 txt/ygas 一侧，已回退旧单设备路径" in single_status_text,
+            {"single_status": single_status_text, "single_diag": single_diag_text},
+        ),
+    ]
+
+    failed = False
+    print("[single_device_only_dat_still_fallback_check]")
+    print(f"dat_path={dat_path}")
+    print(f"column_b={col_b}")
+    print(f"single_details={single_details}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
         raise ValueError("single-device-default-reuse-enabled-check needs --ygas and --dat.")
@@ -4505,6 +5021,9 @@ def main() -> int:
             "single-file-open-auto-bootstrap-compare-context-check",
             "single-device-no-visible-change-regression-check",
             "single-device-txt-compare-side-equivalence-check",
+            "single-device-mixed-selection-txt-dat-reuse-check",
+            "single-device-mixed-selection-multi-txt-plus-dat-reuse-check",
+            "single-device-only-dat-still-fallback-check",
             "single-device-default-reuse-enabled-check",
             "single-txt-compare-side-equivalence-check",
             "single-compare-style-preview-check",
@@ -4575,6 +5094,12 @@ def main() -> int:
             return run_single_device_no_visible_change_regression_check_mode(args)
         if mode == "single-device-txt-compare-side-equivalence-check":
             return run_single_device_txt_compare_side_equivalence_check_mode(args)
+        if mode == "single-device-mixed-selection-txt-dat-reuse-check":
+            return run_single_device_mixed_selection_txt_dat_reuse_check_mode(args)
+        if mode == "single-device-mixed-selection-multi-txt-plus-dat-reuse-check":
+            return run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode(args)
+        if mode == "single-device-only-dat-still-fallback-check":
+            return run_single_device_only_dat_still_fallback_check_mode(args)
         if mode == "single-device-default-reuse-enabled-check":
             return run_single_device_default_reuse_enabled_check_mode(args)
         if mode == "single-txt-compare-side-equivalence-check":
