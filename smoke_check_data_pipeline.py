@@ -473,6 +473,71 @@ def capture_single_and_dual_target_spectrum_render_states(
     }
 
 
+def capture_single_file_open_and_dual_target_spectrum_render_states(
+    app: object,
+    *,
+    single_ygas_path: Path,
+    dat_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    import tkinter as tk
+
+    app.element_preset_var.set(str(args.element or "CO2"))
+    simulate_single_file_open(app, single_ygas_path)
+    parsed = parse_supported_file(single_ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve matching txt column for the requested element.")
+    app.column_vars = {str(target_column): tk.BooleanVar(master=app.root, value=True)}
+    run_background_tasks_inline(app)
+    app.generate_plot()
+    if not app.figure.axes:
+        raise ValueError("Single-file-open target-spectrum render did not produce a visible axis.")
+    single_axis_state = extract_axis_render_state(app.figure.axes[0])
+    single_status_text = app.status_var.get()
+    single_diag_text = app.diagnostic_var.get()
+    single_plot_kind = app.current_plot_kind
+    single_plot_style = app.current_plot_style_label
+    single_plot_layout = app.current_plot_layout_label
+    single_export_plot_execution_path = get_export_plot_execution_path(app)
+    single_export_render_semantics = get_export_metadata_value(app, "render_semantics")
+    single_target_metadata = dict(getattr(app, "current_target_plot_metadata", {}) or {})
+    single_visible_scope = str(
+        single_target_metadata.get("target_spectrum_visible_series_scope")
+        or get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+        or ""
+    )
+
+    dual_payload = prepare_target_spectrum_payload_for_smoke(
+        app,
+        ygas_paths=[single_ygas_path],
+        dat_path=dat_path,
+        args=args,
+    )
+    render_prepared_target_spectrum_payload(app, dual_payload)
+    if not app.figure.axes:
+        raise ValueError("Dual target-spectrum reference render did not produce a visible axis.")
+    dual_axis_state = extract_axis_render_state(app.figure.axes[0])
+
+    return {
+        "single_axis_state": single_axis_state,
+        "single_status_text": single_status_text,
+        "single_diag_text": single_diag_text,
+        "single_plot_kind": single_plot_kind,
+        "single_plot_style": single_plot_style,
+        "single_plot_layout": single_plot_layout,
+        "single_export_plot_execution_path": single_export_plot_execution_path,
+        "single_export_render_semantics": single_export_render_semantics,
+        "single_visible_scope": single_visible_scope,
+        "dual_axis_state": dual_axis_state,
+        "dual_plot_kind": app.current_plot_kind,
+        "dual_plot_style": app.current_plot_style_label,
+        "dual_plot_layout": app.current_plot_layout_label,
+        "dual_export_plot_execution_path": get_export_plot_execution_path(app),
+        "dual_export_render_semantics": get_export_metadata_value(app, "render_semantics"),
+    }
+
+
 def simulate_single_file_open(app: object, source_path: Path) -> None:
     if hasattr(app, "reset_auto_compare_context"):
         app.reset_auto_compare_context()
@@ -870,6 +935,28 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-vs-dual-target-spectrum-style-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_file_open_target_spectrum_primary_visible",
+            run_single_file_open_target_spectrum_primary_visible_check_mode,
+            clone_args(
+                args,
+                mode="single-file-open-target-spectrum-primary-visible-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_file_open_vs_dual_target_spectrum_primary_subset",
+            run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode,
+            clone_args(
+                args,
+                mode="single-file-open-vs-dual-target-spectrum-primary-subset-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -5532,6 +5619,147 @@ def run_single_vs_dual_target_spectrum_style_check_mode(args: argparse.Namespace
     return 1 if failed else 0
 
 
+def run_single_file_open_target_spectrum_primary_visible_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_target_visible_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_file_open_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_path,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_open_direct_generate_uses_target_spectrum_renderer",
+            render_state["single_plot_kind"] == "target_spectrum"
+            and render_state["single_export_plot_execution_path"] == "target_spectrum_render"
+            and render_state["single_export_render_semantics"] == "target_spectrum_single_group",
+            {
+                "single_plot_kind": render_state["single_plot_kind"],
+                "single_export_plot_execution_path": render_state["single_export_plot_execution_path"],
+                "single_export_render_semantics": render_state["single_export_render_semantics"],
+            },
+        ),
+        (
+            "single_file_open_direct_generate_only_shows_primary_visible_series",
+            render_state["single_visible_scope"] == "ygas_only"
+            and len(render_state["single_axis_state"]["scatter_offsets"]) == 1
+            and "target_spectrum_visible_series_scope=ygas_only" in str(render_state["single_status_text"])
+            and "target_spectrum_visible_series_scope=ygas_only" in str(render_state["single_diag_text"]),
+            {
+                "single_visible_scope": render_state["single_visible_scope"],
+                "single_status_text": render_state["single_status_text"],
+                "single_diag_text": render_state["single_diag_text"],
+                "single_scatter_collection_count": len(render_state["single_axis_state"]["scatter_offsets"]),
+            },
+        ),
+        (
+            "single_file_open_direct_generate_keeps_target_title_semantics",
+            str(render_state["single_axis_state"]["title"]).startswith("时间序列谱分析 - "),
+            {"single_title": render_state["single_axis_state"]["title"]},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_target_spectrum_primary_visible_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_target_subset_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_file_open_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_path,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    single_offsets = list(render_state["single_axis_state"]["scatter_offsets"])
+    dual_offsets = list(render_state["dual_axis_state"]["scatter_offsets"])
+    single_lines = list(render_state["single_axis_state"]["reference_slope_lines"])
+    dual_lines = list(render_state["dual_axis_state"]["reference_slope_lines"])
+    same_reference_lines = len(single_lines) == len(dual_lines) and all(
+        str(single["label"]) == str(dual["label"])
+        and np.array_equal(np.asarray(single["x"], dtype=float), np.asarray(dual["x"], dtype=float))
+        and np.allclose(
+            np.asarray(single["y"], dtype=float),
+            np.asarray(dual["y"], dtype=float),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        for single, dual in zip(single_lines, dual_lines)
+    )
+
+    checks = [
+        (
+            "single_file_open_visible_blue_subset_matches_dual_target_spectrum_blue_series",
+            len(single_offsets) == 1
+            and len(dual_offsets) == 2
+            and np.array_equal(np.asarray(single_offsets[0], dtype=float), np.asarray(dual_offsets[0], dtype=float)),
+            {
+                "single_offsets": single_offsets,
+                "dual_offsets": dual_offsets,
+            },
+        ),
+        (
+            "single_file_open_target_spectrum_style_matches_dual_target_spectrum_style",
+            render_state["single_plot_kind"] == "target_spectrum"
+            and render_state["dual_plot_kind"] == "target_spectrum"
+            and str(render_state["single_plot_style"]) == str(render_state["dual_plot_style"])
+            and str(render_state["single_plot_layout"]) == str(render_state["dual_plot_layout"])
+            and str(render_state["single_axis_state"]["title"]) == str(render_state["dual_axis_state"]["title"]),
+            {
+                "single_plot_kind": render_state["single_plot_kind"],
+                "dual_plot_kind": render_state["dual_plot_kind"],
+                "single_plot_style": render_state["single_plot_style"],
+                "dual_plot_style": render_state["dual_plot_style"],
+                "single_plot_layout": render_state["single_plot_layout"],
+                "dual_plot_layout": render_state["dual_plot_layout"],
+                "single_title": render_state["single_axis_state"]["title"],
+                "dual_title": render_state["dual_axis_state"]["title"],
+            },
+        ),
+        (
+            "single_file_open_target_spectrum_reference_line_matches_dual_target_spectrum_reference_line",
+            same_reference_lines,
+            {
+                "single_reference_slope_lines": single_lines,
+                "dual_reference_slope_lines": dual_lines,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_vs_dual_target_spectrum_primary_subset_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_fallback_still_legacy_render_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas:
         raise ValueError("single-device-fallback-still-legacy-render-check needs --ygas.")
@@ -7255,6 +7483,8 @@ def main() -> int:
             "single-device-vs-dual-compare-visible-scatter-subset-check",
             "single-vs-dual-target-spectrum-visible-subset-check",
             "single-vs-dual-target-spectrum-style-check",
+            "single-file-open-target-spectrum-primary-visible-check",
+            "single-file-open-vs-dual-target-spectrum-primary-subset-check",
             "single-device-fallback-still-legacy-render-check",
             "single-device-active-dat-sync-check",
             "single-device-active-time-range-sync-check",
@@ -7372,6 +7602,10 @@ def main() -> int:
             return run_single_vs_dual_target_spectrum_visible_subset_check_mode(args)
         if mode == "single-vs-dual-target-spectrum-style-check":
             return run_single_vs_dual_target_spectrum_style_check_mode(args)
+        if mode == "single-file-open-target-spectrum-primary-visible-check":
+            return run_single_file_open_target_spectrum_primary_visible_check_mode(args)
+        if mode == "single-file-open-vs-dual-target-spectrum-primary-subset-check":
+            return run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode(args)
         if mode == "single-device-fallback-still-legacy-render-check":
             return run_single_device_fallback_still_legacy_render_check_mode(args)
         if mode == "single-device-active-dat-sync-check":

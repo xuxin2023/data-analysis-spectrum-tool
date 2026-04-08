@@ -3788,6 +3788,55 @@ class FileViewerApp:
             return "target_spectrum_dual_group"
         return "target_spectrum_multi_group"
 
+    def resolve_target_spectrum_visible_series_scope(
+        self,
+        target_metadata: dict[str, Any],
+        *,
+        is_psd_mode: bool,
+    ) -> str:
+        if not is_psd_mode:
+            return "all_series"
+        selection_file_count = int(target_metadata.get("selection_file_count", 0) or 0)
+        selected_txt_file_count = int(target_metadata.get("selected_txt_file_count", 0) or 0)
+        selected_dat_file_count = int(target_metadata.get("selected_dat_file_count", 0) or 0)
+        if selection_file_count == 1 and selected_txt_file_count == 1 and selected_dat_file_count == 0:
+            return "ygas_only"
+        if selection_file_count == 1 and selected_dat_file_count == 1 and selected_txt_file_count == 0:
+            return "dat_only"
+        return "all_series"
+
+    def is_target_spectrum_series_visible(
+        self,
+        item: dict[str, Any],
+        *,
+        visible_series_scope: str,
+    ) -> bool:
+        if visible_series_scope == "all_series":
+            return True
+        device_kind = str(item.get("device_kind", "")).strip()
+        if visible_series_scope == "ygas_only":
+            return device_kind == "ygas"
+        if visible_series_scope == "dat_only":
+            return device_kind == "dat"
+        return True
+
+    def compute_positive_log_axis_limits(self, values: np.ndarray) -> tuple[float, float] | None:
+        value_array = np.asarray(values, dtype=float)
+        mask = np.isfinite(value_array) & (value_array > 0)
+        if not np.any(mask):
+            return None
+        positive_values = value_array[mask]
+        vmin = float(np.min(positive_values))
+        vmax = float(np.max(positive_values))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= 0:
+            return None
+        if math.isclose(vmin, vmax, rel_tol=1e-12, abs_tol=1e-18):
+            return vmin / 1.5, vmax * 1.5
+        log_min = float(np.log10(vmin))
+        log_max = float(np.log10(vmax))
+        padding = max((log_max - log_min) * 0.05, 0.05)
+        return 10 ** (log_min - padding), 10 ** (log_max + padding)
+
     def build_target_spectrum_dispatch_groups(
         self,
         target_metadata: dict[str, Any],
@@ -8799,6 +8848,10 @@ class FileViewerApp:
             if is_psd_mode
             else str(target_metadata.get("display_semantics") or series_results[0].get("details", {}).get("display_semantics") or "")
         )
+        visible_series_scope = self.resolve_target_spectrum_visible_series_scope(
+            target_metadata,
+            is_psd_mode=is_psd_mode,
+        )
 
         if is_psd_mode:
             series_results = sorted(
@@ -8829,8 +8882,11 @@ class FileViewerApp:
         ax = self.figure.add_subplot(111)
         ax.set_xscale("log")
 
+        visible_series_results: list[dict[str, Any]] = []
         combined_freq: list[np.ndarray] = []
         combined_values: list[np.ndarray] = []
+        reference_freq: list[np.ndarray] = []
+        reference_values: list[np.ndarray] = []
         point_summaries: list[str] = []
         aligned_frames: list[pd.DataFrame] = []
 
@@ -8856,6 +8912,10 @@ class FileViewerApp:
             values_plot = y_values[mask]
             if len(freq_plot) == 0:
                 continue
+            reference_freq.append(freq_plot)
+            reference_values.append(values_plot)
+            if not self.is_target_spectrum_series_visible(item, visible_series_scope=visible_series_scope):
+                continue
 
             self.apply_series_style(
                 ax,
@@ -8871,6 +8931,12 @@ class FileViewerApp:
                 line_style=str(style["linestyle"]),
                 zorder=float(style["zorder"]),
             )
+            visible_item = dict(item)
+            visible_details = dict(visible_item.get("details", {}))
+            visible_details["target_spectrum_visible_series_scope"] = visible_series_scope
+            visible_details["target_spectrum_visible_series_count"] = 0
+            visible_item["details"] = visible_details
+            visible_series_results.append(visible_item)
             combined_freq.append(freq_plot)
             combined_values.append(values_plot)
             if is_psd_mode:
@@ -8891,10 +8957,12 @@ class FileViewerApp:
 
         all_freq = np.concatenate(combined_freq)
         all_values = np.concatenate(combined_values)
+        reference_all_freq = np.concatenate(reference_freq) if reference_freq else all_freq
+        reference_all_values = np.concatenate(reference_values) if reference_values else all_values
         if is_psd_mode or display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or spectrum_type == CROSS_SPECTRUM_MAGNITUDE:
             ax.set_yscale("log")
         else:
-            max_abs = float(np.nanmax(np.abs(all_values))) if len(all_values) else 0.0
+            max_abs = float(np.nanmax(np.abs(reference_all_values))) if len(reference_all_values) else 0.0
             linthresh = max(max_abs * 1e-3, 1e-12)
             ax.set_yscale("symlog", linthresh=linthresh)
             ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1.0, alpha=0.8, zorder=1)
@@ -8902,8 +8970,8 @@ class FileViewerApp:
         if is_psd_mode:
             self.add_selected_reference_slopes(
                 ax,
-                all_freq,
-                all_values,
+                reference_all_freq,
+                reference_all_values,
                 is_psd=True,
                 use_fixed_power_law=True,
                 amplitude_at_1hz=1.0,
@@ -8917,11 +8985,19 @@ class FileViewerApp:
             ylabel = display_meta["ylabel"]
             self.add_selected_reference_slopes(
                 ax,
-                all_freq,
-                all_values,
+                reference_all_freq,
+                reference_all_values,
                 is_psd=False,
                 spectrum_type=spectrum_type,
             )
+
+        if visible_series_scope != "all_series" and is_psd_mode:
+            x_limits = self.compute_positive_log_axis_limits(reference_all_freq)
+            y_limits = self.compute_positive_log_axis_limits(reference_all_values)
+            if x_limits is not None:
+                ax.set_xlim(*x_limits)
+            if y_limits is not None:
+                ax.set_ylim(*y_limits)
 
         ax.set_title(title)
         ax.set_xlabel("Frequency (Hz)")
@@ -8944,12 +9020,18 @@ class FileViewerApp:
             ]
         self.current_result_freq = None
         self.current_result_values = None
-        self.current_result_frame = self.build_overlay_export_frame(series_results)
+        for visible_item in visible_series_results:
+            visible_details = dict(visible_item.get("details", {}))
+            visible_details["target_spectrum_visible_series_count"] = int(len(visible_series_results))
+            visible_item["details"] = visible_details
+        self.current_result_frame = self.build_overlay_export_frame(visible_series_results)
         self.current_aligned_frame = None
         if aligned_frames:
             self.current_target_plot_metadata["aligned_frames"] = aligned_frames
         else:
             self.current_target_plot_metadata.pop("aligned_frames", None)
+        self.current_target_plot_metadata["target_spectrum_visible_series_scope"] = visible_series_scope
+        self.current_target_plot_metadata["target_spectrum_visible_series_count"] = int(len(visible_series_results))
         self.current_aligned_metadata = {
             "spectrum_mode": spectrum_mode,
             "alignment_strategy": target_metadata.get("alignment_strategy"),
@@ -8971,9 +9053,9 @@ class FileViewerApp:
                     ),
                 }
             )
-        self.current_compare_files = [str(item["label"]) for item in series_results]
+        self.current_compare_files = [str(item["label"]) for item in visible_series_results]
 
-        first_details = dict(series_results[0]["details"])
+        first_details = dict(visible_series_results[0]["details"])
         mode_label = str(target_metadata.get("mode_label", "目标谱图"))
         group_records = list(target_metadata.get("group_records", []))
         kept_group_count = int(
@@ -8991,6 +9073,7 @@ class FileViewerApp:
         total_group_count = int(target_metadata.get("total_group_count", len(group_records)))
         expected_series_count = int(target_metadata.get("expected_series_count", len(series_results)))
         actual_series_count = int(target_metadata.get("actual_series_count", len(series_results)))
+        visible_series_count = int(len(visible_series_results))
         requested_nsegment_ui = int(
             target_metadata.get(
                 "requested_nsegment",
@@ -9039,12 +9122,15 @@ class FileViewerApp:
             f"当前目标要素={target_element}",
             *build_device_dispatch_items(first_details, include_plot_execution_path=True),
             f"target_spectrum_group_count={kept_group_count}",
+            f"target_spectrum_visible_series_scope={visible_series_scope}",
+            f"target_spectrum_visible_series_count={visible_series_count}",
             "current_plot_kind=target_spectrum",
             f"总组数={total_group_count}",
             f"保留组数={kept_group_count}",
             f"跳过组数={skipped_group_count}",
             f"预期系列数={expected_series_count}",
             f"实际系列数={actual_series_count}",
+            f"可见系列数={visible_series_count}",
             f"目标谱图沿用当前分析参数={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
             f"requested_nsegment={requested_nsegment_ui}",
             f"系列有效点数={'；'.join(point_summaries)}",
@@ -9138,9 +9224,14 @@ class FileViewerApp:
             batch_skips=skipped_group_count,
             extra_items=extra_items,
         )
-        status_text = f"{mode_label}已生成：保留 {kept_group_count}/{total_group_count} 组 | 输出 {actual_series_count} 条系列"
+        status_text = (
+            f"{mode_label}已生成：保留 {kept_group_count}/{total_group_count} 组"
+            f" | 输出 {visible_series_count}/{actual_series_count} 条可见系列"
+        )
         status_items = build_device_dispatch_items(first_details)
         status_items.append(f"target_spectrum_group_count={kept_group_count}")
+        status_items.append(f"target_spectrum_visible_series_scope={visible_series_scope}")
+        status_items.append(f"target_spectrum_visible_series_count={visible_series_count}")
         status_items.append("current_plot_kind=target_spectrum")
         if status_items:
             status_text += f" | {' | '.join(status_items)}"
