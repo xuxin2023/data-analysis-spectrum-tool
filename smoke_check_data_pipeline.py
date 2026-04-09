@@ -640,6 +640,56 @@ def choose_single_column(parsed: core.ParsedDataResult, element: str | None, dev
     return None
 
 
+def compute_expected_ygas_only_legacy_target_offsets(
+    app: object,
+    *,
+    ygas_path: Path,
+    target_column: str,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    target_element = str(args.element or "CO2")
+    required_columns = app.build_target_required_columns(
+        target_element=target_element,
+        device_kind="ygas",
+    )
+    parsed = app.parse_target_profiled_file(
+        ygas_path,
+        device_kind="ygas",
+        required_columns=required_columns,
+    )
+    window_start, window_end, _ = core.get_parsed_time_bounds(parsed)
+    frame, _meta = core.build_target_window_series(
+        parsed,
+        str(target_column),
+        pd.Timestamp(window_start),
+        pd.Timestamp(window_end),
+    )
+    if np.isclose(float(args.fs), float(core.DEFAULT_FS), rtol=0.0, atol=1e-9):
+        estimated_fs = core.estimate_fs_from_timestamp(frame, core.TIMESTAMP_COL)
+        resolved_fs = float(estimated_fs if estimated_fs else core.DEFAULT_FS)
+    else:
+        resolved_fs = float(args.fs)
+    requested_nsegment = int(
+        args.nsegment
+        if bool(app.legacy_target_use_analysis_params_var.get())
+        else core.legacy_target_nsegment_resolver(len(frame))
+    )
+    freq, density, details = core.compute_legacy_target_psd_from_array(
+        frame["value"].to_numpy(dtype=float),
+        resolved_fs,
+        requested_nsegment,
+        float(args.overlap_ratio),
+        psd_kernel=core.LEGACY_TARGET_PSD_KERNEL_DEFAULT,
+    )
+    mask = core.build_spectrum_plot_mask(freq, density, core.CROSS_SPECTRUM_MAGNITUDE)
+    return {
+        "offsets": np.column_stack((freq[mask], density[mask])),
+        "details": details,
+        "requested_nsegment": requested_nsegment,
+        "resolved_fs": resolved_fs,
+    }
+
+
 def prepare_series(
     parsed: core.ParsedDataResult,
     column: str,
@@ -946,6 +996,28 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             clone_args(
                 args,
                 mode="single-file-open-target-spectrum-primary-visible-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_file_open_auto_preview_target_spectrum",
+            run_single_file_open_auto_preview_target_spectrum_check_mode,
+            clone_args(
+                args,
+                mode="single-file-open-auto-preview-target-spectrum-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
+            "single_file_parent_dat_autodiscovery_target_spectrum",
+            run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode,
+            clone_args(
+                args,
+                mode="single-file-parent-dat-autodiscovery-target-spectrum-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -4970,6 +5042,7 @@ def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace
 
         root, app = build_headless_app()
         try:
+            app.element_preset_var.set(str(args.element or "CO2"))
             simulate_generate_plot_from_selected_files(
                 app,
                 root,
@@ -4982,17 +5055,28 @@ def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace
             diag_text = app.diagnostic_var.get()
             export_plot_execution_path = get_export_plot_execution_path(app)
             export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_psd_kernel = get_export_metadata_value(app, "psd_kernel")
+            export_effective_nsegment = get_export_metadata_value(app, "effective_nsegment")
             current_plot_kind = app.current_plot_kind
             plot_title = str(app.figure.axes[0].get_title()) if app.figure.axes else ""
+            axis_state = extract_axis_render_state(app.figure.axes[0]) if app.figure.axes else {"scatter_offsets": []}
+            export_target_context_mode = get_export_metadata_value(app, "target_spectrum_context_mode")
+            export_visible_scope = get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+            expected_target_offsets = compute_expected_ygas_only_legacy_target_offsets(
+                app,
+                ygas_path=isolated_path,
+                target_column=str(target_column),
+                args=args,
+            )
         finally:
             root.destroy()
 
     checks = [
         (
-            "single_device_default_fallback_dispatch_path_active",
-            current_plot_kind == "spectral"
-            and export_plot_execution_path == "single_device_spectrum"
-            and export_render_semantics == "single_device",
+            "single_device_default_no_dat_stays_on_target_spectrum_dispatch",
+            current_plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
             {
                 "current_plot_kind": current_plot_kind,
                 "export_plot_execution_path": export_plot_execution_path,
@@ -5000,21 +5084,27 @@ def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace
             },
         ),
         (
-            "single_device_default_fallback_visible",
-            "effective_device_count=1" in status_text
-            and "render_semantics=single_device" in status_text
-            and "plot_execution_path=single_device_spectrum" in diag_text
-            and "single_txt_execution_path=direct_generate_plain_spectral_fallback" in diag_text,
+            "single_device_default_no_dat_exposes_target_spectrum_metadata",
+            export_target_context_mode == "ygas_only_no_dat"
+            and export_visible_scope == "ygas_only"
+            and "effective_device_count=1" in status_text
+            and "render_semantics=target_spectrum_single_group" in status_text
+            and "plot_execution_path=target_spectrum_render" in diag_text
+            and "target_spectrum_group_count=1" in diag_text
+            and "target_spectrum_visible_series_scope=ygas_only" in diag_text
+            and "target_spectrum_context_mode=ygas_only_no_dat" in diag_text,
             {
                 "status_text": status_text,
                 "diag_text": diag_text,
+                "target_spectrum_context_mode": export_target_context_mode,
+                "target_spectrum_visible_series_scope": export_visible_scope,
             },
         ),
         (
-            "single_device_default_fallback_uses_plain_psd_title_semantics",
-            plot_title.startswith("功率谱密度：")
-            and "direct_generate_target_spectrum_fallback_reason=" in status_text
-            and "single_txt_execution_path=direct_generate_plain_spectral_fallback" in diag_text,
+            "single_device_default_no_dat_keeps_target_title_semantics",
+            plot_title.startswith("时间序列谱分析 - ")
+            and "selected_dat_file_count=0" in status_text
+            and "current_plot_kind=target_spectrum" in status_text,
             {
                 "plot_title": plot_title,
                 "status_text": status_text,
@@ -5022,6 +5112,40 @@ def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace
             },
         ),
     ]
+
+    checks.extend(
+        [
+            (
+                "single_device_default_no_dat_uses_legacy_target_psd_kernel",
+                f"psd_kernel={core.LEGACY_TARGET_PSD_KERNEL_DEFAULT}" in diag_text
+                and str(expected_target_offsets["details"].get("psd_kernel")) == core.LEGACY_TARGET_PSD_KERNEL_DEFAULT
+                and f"effective_nsegment={expected_target_offsets['details'].get('effective_nsegment')}" in diag_text,
+                {
+                    "export_psd_kernel": export_psd_kernel,
+                    "expected_psd_kernel": expected_target_offsets["details"].get("psd_kernel"),
+                    "export_effective_nsegment": export_effective_nsegment,
+                    "expected_effective_nsegment": expected_target_offsets["details"].get("effective_nsegment"),
+                },
+            ),
+            (
+                "single_device_default_no_dat_visible_points_match_legacy_target_psd",
+                len(axis_state["scatter_offsets"]) == 1
+                and np.asarray(axis_state["scatter_offsets"][0], dtype=float).shape
+                == np.asarray(expected_target_offsets["offsets"], dtype=float).shape
+                and np.allclose(
+                    np.asarray(axis_state["scatter_offsets"][0], dtype=float),
+                    np.asarray(expected_target_offsets["offsets"], dtype=float),
+                    rtol=1e-12,
+                    atol=1e-12,
+                ),
+                {
+                    "scatter_collection_count": len(axis_state["scatter_offsets"]),
+                    "rendered_offsets": axis_state["scatter_offsets"],
+                    "expected_offsets": expected_target_offsets["offsets"],
+                },
+            ),
+        ]
+    )
 
     failed = False
     print("[device_count_default_single_fallback_check]")
@@ -5670,6 +5794,156 @@ def run_single_file_open_target_spectrum_primary_visible_check_mode(args: argpar
 
     failed = False
     print("[single_file_open_target_spectrum_primary_visible_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_open_auto_preview_target_spectrum_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_auto_preview_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+
+        root, app = build_headless_app()
+        try:
+            import tkinter as tk
+
+            app.element_preset_var.set(str(args.element or "CO2"))
+            simulate_single_file_open(app, ygas_path)
+            parsed = parse_supported_file(ygas_path)
+            target_column = choose_single_column(parsed, args.element, "A")
+            if not target_column:
+                raise ValueError("Unable to resolve matching txt column for the requested element.")
+            app.column_vars = {str(target_column): tk.BooleanVar(master=app.root, value=True)}
+            run_background_tasks_inline(app)
+            app.auto_perform_analysis()
+            if not app.figure.axes:
+                raise ValueError("Single-file auto preview did not produce a visible axis.")
+            axis_state = extract_axis_render_state(app.figure.axes[0])
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_visible_scope = get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_auto_preview_uses_target_spectrum_renderer",
+            plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_file_auto_preview_only_shows_primary_visible_series",
+            export_visible_scope == "ygas_only"
+            and len(axis_state["scatter_offsets"]) == 1
+            and "target_spectrum_visible_series_scope=ygas_only" in status_text
+            and "target_spectrum_visible_series_scope=ygas_only" in diag_text,
+            {
+                "export_visible_scope": export_visible_scope,
+                "scatter_collection_count": len(axis_state["scatter_offsets"]),
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_file_auto_preview_keeps_target_title_semantics",
+            str(axis_state["title"]).startswith("时间序列谱分析 - "),
+            {"title": axis_state["title"]},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_auto_preview_target_spectrum_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_parent_dat_autodiscovery_") as temp_dir:
+        root_dir = Path(temp_dir)
+        child_dir = root_dir / "0328"
+        child_dir.mkdir(parents=True, exist_ok=True)
+        bundle = prepare_target_spectrum_smoke_paths(root_dir, group_count=1)
+        original_ygas_path = Path(bundle["ygas_paths"][0])
+        ygas_path = child_dir / original_ygas_path.name
+        shutil.move(str(original_ygas_path), str(ygas_path))
+        dat_path = Path(bundle["dat_path"])
+
+        parsed = parse_supported_file(ygas_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve matching txt column for the requested element.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            simulate_single_file_open(app, ygas_path)
+            import tkinter as tk
+
+            app.column_vars = {str(target_column): tk.BooleanVar(master=root, value=True)}
+            run_background_tasks_inline(app)
+            app.generate_plot()
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_context_dat_name = get_export_metadata_value(app, "target_spectrum_context_dat_file_name")
+            auto_compare_context_dat_file_name = str(getattr(app, "auto_compare_context_dat_file_name", "") or "")
+            plot_title = str(app.figure.axes[0].get_title()) if app.figure.axes else ""
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_parent_dat_autodiscovery_uses_target_spectrum_renderer",
+            plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_file_parent_dat_autodiscovery_binds_parent_dat_context",
+            export_context_dat_name == dat_path.name
+            and auto_compare_context_dat_file_name == dat_path.name
+            and f"target_spectrum_context_dat_file_name={dat_path.name}" in status_text
+            and f"target_spectrum_context_dat_file_name={dat_path.name}" in diag_text,
+            {
+                "export_context_dat_name": export_context_dat_name,
+                "auto_compare_context_dat_file_name": auto_compare_context_dat_file_name,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_file_parent_dat_autodiscovery_keeps_target_title_semantics",
+            plot_title.startswith("时间序列谱分析 - "),
+            {"plot_title": plot_title},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_parent_dat_autodiscovery_target_spectrum_check]")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -7484,6 +7758,8 @@ def main() -> int:
             "single-vs-dual-target-spectrum-visible-subset-check",
             "single-vs-dual-target-spectrum-style-check",
             "single-file-open-target-spectrum-primary-visible-check",
+            "single-file-open-auto-preview-target-spectrum-check",
+            "single-file-parent-dat-autodiscovery-target-spectrum-check",
             "single-file-open-vs-dual-target-spectrum-primary-subset-check",
             "single-device-fallback-still-legacy-render-check",
             "single-device-active-dat-sync-check",
@@ -7604,6 +7880,10 @@ def main() -> int:
             return run_single_vs_dual_target_spectrum_style_check_mode(args)
         if mode == "single-file-open-target-spectrum-primary-visible-check":
             return run_single_file_open_target_spectrum_primary_visible_check_mode(args)
+        if mode == "single-file-open-auto-preview-target-spectrum-check":
+            return run_single_file_open_auto_preview_target_spectrum_check_mode(args)
+        if mode == "single-file-parent-dat-autodiscovery-target-spectrum-check":
+            return run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode(args)
         if mode == "single-file-open-vs-dual-target-spectrum-primary-subset-check":
             return run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode(args)
         if mode == "single-device-fallback-still-legacy-render-check":

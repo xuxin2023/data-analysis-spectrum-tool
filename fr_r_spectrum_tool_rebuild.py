@@ -806,6 +806,7 @@ class FileViewerApp:
         self.target_parsed_file_cache: dict[tuple[Any, ...], ParsedFileResult] = {}
         self.last_param_error_message: str | None = None
         self.pending_direct_generate_target_spectrum_fallback_reason: str | None = None
+        self.pending_selected_files_default_render_quiet = False
         self.suspend_setting_reload = False
         self.current_used_mode1_template = False
         self.current_layout_label = "未加载"
@@ -2460,18 +2461,43 @@ class FileViewerApp:
 
     def build_auto_compare_bootstrap_files(self, selection_paths: list[Path]) -> list[Path]:
         normalized_selection = [Path(path) for path in selection_paths]
+        def collect_supported_dat_files(folder: Path) -> list[Path]:
+            dat_candidates: list[Path] = []
+            try:
+                supported_files = self.get_supported_files(folder)
+            except Exception:
+                return dat_candidates
+            for path in supported_files:
+                try:
+                    profile = detect_file_profile(path, read_preview_lines(path))
+                except Exception:
+                    profile = None
+                if profile == "TOA5_DAT" or path.suffix.lower() == ".dat":
+                    dat_candidates.append(path)
+            return dat_candidates
+
         if self.current_folder is not None and normalized_selection:
             current_folder_resolved = self.current_folder.resolve()
             selection_parents = {path.parent.resolve() for path in normalized_selection}
             if selection_parents == {current_folder_resolved}:
-                if self.file_paths:
-                    return list(self.file_paths)
-                return self.get_supported_files(self.current_folder)
+                current_files = list(self.file_paths) if self.file_paths else self.get_supported_files(self.current_folder)
+                if any(path.suffix.lower() == ".dat" for path in current_files):
+                    return current_files
+                parent_dat_files = collect_supported_dat_files(self.current_folder.parent)
+                if parent_dat_files:
+                    return [*normalized_selection, *parent_dat_files]
+                return current_files
 
         selection_parents = {path.parent.resolve() for path in normalized_selection}
         if len(selection_parents) == 1:
             parent = Path(next(iter(selection_parents)))
-            return self.get_supported_files(parent)
+            current_files = self.get_supported_files(parent)
+            if any(path.suffix.lower() == ".dat" for path in current_files):
+                return current_files
+            parent_dat_files = collect_supported_dat_files(parent.parent)
+            if parent_dat_files:
+                return [*normalized_selection, *parent_dat_files]
+            return current_files
         return normalized_selection
 
     def ensure_auto_compare_context_for_selection(
@@ -4010,6 +4036,458 @@ class FileViewerApp:
             dat_context_file_name=dat_context_file_name,
         )
 
+    def prepare_ygas_only_target_spectrum_dispatch_payload(
+        self,
+        selected_txt_paths: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        *,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        target_element = self.resolve_target_element_name()
+        ygas_required_columns = self.build_target_required_columns(
+            target_element=target_element,
+            device_kind="ygas",
+        )
+        use_requested_nsegment = bool(self.legacy_target_use_analysis_params_var.get())
+        selected_psd_kernel = core.LEGACY_TARGET_PSD_KERNEL_DEFAULT
+        skipped_windows: list[str] = []
+        group_records: list[dict[str, Any]] = []
+        wrapped_series_results: list[dict[str, Any]] = []
+        effective_nsegment_values: list[int] = []
+        positive_freq_values: list[int] = []
+        first_positive_freq_values: list[float] = []
+        ygas_windows: list[dict[str, Any]] = []
+        total_paths = len(selected_txt_paths)
+
+        def _resolve_ygas_fs(parsed: ParsedFileResult, frame: pd.DataFrame, ui_fs: float) -> float:
+            manual_override = not math.isclose(ui_fs, DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
+            if manual_override:
+                return float(ui_fs)
+            estimated = core.estimate_fs_from_timestamp(frame, core.TIMESTAMP_COL)
+            if estimated:
+                return float(estimated)
+            return float(DEFAULT_FS)
+
+        def _build_skip_record(
+            *,
+            group_key: str,
+            labels: dict[str, str],
+            window_label: str,
+            window_start: pd.Timestamp | None,
+            window_end: pd.Timestamp | None,
+            reason: str,
+            ygas_column_name: str | None,
+        ) -> dict[str, Any]:
+            return {
+                "group_key": group_key,
+                "group_label": labels["group_label"],
+                "window_label": window_label,
+                "ygas_start": window_start,
+                "ygas_end": window_end,
+                "dat_start": None,
+                "dat_end": None,
+                "ygas_points": 0,
+                "dat_points": 0,
+                "ygas_fs": None,
+                "dat_fs": None,
+                "ygas_coverage_ratio": None,
+                "dat_coverage_ratio": None,
+                "ygas_leading_invalid_gap_s": None,
+                "dat_leading_invalid_gap_s": None,
+                "ygas_trailing_invalid_gap_s": None,
+                "dat_trailing_invalid_gap_s": None,
+                "ygas_non_null_ratio": None,
+                "dat_non_null_ratio": None,
+                "ygas_freq_points": 0,
+                "dat_freq_points": 0,
+                "ygas_column": ygas_column_name,
+                "dat_column": "",
+                "ygas_label": labels["ygas_label"],
+                "dat_label": "",
+                "keep": False,
+                "forced_include": False,
+                "reason": str(reason),
+                "status": "跳过",
+                "forceable": False,
+                "group_source": "ygas_only_target_spectrum",
+                "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+            }
+
+        for index, path in enumerate(selected_txt_paths, start=1):
+            if reporter is not None:
+                reporter(f"正在解析 ygas 文件 {index}/{total_paths}: {path.name}")
+            try:
+                parsed_ygas = self.parse_target_profiled_file(
+                    path,
+                    device_kind="ygas",
+                    required_columns=ygas_required_columns,
+                )
+                window_start, window_end, _window_points = core.get_parsed_time_bounds(parsed_ygas)
+                labels = core.build_legacy_group_labels(
+                    target_element=target_element,
+                    window_start=pd.Timestamp(window_start),
+                    ygas_path=path,
+                )
+                group_key = core.build_target_group_key(path, pd.Timestamp(window_start))
+                window_label = f"{pd.Timestamp(window_start):%Y-%m-%d %H:%M} ~ {pd.Timestamp(window_end):%H:%M}"
+                resolved_target_column = str(target_column or "").strip()
+                if resolved_target_column not in parsed_ygas.dataframe.columns:
+                    resolved_target_column = str(
+                        self.select_target_element_column(
+                            parsed_ygas,
+                            device_key="A",
+                            target_element=target_element,
+                        )
+                        or ""
+                    ).strip()
+                if not resolved_target_column:
+                    skipped_windows.append(f"{group_key}(未找到{target_element}列)")
+                    group_records.append(
+                        _build_skip_record(
+                            group_key=group_key,
+                            labels=labels,
+                            window_label=window_label,
+                            window_start=pd.Timestamp(window_start),
+                            window_end=pd.Timestamp(window_end),
+                            reason=f"未找到{target_element}列",
+                            ygas_column_name=None,
+                        )
+                    )
+                    continue
+                ygas_windows.append(
+                    {
+                        "path": path,
+                        "parsed": parsed_ygas,
+                        "column": resolved_target_column,
+                        "start": pd.Timestamp(window_start),
+                        "end": pd.Timestamp(window_end),
+                        "labels": labels,
+                        "group_key": group_key,
+                    }
+                )
+            except Exception as exc:
+                fallback_start = pd.Timestamp(start_dt) if start_dt is not None else None
+                fallback_end = pd.Timestamp(end_dt) if end_dt is not None else None
+                labels = {
+                    "group_label": path.name,
+                    "ygas_label": path.name,
+                    "dat_label": "",
+                }
+                group_records.append(
+                    _build_skip_record(
+                        group_key=path.name,
+                        labels=labels,
+                        window_label=path.name,
+                        window_start=fallback_start,
+                        window_end=fallback_end,
+                        reason=str(exc),
+                        ygas_column_name=str(target_column or "").strip() or None,
+                    )
+                )
+                skipped_windows.append(f"{path.name}({exc})")
+
+        if not ygas_windows:
+            raise ValueError(f"没有找到可用于生成“{target_element}”目标谱图的 ygas 时间窗口。")
+
+        txt_summary = core.build_range_summary_from_entries(
+            [
+                {
+                    "path": item["path"],
+                    "start": item["start"],
+                    "end": item["end"],
+                    "points": int(item["parsed"].timestamp_valid_count),
+                    "raw_rows": int(item["parsed"].source_row_count or len(item["parsed"].dataframe)),
+                    "valid_timestamp_points": int(item["parsed"].timestamp_valid_count),
+                }
+                for item in ygas_windows
+            ]
+        )
+        resolved_start, resolved_end, resolved_strategy_label = self.resolve_target_time_range_for_strategy(
+            self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            self.time_start_var.get().strip(),
+            self.time_end_var.get().strip(),
+            txt_summary,
+            None,
+        )
+        effective_start_override = pd.Timestamp(start_dt) if start_dt is not None else (
+            pd.Timestamp(resolved_start) if resolved_start is not None else None
+        )
+        effective_end_override = pd.Timestamp(end_dt) if end_dt is not None else (
+            pd.Timestamp(resolved_end) if resolved_end is not None else None
+        )
+        time_range_policy = (
+            "full_file"
+            if effective_start_override is None and effective_end_override is None
+            else "manual_time_range"
+        )
+        time_range_policy_label = "全文件" if time_range_policy == "full_file" else (
+            str(resolved_strategy_label or "手动时间范围")
+        )
+
+        for group_index, item in enumerate(sorted(ygas_windows, key=lambda value: pd.Timestamp(value["start"]))):
+            window_start = pd.Timestamp(item["start"])
+            window_end = pd.Timestamp(item["end"])
+            effective_start = max([window_start] + ([effective_start_override] if effective_start_override is not None else []))
+            effective_end = min([window_end] + ([effective_end_override] if effective_end_override is not None else []))
+            window_label = f"{effective_start:%Y-%m-%d %H:%M} ~ {effective_end:%H:%M}"
+            if effective_start >= effective_end:
+                reason = "不在当前目标时间范围内"
+                skipped_windows.append(f"{item['group_key']}({reason})")
+                group_records.append(
+                    _build_skip_record(
+                        group_key=str(item["group_key"]),
+                        labels=dict(item["labels"]),
+                        window_label=window_label,
+                        window_start=effective_start,
+                        window_end=effective_end,
+                        reason=reason,
+                        ygas_column_name=str(item["column"]),
+                    )
+                )
+                continue
+
+            try:
+                ygas_frame, ygas_meta = core.build_target_window_series(
+                    item["parsed"],
+                    str(item["column"]),
+                    effective_start,
+                    effective_end,
+                )
+                group_requested_nsegment = int(
+                    requested_nsegment
+                    if use_requested_nsegment
+                    else core.legacy_target_nsegment_resolver(len(ygas_frame))
+                )
+                ygas_fs = _resolve_ygas_fs(item["parsed"], ygas_frame, fs)
+                freq, density, details = core.compute_legacy_target_psd_from_array(
+                    ygas_frame["value"].to_numpy(dtype=float),
+                    float(ygas_fs),
+                    int(group_requested_nsegment),
+                    overlap_ratio,
+                    psd_kernel=selected_psd_kernel,
+                )
+                mask = core.build_spectrum_plot_mask(freq, density, CROSS_SPECTRUM_MAGNITUDE)
+                valid_freq_points = int(np.count_nonzero(mask))
+                if valid_freq_points <= 0:
+                    raise ValueError("目标谱图没有生成有效正频点。")
+                details = dict(details)
+                details.update(
+                    {
+                        "device_kind": "ygas",
+                        "data_context_source": "ygas_only_target_spectrum_no_dat",
+                        "time_range_policy": time_range_policy,
+                        "time_range_policy_label": time_range_policy_label,
+                        "time_range_policy_note": str(resolved_strategy_label or time_range_policy_label),
+                        "base_source_start": ygas_meta.get("source_start"),
+                        "base_source_end": ygas_meta.get("source_end"),
+                        "base_requested_start": ygas_meta.get("requested_start"),
+                        "base_requested_end": ygas_meta.get("requested_end"),
+                        "base_actual_start": ygas_meta.get("actual_start"),
+                        "base_actual_end": ygas_meta.get("actual_end"),
+                        "base_requested_duration_s": ygas_meta.get("requested_duration_s"),
+                        "base_actual_duration_s": ygas_meta.get("actual_duration_s"),
+                        "base_leading_invalid_gap_s": ygas_meta.get("leading_invalid_gap_s"),
+                        "base_trailing_invalid_gap_s": ygas_meta.get("trailing_invalid_gap_s"),
+                        "base_non_null_ratio": ygas_meta.get("non_null_ratio"),
+                        "base_timestamp_valid_count": ygas_meta.get("timestamp_valid_count"),
+                        "base_timestamp_valid_ratio": ygas_meta.get("timestamp_valid_ratio"),
+                        "base_timestamp_warning": ygas_meta.get("timestamp_warning"),
+                        "coverage_ratio": ygas_meta.get("coverage_ratio"),
+                        "window_start": effective_start,
+                        "window_end": effective_end,
+                        "selected_target_column": str(item["column"]),
+                    }
+                )
+                wrapped_series_results.append(
+                    {
+                        "label": str(item["labels"]["ygas_label"]),
+                        "device_kind": "ygas",
+                        "group_index": group_index,
+                        "freq": freq,
+                        "density": density,
+                        "valid_points": int(ygas_meta.get("valid_points", len(ygas_frame))),
+                        "valid_freq_points": valid_freq_points,
+                        "details": details,
+                    }
+                )
+                effective_nsegment = int(details.get("effective_nsegment", details.get("nsegment", 0)) or 0)
+                if effective_nsegment > 0:
+                    effective_nsegment_values.append(effective_nsegment)
+                positive_freq_values.append(valid_freq_points)
+                if details.get("first_positive_freq") is not None:
+                    first_positive_freq_values.append(float(details["first_positive_freq"]))
+                group_records.append(
+                    {
+                        "group_key": str(item["group_key"]),
+                        "group_label": str(item["labels"]["group_label"]),
+                        "window_label": window_label,
+                        "ygas_start": effective_start,
+                        "ygas_end": effective_end,
+                        "dat_start": None,
+                        "dat_end": None,
+                        "ygas_points": int(ygas_meta.get("valid_points", len(ygas_frame))),
+                        "dat_points": 0,
+                        "ygas_fs": float(ygas_fs),
+                        "dat_fs": None,
+                        "ygas_coverage_ratio": ygas_meta.get("coverage_ratio"),
+                        "dat_coverage_ratio": None,
+                        "ygas_leading_invalid_gap_s": ygas_meta.get("leading_invalid_gap_s"),
+                        "dat_leading_invalid_gap_s": None,
+                        "ygas_trailing_invalid_gap_s": ygas_meta.get("trailing_invalid_gap_s"),
+                        "dat_trailing_invalid_gap_s": None,
+                        "ygas_non_null_ratio": ygas_meta.get("non_null_ratio"),
+                        "dat_non_null_ratio": None,
+                        "ygas_freq_points": valid_freq_points,
+                        "dat_freq_points": 0,
+                        "ygas_column": str(item["column"]),
+                        "dat_column": "",
+                        "ygas_label": str(item["labels"]["ygas_label"]),
+                        "dat_label": "",
+                        "keep": True,
+                        "forced_include": False,
+                        "reason": "未提供dat，按单设备目标谱图语义生成",
+                        "status": "保留",
+                        "forceable": False,
+                        "group_source": "ygas_only_target_spectrum",
+                        "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+                        **core.build_legacy_target_spectrum_fields(
+                            "ygas",
+                            details,
+                            valid_freq_points=valid_freq_points,
+                        ),
+                        "dat_effective_fs": None,
+                        "dat_requested_nsegment": None,
+                        "dat_effective_nsegment": None,
+                        "dat_noverlap": None,
+                        "dat_nsegment_source": None,
+                        "dat_psd_kernel": None,
+                        "dat_positive_freq_points": None,
+                        "dat_first_positive_freq": None,
+                        "dat_window_type": None,
+                        "dat_detrend": None,
+                        "dat_overlap": None,
+                        "dat_scaling_mode": None,
+                        "dat_valid_freq_points": None,
+                    }
+                )
+            except Exception as exc:
+                skipped_windows.append(f"{item['group_key']}({exc})")
+                group_records.append(
+                    _build_skip_record(
+                        group_key=str(item["group_key"]),
+                        labels=dict(item["labels"]),
+                        window_label=window_label,
+                        window_start=effective_start,
+                        window_end=effective_end,
+                        reason=str(exc),
+                        ygas_column_name=str(item["column"]),
+                    )
+                )
+
+        if not wrapped_series_results:
+            raise ValueError("当前选择没有可用于目标谱图语义渲染的有效 ygas 谱值。")
+
+        group_count = int(len(wrapped_series_results))
+        render_semantics = self.resolve_target_spectrum_render_semantics(group_count)
+        for item in wrapped_series_results:
+            details = dict(item.get("details", {}))
+            details["plot_execution_path"] = "target_spectrum_render"
+            details["render_semantics"] = render_semantics
+            details["current_plot_kind"] = "target_spectrum"
+            details["selection_file_count"] = int(len(selected_txt_paths))
+            details["selected_file_count"] = int(len(selected_txt_paths))
+            details["selected_txt_file_count"] = int(len(selected_txt_paths))
+            details["selected_dat_file_count"] = 0
+            details["target_spectrum_group_count"] = group_count
+            details["target_spectrum_series_count"] = group_count
+            item["details"] = details
+
+        preview_frame = self.build_target_group_preview_frame(group_records)
+        qc_frame = self.build_target_group_qc_export_frame(group_records)
+        kept_group_records = [
+            dict(record)
+            for record in group_records
+            if record.get("status") in {"保留", "手动保留"}
+        ]
+        first_kept_record = kept_group_records[0]
+        requested_nsegment_summary = int(
+            requested_nsegment
+            if use_requested_nsegment
+            else max(
+                int(record.get("ygas_requested_nsegment", 0) or 0)
+                for record in kept_group_records
+            )
+        )
+        target_metadata = {
+            "mode_label": "目标谱图",
+            "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+            "ygas_column": str(first_kept_record.get("ygas_column") or target_column),
+            "dat_column": None,
+            "ygas_target_column": str(first_kept_record.get("ygas_column") or target_column),
+            "dat_target_column": None,
+            "time_range_label": (
+                f"{time_range_policy_label}: "
+                f"{(effective_start_override if effective_start_override is not None else pd.Timestamp(txt_summary['start'])):%Y-%m-%d %H:%M:%S}"
+                " ~ "
+                f"{(effective_end_override if effective_end_override is not None else pd.Timestamp(txt_summary['end'])):%Y-%m-%d %H:%M:%S}"
+            ),
+            "group_records": group_records,
+            "group_preview_frame": preview_frame,
+            "group_qc_export_frame": qc_frame,
+            "total_group_count": int(len(group_records)),
+            "kept_group_count": group_count,
+            "skipped_group_count": int(sum(1 for record in group_records if record.get("status") == "跳过")),
+            "expected_series_count": group_count,
+            "actual_series_count": group_count,
+            "requested_nsegment": requested_nsegment_summary,
+            "legacy_target_uses_requested_nsegment": bool(use_requested_nsegment),
+            "legacy_psd_kernel_requested": selected_psd_kernel,
+            "legacy_psd_kernel": selected_psd_kernel,
+            "legacy_psd_kernel_selection_basis": "未提供 dat，沿用目标谱图默认 PSD 核。",
+            "legacy_psd_candidate_results": [],
+            "reference_line_mode": "fixed_f_pow_-2_3",
+            "reference_line_at_1hz": 1.0,
+            "effective_nsegment_values": effective_nsegment_values,
+            "positive_freq_points_min": min(positive_freq_values) if positive_freq_values else None,
+            "positive_freq_points_max": max(positive_freq_values) if positive_freq_values else None,
+            "first_positive_freq_min": min(first_positive_freq_values) if first_positive_freq_values else None,
+            "first_positive_freq_max": max(first_positive_freq_values) if first_positive_freq_values else None,
+            "matched_count_min": None,
+            "matched_count_max": None,
+            "tolerance_seconds_min": None,
+            "tolerance_seconds_max": None,
+            "generated_cross_series_count": None,
+            "generated_cross_series_roles": None,
+            "skipped_windows": skipped_windows,
+            "time_range_policy": time_range_policy,
+            "time_range_policy_label": time_range_policy_label,
+            "target_spectrum_context_mode": "ygas_only_no_dat",
+        }
+        payload = {
+            "series_results": wrapped_series_results,
+            "target_element": str(target_element),
+            "target_column": str(target_column),
+            "target_metadata": target_metadata,
+        }
+        finalized = self.finalize_target_spectrum_dispatch_payload(
+            payload,
+            selection_file_count=int(len(selected_txt_paths)),
+            selected_txt_file_count=int(len(selected_txt_paths)),
+            selected_dat_file_count=0,
+            data_context_source="ygas_only_target_spectrum_no_dat",
+            active_compare_context=None,
+            dat_context_file_name="",
+        )
+        finalized_target_metadata = dict(finalized.get("target_metadata", {}))
+        finalized_target_metadata["target_spectrum_context_mode"] = "ygas_only_no_dat"
+        finalized["target_metadata"] = finalized_target_metadata
+        return finalized
+
     def prepare_default_target_spectrum_dispatch_payload(
         self,
         selected_files: list[Path],
@@ -4017,6 +4495,8 @@ class FileViewerApp:
         fs: float,
         requested_nsegment: int,
         overlap_ratio: float,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
         normalized_selected_files = [Path(path) for path in selected_files]
@@ -4042,7 +4522,16 @@ class FileViewerApp:
             dat_path = Path(active_compare_context["dat_path"])
             data_context_source = "active_compare_context_reuse"
         if dat_path is None:
-            raise ValueError("当前选择未能解析出目标谱图所需的 dat 上下文。")
+            return self.prepare_ygas_only_target_spectrum_dispatch_payload(
+                selected_txt_paths,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                reporter=reporter,
+            )
 
         payload = self.prepare_target_spectrum_payload(
             ygas_paths=selected_txt_paths,
@@ -4062,7 +4551,7 @@ class FileViewerApp:
             forced_include_group_keys=self.get_selected_target_group_overrides(),
             reporter=reporter,
         )
-        return self.finalize_target_spectrum_dispatch_payload(
+        finalized = self.finalize_target_spectrum_dispatch_payload(
             payload,
             selection_file_count=int(selection_summary.get("selected_file_count", len(normalized_selected_files))),
             selected_txt_file_count=int(selection_summary.get("selected_txt_file_count", len(selected_txt_paths))),
@@ -4071,6 +4560,10 @@ class FileViewerApp:
             active_compare_context=active_compare_context,
             dat_context_file_name=str(dat_path.name),
         )
+        finalized_target_metadata = dict(finalized.get("target_metadata", {}))
+        finalized_target_metadata["target_spectrum_context_mode"] = "txt_plus_dat"
+        finalized["target_metadata"] = finalized_target_metadata
+        return finalized
 
     def prepare_selected_files_default_render_payload(
         self,
@@ -4090,6 +4583,8 @@ class FileViewerApp:
                 fs,
                 requested_nsegment,
                 overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
                 reporter=reporter,
             )
         except Exception as exc:
@@ -4432,6 +4927,7 @@ class FileViewerApp:
         if str(payload.get("default_dispatch_family") or "") == "plain_spectral_fallback":
             fallback_reason = str(payload.get("target_spectrum_default_fallback_reason") or "").strip()
             target_column = str(payload.get("target_column") or (self.selected_columns[0] if self.selected_columns else ""))
+            fallback_quiet = bool(self.pending_selected_files_default_render_quiet)
             if fallback_reason:
                 self.render_plot_message(
                     f"目标谱图主链不可用，已回退普通功率谱密度：{fallback_reason}",
@@ -4445,7 +4941,7 @@ class FileViewerApp:
                 fallback_reason or "target_spectrum_payload_unavailable"
             )
             try:
-                self.perform_analysis("spectral")
+                self.perform_analysis("spectral", quiet=fallback_quiet)
             finally:
                 self.pending_direct_generate_target_spectrum_fallback_reason = previous_reason
             return
@@ -7170,7 +7666,10 @@ class FileViewerApp:
         self.auto_analysis_after_id = None
         chosen = self.selected_columns
         if len(chosen) == 1:
-            self.perform_analysis("spectral", quiet=True)
+            if self.current_data_source_kind == "file" and self.get_selected_file_paths():
+                self.perform_default_single_column_render(quiet=True)
+            else:
+                self.perform_analysis("spectral", quiet=True)
         elif len(chosen) == 2:
             self.perform_analysis("cross", quiet=True)
         elif len(chosen) == 0:
@@ -7219,6 +7718,46 @@ class FileViewerApp:
         self.status_var.set("生成图失败：选择列数量不正确")
         self.update_diagnostic_info(layout=self.current_layout_label)
         self.render_plot_message("当前最多支持 1 列功率谱密度或 2 列互谱分析。", level="warning")
+
+    def perform_default_single_column_render(self, quiet: bool = False) -> None:
+        selected_files = self.get_selected_file_paths()
+        if not selected_files or self.current_data_source_kind == "comparison_analysis":
+            self.perform_analysis("spectral", quiet=quiet)
+            return
+
+        try:
+            target_column = self.selected_columns[0]
+            fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+            start_dt, end_dt = self.resolve_optional_time_range_inputs()
+            payload = self.prepare_selected_files_default_render_payload(
+                selected_files,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
+            previous_quiet = bool(self.pending_selected_files_default_render_quiet)
+            self.pending_selected_files_default_render_quiet = bool(quiet)
+            try:
+                self.on_selected_files_default_plot_ready(payload)
+            finally:
+                self.pending_selected_files_default_render_quiet = previous_quiet
+            self.last_param_error_message = None
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"分析失败：{message}")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            level = "warning" if message.startswith("参数错误") else "error"
+            self.render_plot_message(message, level=level)
+            is_param_error = message.startswith("参数错误")
+            if is_param_error:
+                if self.last_param_error_message != message and not quiet:
+                    messagebox.showerror("参数错误", message)
+                self.last_param_error_message = message
+            elif not quiet:
+                messagebox.showerror("分析失败", message)
 
     def perform_analysis(self, analysis_type: str, quiet: bool = False) -> None:
         try:
@@ -9080,6 +9619,22 @@ class FileViewerApp:
                 first_details.get("requested_nsegment", first_details.get("nsegment", 0)),
             )
         )
+        target_context_mode = str(target_metadata.get("target_spectrum_context_mode") or "").strip()
+        target_context_dat_file_name = str(target_metadata.get("target_spectrum_context_dat_file_name") or "").strip()
+        if self.current_result_frame is not None and not self.current_result_frame.empty:
+            self.current_result_frame = self.attach_metadata_columns(
+                self.current_result_frame,
+                {
+                    "current_plot_kind": "target_spectrum",
+                    "plot_execution_path": "target_spectrum_render",
+                    "render_semantics": str(target_metadata.get("render_semantics") or first_details.get("render_semantics") or ""),
+                    "target_spectrum_group_count": kept_group_count,
+                    "target_spectrum_visible_series_scope": visible_series_scope,
+                    "target_spectrum_visible_series_count": visible_series_count,
+                    "target_spectrum_context_mode": target_context_mode or None,
+                    "target_spectrum_context_dat_file_name": target_context_dat_file_name or None,
+                },
+            )
         effective_nsegment_values = [
             int(value)
             for value in target_metadata.get("effective_nsegment_values", [])
@@ -9135,6 +9690,10 @@ class FileViewerApp:
             f"requested_nsegment={requested_nsegment_ui}",
             f"系列有效点数={'；'.join(point_summaries)}",
         ]
+        if target_context_mode:
+            extra_items.append(f"target_spectrum_context_mode={target_context_mode}")
+        if target_context_dat_file_name:
+            extra_items.append(f"target_spectrum_context_dat_file_name={target_context_dat_file_name}")
         if effective_nsegment_values:
             extra_items.append(f"effective_nsegment={'/'.join(str(value) for value in effective_nsegment_values)}")
         if positive_freq_points_min is not None and positive_freq_points_max is not None:
@@ -9232,6 +9791,10 @@ class FileViewerApp:
         status_items.append(f"target_spectrum_group_count={kept_group_count}")
         status_items.append(f"target_spectrum_visible_series_scope={visible_series_scope}")
         status_items.append(f"target_spectrum_visible_series_count={visible_series_count}")
+        if target_context_mode:
+            status_items.append(f"target_spectrum_context_mode={target_context_mode}")
+        if target_context_dat_file_name:
+            status_items.append(f"target_spectrum_context_dat_file_name={target_context_dat_file_name}")
         status_items.append("current_plot_kind=target_spectrum")
         if status_items:
             status_text += f" | {' | '.join(status_items)}"
