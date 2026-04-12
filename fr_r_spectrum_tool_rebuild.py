@@ -113,6 +113,13 @@ EXPORT_REQUIRED_METADATA_FIELDS = (
 EXPORT_ADDITIONAL_METADATA_FIELDS = (
     *core.TIME_RANGE_METADATA_EXPORT_KEYS,
     "plot_execution_path",
+    "render_semantics",
+    "effective_device_count",
+    "effective_device_ids",
+    "selection_file_count",
+    "selected_txt_file_count",
+    "selected_dat_file_count",
+    "data_context_source",
     "cross_execution_path",
     "cross_implementation_id",
     "cross_reference_column",
@@ -320,6 +327,70 @@ def build_compare_geometry_point_count_items(details: dict[str, Any]) -> list[st
     return items
 
 
+def normalize_effective_device_ids(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    normalized: list[str] = []
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def annotate_device_dispatch_details(
+    details: dict[str, Any],
+    *,
+    effective_device_ids: list[str] | tuple[str, ...] | set[str],
+    plot_execution_path: str,
+    render_semantics: str,
+    selection_file_count: int,
+    selected_txt_file_count: int,
+    selected_dat_file_count: int,
+    data_context_source: str,
+) -> None:
+    normalized_device_ids = normalize_effective_device_ids(effective_device_ids)
+    details["effective_device_count"] = int(len(normalized_device_ids))
+    details["effective_device_ids"] = normalized_device_ids
+    details["plot_execution_path"] = str(plot_execution_path)
+    details["render_semantics"] = str(render_semantics)
+    details["selection_file_count"] = int(selection_file_count)
+    details["selected_file_count"] = int(selection_file_count)
+    details["selected_txt_file_count"] = int(selected_txt_file_count)
+    details["selected_dat_file_count"] = int(selected_dat_file_count)
+    details["data_context_source"] = str(data_context_source or "")
+    if details.get("time_range_policy") is not None:
+        details["time_range_policy"] = str(details.get("time_range_policy") or "")
+
+
+def build_device_dispatch_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
+    items: list[str] = []
+    normalized_device_ids = normalize_effective_device_ids(details.get("effective_device_ids"))
+    if "effective_device_count" in details or normalized_device_ids:
+        items.append(
+            f"effective_device_count={int(details.get('effective_device_count', len(normalized_device_ids)))}"
+        )
+    if "effective_device_ids" in details or normalized_device_ids:
+        items.append(f"effective_device_ids={','.join(normalized_device_ids)}")
+    for key in (
+        "render_semantics",
+        "selection_file_count",
+        "selected_txt_file_count",
+        "selected_dat_file_count",
+        "data_context_source",
+        "time_range_policy",
+    ):
+        value = details.get(key)
+        if value is not None and value != "":
+            items.append(f"{key}={value}")
+    if include_plot_execution_path:
+        plot_execution_path = details.get("plot_execution_path")
+        if plot_execution_path is not None and plot_execution_path != "":
+            items.append(f"plot_execution_path={plot_execution_path}")
+    return items
+
+
 def build_execution_items(
     details: dict[str, Any],
     keys: tuple[str, ...],
@@ -354,34 +425,36 @@ def build_auto_compare_context_items(details: dict[str, Any]) -> list[str]:
 
 
 def build_single_txt_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
-    items = build_execution_items(
+    items = build_device_dispatch_items(details, include_plot_execution_path=include_plot_execution_path)
+    items.extend(
+        build_execution_items(
         details,
         (
             "single_txt_execution_path",
             "single_txt_selection_scope",
             "single_txt_time_range_policy",
+            "direct_generate_target_spectrum_fallback_reason",
         ),
-        include_plot_execution_path=include_plot_execution_path,
-    )
+        include_plot_execution_path=False,
+    ))
     items.extend(build_auto_compare_context_items(details))
     return items
 
 
 def build_single_device_execution_items(details: dict[str, Any], *, include_plot_execution_path: bool = False) -> list[str]:
-    items = build_execution_items(
+    items = build_device_dispatch_items(details, include_plot_execution_path=include_plot_execution_path)
+    items.extend(build_execution_items(
         details,
         (
             "single_device_execution_path",
             "single_device_render_semantics",
+            "current_plot_kind",
             "single_device_selection_scope",
             "single_device_time_range_policy",
             "single_device_compare_side_fallback_reason",
-            "selected_file_count",
-            "selected_txt_file_count",
-            "selected_dat_file_count",
         ),
-        include_plot_execution_path=include_plot_execution_path,
-    )
+        include_plot_execution_path=False,
+    ))
     for key in (
         "single_device_compare_context_source",
         "single_device_compare_context_dat_file_name",
@@ -732,6 +805,8 @@ class FileViewerApp:
         self.saved_read_settings: dict[str, dict[str, str | bool]] = {}
         self.target_parsed_file_cache: dict[tuple[Any, ...], ParsedFileResult] = {}
         self.last_param_error_message: str | None = None
+        self.pending_direct_generate_target_spectrum_fallback_reason: str | None = None
+        self.pending_selected_files_default_render_quiet = False
         self.suspend_setting_reload = False
         self.current_used_mode1_template = False
         self.current_layout_label = "未加载"
@@ -768,7 +843,7 @@ class FileViewerApp:
         self.selected_dat_var = tk.StringVar(value="")
         self.single_compare_style_preview_var = tk.BooleanVar(value=True)
         self.single_compare_style_preview_info_var = tk.StringVar(
-            value="当前没有可复用的 compare txt 侧上下文；满足条件后会默认自动复用，取消勾选可退回旧路径。"
+            value="单设备优先复用对比图语义：等待可复用的 compare 上下文；直接生成图会优先尝试目标谱图。"
         )
         self.legacy_target_use_analysis_params_var = tk.BooleanVar(value=False)
         self.legacy_target_spectrum_mode_var = tk.StringVar(value=core.LEGACY_TARGET_SPECTRUM_MODE_PSD)
@@ -973,12 +1048,12 @@ class FileViewerApp:
 
         ttk.Checkbutton(
             quick_start_frame,
-            text="沿用当前分析参数（默认关闭）",
+            text="沿用当前分析参数（勾选后始终生效）",
             variable=self.legacy_target_use_analysis_params_var,
         ).grid(row=10, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
         ttk.Label(
             quick_start_frame,
-            text="默认按目标谱图预设自动解析 NSEGMENT，避免历史方案里的 256 覆盖当前链路。",
+            text="默认按目标谱图预设自动解析 NSEGMENT；如果你手动把 NSEGMENT 改离 256，当前值也会自动生效。",
             foreground="#666666",
             wraplength=300,
             justify="left",
@@ -1365,7 +1440,7 @@ class FileViewerApp:
 
         self.single_compare_style_preview_check = ttk.Checkbutton(
             actions_frame,
-            text="复用 compare txt 侧输入（单图/单设备）",
+            text="单设备优先复用对比图语义（自动）",
             variable=self.single_compare_style_preview_var,
             state="disabled",
         )
@@ -2163,6 +2238,175 @@ class FileViewerApp:
                 }
         return None
 
+    def resolve_grouped_spectral_device_key(
+        self,
+        profile_name: str | None,
+        path: Path,
+    ) -> str | None:
+        profile_family = self.resolve_selection_merge_profile_family(str(profile_name or ""))
+        if profile_family == "ygas":
+            return "A"
+        if profile_family == "dat":
+            return "B"
+        suffix = path.suffix.lower()
+        if suffix in TEXT_LIKE_SUFFIXES:
+            return "A"
+        if suffix == ".dat":
+            return "B"
+        return None
+
+    def build_grouped_target_element_candidates(
+        self,
+        *,
+        target_column: str,
+        target_element: str,
+    ) -> list[str]:
+        candidates: list[str] = []
+        normalized_target = str(target_column).strip().lower()
+
+        def append_candidate(name: str) -> None:
+            text = str(name).strip()
+            if text and text in ELEMENT_PRESETS and text not in candidates:
+                candidates.append(text)
+
+        for preset_name, preset in ELEMENT_PRESETS.items():
+            preset_values = {
+                str(value).strip().lower()
+                for key in ("A", "B")
+                for value in preset.get(key, [])
+                if str(value).strip()
+            }
+            if normalized_target and normalized_target in preset_values:
+                append_candidate(str(preset_name))
+        append_candidate(target_element)
+        return candidates
+
+    def build_grouped_spectral_required_columns(
+        self,
+        *,
+        target_column: str,
+        target_element: str,
+        device_key: str | None,
+    ) -> list[str]:
+        ordered: list[str] = []
+
+        def append_candidate(value: str) -> None:
+            text = str(value).strip()
+            if text and text not in ordered:
+                ordered.append(text)
+
+        append_candidate(target_column)
+        for pair in self.build_compare_pairs():
+            a_col = str(pair.get("a_col") or "").strip()
+            b_col = str(pair.get("b_col") or "").strip()
+            if device_key == "A":
+                if a_col:
+                    append_candidate(a_col)
+                if b_col and b_col == str(target_column).strip():
+                    append_candidate(a_col)
+            elif device_key == "B":
+                if b_col:
+                    append_candidate(b_col)
+                if a_col and a_col == str(target_column).strip():
+                    append_candidate(b_col)
+
+        if device_key in {"A", "B"}:
+            for candidate_element in self.build_grouped_target_element_candidates(
+                target_column=target_column,
+                target_element=target_element,
+            ):
+                for value in ELEMENT_PRESETS.get(candidate_element, {}).get(device_key, []):
+                    append_candidate(str(value))
+        return ordered
+
+    def resolve_grouped_spectral_target_column(
+        self,
+        parsed: ParsedFileResult,
+        *,
+        path: Path,
+        target_column: str,
+        target_element: str,
+        device_key: str | None = None,
+    ) -> dict[str, str] | None:
+        normalized_target = str(target_column).strip()
+        if not normalized_target:
+            return None
+
+        resolved_device_key = device_key or self.resolve_grouped_spectral_device_key(parsed.profile_name, path)
+        direct_hit = self.select_first_matching_column(parsed.available_columns, [normalized_target])
+        if direct_hit:
+            return {
+                "resolved_target_column": str(direct_hit),
+                "resolution_source": "exact_column_match",
+                "device_key": str(resolved_device_key or ""),
+            }
+
+        for pair in self.build_compare_pairs():
+            a_col = str(pair.get("a_col") or "").strip()
+            b_col = str(pair.get("b_col") or "").strip()
+            if resolved_device_key == "A" and b_col and b_col == normalized_target:
+                pair_hit = self.select_first_matching_column(parsed.available_columns, [a_col])
+                if pair_hit:
+                    return {
+                        "resolved_target_column": str(pair_hit),
+                        "resolution_source": "compare_pair_mapping",
+                        "device_key": "A",
+                    }
+            if resolved_device_key == "B" and a_col and a_col == normalized_target:
+                pair_hit = self.select_first_matching_column(parsed.available_columns, [b_col])
+                if pair_hit:
+                    return {
+                        "resolved_target_column": str(pair_hit),
+                        "resolution_source": "compare_pair_mapping",
+                        "device_key": "B",
+                    }
+
+        if resolved_device_key in {"A", "B"}:
+            for candidate_element in self.build_grouped_target_element_candidates(
+                target_column=target_column,
+                target_element=target_element,
+            ):
+                preset_hit = self.select_target_element_column(
+                    parsed,
+                    device_key=resolved_device_key,
+                    target_element=candidate_element,
+                )
+                if preset_hit:
+                    return {
+                        "resolved_target_column": str(preset_hit),
+                        "resolution_source": f"element_preset:{candidate_element}",
+                        "device_key": str(resolved_device_key),
+                    }
+        return None
+
+    def align_grouped_spectral_target_column(
+        self,
+        parsed: ParsedFileResult,
+        *,
+        target_column: str,
+        resolved_target_column: str,
+    ) -> ParsedFileResult:
+        normalized_target = str(target_column).strip()
+        normalized_resolved = str(resolved_target_column).strip()
+        if not normalized_target or not normalized_resolved:
+            raise ValueError("设备分组目标列对齐失败：目标列为空。")
+        if normalized_resolved not in parsed.dataframe.columns:
+            raise ValueError(f"设备分组目标列对齐失败：缺少列 {normalized_resolved}。")
+        if normalized_resolved == normalized_target:
+            return parsed
+
+        aligned_frame = parsed.dataframe.rename(columns={normalized_resolved: normalized_target})
+        aligned = self.build_parsed_result_from_dataframe(
+            aligned_frame,
+            parsed.profile_name,
+            parsed.timestamp_col,
+            source_row_count=parsed.source_row_count,
+        )
+        aligned.timestamp_valid_count = int(parsed.timestamp_valid_count)
+        aligned.timestamp_valid_ratio = float(parsed.timestamp_valid_ratio)
+        aligned.timestamp_warning = parsed.timestamp_warning
+        return aligned
+
     def reset_auto_compare_context(self, *, clear_selected_dat: bool = True) -> None:
         self.auto_prepare_payload = None
         self.auto_dat_options = {}
@@ -2217,18 +2461,43 @@ class FileViewerApp:
 
     def build_auto_compare_bootstrap_files(self, selection_paths: list[Path]) -> list[Path]:
         normalized_selection = [Path(path) for path in selection_paths]
+        def collect_supported_dat_files(folder: Path) -> list[Path]:
+            dat_candidates: list[Path] = []
+            try:
+                supported_files = self.get_supported_files(folder)
+            except Exception:
+                return dat_candidates
+            for path in supported_files:
+                try:
+                    profile = detect_file_profile(path, read_preview_lines(path))
+                except Exception:
+                    profile = None
+                if profile == "TOA5_DAT" or path.suffix.lower() == ".dat":
+                    dat_candidates.append(path)
+            return dat_candidates
+
         if self.current_folder is not None and normalized_selection:
             current_folder_resolved = self.current_folder.resolve()
             selection_parents = {path.parent.resolve() for path in normalized_selection}
             if selection_parents == {current_folder_resolved}:
-                if self.file_paths:
-                    return list(self.file_paths)
-                return self.get_supported_files(self.current_folder)
+                current_files = list(self.file_paths) if self.file_paths else self.get_supported_files(self.current_folder)
+                if any(path.suffix.lower() == ".dat" for path in current_files):
+                    return current_files
+                parent_dat_files = collect_supported_dat_files(self.current_folder.parent)
+                if parent_dat_files:
+                    return [*normalized_selection, *parent_dat_files]
+                return current_files
 
         selection_parents = {path.parent.resolve() for path in normalized_selection}
         if len(selection_parents) == 1:
             parent = Path(next(iter(selection_parents)))
-            return self.get_supported_files(parent)
+            current_files = self.get_supported_files(parent)
+            if any(path.suffix.lower() == ".dat" for path in current_files):
+                return current_files
+            parent_dat_files = collect_supported_dat_files(parent.parent)
+            if parent_dat_files:
+                return [*normalized_selection, *parent_dat_files]
+            return current_files
         return normalized_selection
 
     def ensure_auto_compare_context_for_selection(
@@ -2478,26 +2747,24 @@ class FileViewerApp:
 
     def refresh_single_compare_style_preview_state(self) -> None:
         available = False
-        info_text = "当前没有可复用的 compare txt 侧上下文；满足条件后会默认自动复用，取消勾选可退回旧路径。"
+        info_text = (
+            "当前没有可复用的 compare 上下文；单文件预览会在上下文缺失时回退到普通单设备谱图，"
+            "直接生成图仍会优先尝试目标谱图。"
+        )
         try:
             context = self.resolve_single_compare_style_preview_context()
             available = True
-            if self.single_compare_style_preview_var.get():
-                info_text = (
-                    f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
-                    " 当前默认复用 compare txt 侧输入作用域与时间窗；取消勾选可退回旧路径。"
-                )
-            else:
-                info_text = (
-                    f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
-                    " 当前已手动关闭复用，单图/单设备会继续走旧路径。"
-                )
+            info_text = (
+                f"已检测到可复用 compare 上下文（txt={len(context['ygas_paths'])} 个，dat=1 个）。"
+                " 单文件预览仍可复用对比图语义；直接生成图会优先走目标谱图。"
+            )
         except Exception:
             available = False
 
         self.single_compare_style_preview_available = available
+        self.single_compare_style_preview_var.set(bool(available))
         if self.single_compare_style_preview_check is not None:
-            self.single_compare_style_preview_check.configure(state="normal" if available else "disabled")
+            self.single_compare_style_preview_check.configure(state="disabled")
         self.single_compare_style_preview_info_var.set(info_text)
 
     def build_txt_compare_side_equivalent_payload(
@@ -2516,9 +2783,6 @@ class FileViewerApp:
         overlap_ratio: float | None = None,
         compare_context_key_prefix: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        if not self.single_compare_style_preview_var.get():
-            return None, "reuse_disabled_by_user"
-
         try:
             context = self.resolve_active_compare_context(selection_paths)
         except ValueError as exc:
@@ -2599,6 +2863,16 @@ class FileViewerApp:
         details["raw_source_rows"] = int(txt_summary.get("raw_rows", merged_ygas.source_row_count or len(merged_ygas.dataframe)))
         details["merged_rows"] = int(txt_summary.get("total_points", len(merged_ygas.dataframe)))
         details["rendered_point_count"] = int(len(payload["freq"]))
+        annotate_device_dispatch_details(
+            details,
+            effective_device_ids=["compare_txt_side"],
+            plot_execution_path=plot_execution_path,
+            render_semantics="single_device_compare_compat",
+            selection_file_count=len(selection_paths),
+            selected_txt_file_count=len(selection_paths),
+            selected_dat_file_count=0,
+            data_context_source="compare_context_reuse",
+        )
         visible_point_count_contract = build_series_point_count_contract(
             [
                 {
@@ -2729,6 +3003,16 @@ class FileViewerApp:
         details["single_device_selection_filtered_to_txt_side"] = bool(
             selection_summary.get("single_device_selection_filtered_to_txt_side", False)
         )
+        annotate_device_dispatch_details(
+            details,
+            effective_device_ids=[device_id],
+            plot_execution_path="single_device_compare_txt_side_equivalent",
+            render_semantics="single_device_compare_compat",
+            selection_file_count=int(selection_summary.get("selected_file_count", len(selected_txt_files))),
+            selected_txt_file_count=int(selection_summary.get("selected_txt_file_count", len(selected_txt_files))),
+            selected_dat_file_count=int(selection_summary.get("selected_dat_file_count", 0)),
+            data_context_source="compare_context_reuse",
+        )
         compare_geometry_series_results = list(payload.get("compare_geometry_series_results", []))
         if not compare_geometry_series_results:
             compare_geometry_series_results = self.build_compare_geometry_series_results(
@@ -2776,6 +3060,163 @@ class FileViewerApp:
             "end_dt": payload.get("end_dt"),
             "compare_geometry_series_results": compare_geometry_series_results,
         }, None
+
+    def build_dual_device_compare_dispatch_payload(
+        self,
+        *,
+        selected_files: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        active_compare_context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        normalized_selected_files = [Path(path) for path in selected_files]
+        compare_context = dict(active_compare_context or {})
+        compare_selection = compare_context.get("compare_selection")
+        if isinstance(compare_selection, tuple) and len(compare_selection) == 5:
+            parsed_a, label_a, parsed_b, label_b, selection_meta = compare_selection
+            resolved_start_dt = compare_context.get("start_dt")
+            resolved_end_dt = compare_context.get("end_dt")
+            strategy_label = str(
+                compare_context.get("compare_context_strategy_label")
+                or self.time_range_strategy_var.get().strip()
+                or "使用 txt+dat 共同时间范围"
+            )
+            has_txt_dat_context = True
+        else:
+            if len(normalized_selected_files) < 2:
+                return None, "insufficient_selected_files"
+            parsed_a = self.parse_profiled_file(normalized_selected_files[0])
+            parsed_b = self.parse_profiled_file(normalized_selected_files[1])
+            label_a = self.format_source_label(normalized_selected_files[0])
+            label_b = self.format_source_label(normalized_selected_files[1])
+            selection_meta = {"txt_summary": None, "dat_summary": None}
+            resolved_start_dt = start_dt
+            resolved_end_dt = end_dt
+            strategy_label = self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围"
+            has_txt_dat_context = False
+
+        resolved_pair = self.resolve_compare_pair_for_target_column(parsed_a, parsed_b, str(target_column))
+        if resolved_pair is None:
+            normalized_target = str(target_column).strip()
+            columns_a = {str(value) for value in parsed_a.suggested_columns}
+            columns_b = {str(value) for value in parsed_b.suggested_columns}
+            if normalized_target and normalized_target in columns_a and normalized_target in columns_b:
+                resolved_pair = {
+                    "a_col": normalized_target,
+                    "b_col": normalized_target,
+                    "label": f"{normalized_target} vs {normalized_target}",
+                }
+        if resolved_pair is None:
+            return None, "compare_pair_unresolved"
+
+        payload = self.prepare_dual_plot_payload(
+            parsed_a=parsed_a,
+            label_a=str(label_a),
+            parsed_b=parsed_b,
+            label_b=str(label_b),
+            pairs=[resolved_pair],
+            selection_meta=dict(selection_meta or {}),
+            compare_mode="时间段内 PSD 对比",
+            compare_scope=self.compare_scope_var.get().strip() or "单对单",
+            start_dt=resolved_start_dt,
+            end_dt=resolved_end_dt,
+            mapping_name=(
+                self.element_preset_var.get().strip()
+                if self.mapping_mode_var.get().strip() == "预设映射"
+                else str(target_column)
+            )
+            or str(target_column),
+            scheme_name=self.scheme_name_var.get().strip() or "默认方案",
+            alignment_strategy=self.get_alignment_strategy("时间段内 PSD 对比"),
+            plot_style=self.resolve_plot_style("时间段内 PSD 对比"),
+            plot_layout=self.resolve_plot_layout("时间段内 PSD 对比"),
+            fs_ui=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            match_tolerance=self.get_match_tolerance_seconds(default_value=0.2),
+            spectrum_type=self.get_selected_cross_spectrum_type("时间段内 PSD 对比"),
+            time_range_context={
+                "strategy_label": strategy_label,
+                "has_txt_dat_context": has_txt_dat_context,
+            },
+        )
+        if str(payload.get("kind") or "") != "psd_compare":
+            return None, "dual_compare_payload_not_psd_compare"
+        return payload, None
+
+    def finalize_device_dispatch_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        device_groups: list[dict[str, Any]],
+        effective_device_ids: list[str],
+        effective_device_count: int,
+        plot_execution_path: str,
+        render_semantics: str,
+        selection_file_count: int,
+        selected_txt_file_count: int,
+        selected_dat_file_count: int,
+        data_context_source: str,
+        time_range_policy: str | None = None,
+        active_compare_context: dict[str, Any] | None = None,
+        compare_geometry_series_results: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        finalized = dict(payload)
+        finalized["device_groups"] = list(device_groups)
+        finalized["device_count"] = int(effective_device_count)
+        finalized["effective_device_count"] = int(effective_device_count)
+        finalized["effective_device_ids"] = list(effective_device_ids)
+        finalized["file_count"] = int(selection_file_count)
+        finalized["selection_file_count"] = int(selection_file_count)
+        finalized["selected_txt_file_count"] = int(selected_txt_file_count)
+        finalized["selected_dat_file_count"] = int(selected_dat_file_count)
+        finalized["data_context_source"] = str(data_context_source or "")
+        finalized["dispatch_render_semantics"] = str(render_semantics)
+        finalized["plot_execution_path"] = str(plot_execution_path)
+        finalized["effective_device_source_hints"] = [
+            str(group.get("device_source") or group.get("group_device_source") or "")
+            for group in device_groups
+        ]
+        if compare_geometry_series_results is not None:
+            finalized["compare_geometry_series_results"] = list(compare_geometry_series_results)
+        if time_range_policy is not None and str(time_range_policy).strip():
+            finalized["time_range_policy"] = str(time_range_policy)
+        if active_compare_context is not None:
+            finalized["active_compare_context_available"] = True
+            finalized["active_compare_context_source"] = str(active_compare_context.get("compare_context_source") or "")
+            finalized["active_compare_context_dat_file_name"] = str(Path(active_compare_context["dat_path"]).name)
+            finalized["active_compare_context_time_range_policy"] = str(
+                active_compare_context.get("compare_context_time_range_policy") or ""
+            )
+        else:
+            finalized["active_compare_context_available"] = False
+
+        series_results: list[dict[str, Any]] = []
+        for raw_item in list(finalized.get("series_results", [])):
+            item = dict(raw_item)
+            details = dict(raw_item.get("details", {}))
+            details["series_count"] = int(effective_device_count)
+            details["analysis_context"] = str(plot_execution_path)
+            if time_range_policy is not None and str(time_range_policy).strip():
+                details["time_range_policy"] = str(time_range_policy)
+            annotate_device_dispatch_details(
+                details,
+                effective_device_ids=effective_device_ids,
+                plot_execution_path=plot_execution_path,
+                render_semantics=render_semantics,
+                selection_file_count=selection_file_count,
+                selected_txt_file_count=selected_txt_file_count,
+                selected_dat_file_count=selected_dat_file_count,
+                data_context_source=data_context_source,
+            )
+            item["details"] = details
+            series_results.append(item)
+        finalized["series_results"] = series_results
+        return finalized
 
     def build_compare_geometry_series_results(
         self,
@@ -3106,26 +3547,55 @@ class FileViewerApp:
         skipped_files: list[str] = []
         parsed_entries: list[dict[str, Any]] = []
         total_files = len(selected_files)
+        target_element = self.resolve_target_element_name()
 
         for index, path in enumerate(selected_files, start=1):
             if reporter is not None:
                 reporter(f"正在解析文件并识别设备… {index}/{total_files}：{path.name}")
+            preview_lines = read_preview_lines(path)
+            detected_profile = detect_file_profile(path, preview_lines)
+            device_key = self.resolve_grouped_spectral_device_key(detected_profile, path)
+            required_columns = self.build_grouped_spectral_required_columns(
+                target_column=target_column,
+                target_element=target_element,
+                device_key=device_key,
+            )
             try:
-                parsed = self.parse_target_profiled_file(path, device_kind="grouped_spectral", required_columns=[target_column])
+                parsed = self.parse_target_profiled_file(
+                    path,
+                    device_kind="grouped_spectral",
+                    required_columns=required_columns or [target_column],
+                )
             except Exception as exc:
                 skipped_files.append(f"{path.name}(解析失败: {exc})")
                 continue
 
-            if target_column not in parsed.dataframe.columns:
-                skipped_files.append(f"{path.name}(缺少列)")
+            resolved_target = self.resolve_grouped_spectral_target_column(
+                parsed,
+                path=path,
+                target_column=target_column,
+                target_element=target_element,
+                device_key=device_key,
+            )
+            if resolved_target is None:
+                skipped_files.append(f"{path.name}(缺少目标列映射)")
                 continue
+            aligned_parsed = self.align_grouped_spectral_target_column(
+                parsed,
+                target_column=target_column,
+                resolved_target_column=str(resolved_target["resolved_target_column"]),
+            )
 
             device_info = core.resolve_device_identifier(parsed, path)
             parsed_entries.append(
                 {
                     "path": path,
                     "parsed": parsed,
+                    "aligned_parsed": aligned_parsed,
                     "device_info": dict(device_info),
+                    "resolved_target_column": str(resolved_target["resolved_target_column"]),
+                    "target_resolution_source": str(resolved_target["resolution_source"]),
+                    "device_key": str(resolved_target.get("device_key") or device_key or ""),
                 }
             )
             group = grouped.setdefault(
@@ -3141,6 +3611,10 @@ class FileViewerApp:
                 {
                     "path": path,
                     "parsed": parsed,
+                    "aligned_parsed": aligned_parsed,
+                    "resolved_target_column": str(resolved_target["resolved_target_column"]),
+                    "target_resolution_source": str(resolved_target["resolution_source"]),
+                    "device_key": str(resolved_target.get("device_key") or device_key or ""),
                 }
             )
 
@@ -3156,7 +3630,7 @@ class FileViewerApp:
         for group in grouped.values():
             entries = list(group["entries"])
             merged_parsed, merge_metadata = core.merge_parsed_results_for_device_group(
-                [item["parsed"] for item in entries],
+                [item["aligned_parsed"] for item in entries],
                 source_paths=[item["path"] for item in entries],
                 device_id=group["device_id"],
             )
@@ -3171,6 +3645,14 @@ class FileViewerApp:
             group["source_paths"] = [item["path"] for item in entries]
             group["valid_value_count"] = valid_count
             group["selection_merge_scope"] = "device_group"
+            group["resolved_target_columns"] = sorted({
+                str(item["resolved_target_column"])
+                for item in entries
+            })
+            group["target_resolution_sources"] = [
+                str(item["target_resolution_source"])
+                for item in entries
+            ]
             device_groups.append(group)
 
         device_groups.sort(key=lambda item: str(item["device_label"]).lower())
@@ -3218,11 +3700,23 @@ class FileViewerApp:
         selection_device_id = str(selection_hint.get("device_id") or "selection_scope")
         selection_device_label = str(selection_hint.get("device_label") or selection_device_id)
         source_paths = list(selected_files)
+        resolved_target_columns = {
+            str(entry.get("resolved_target_column") or "").strip()
+            for entry in parsed_entries
+            if str(entry.get("resolved_target_column") or "").strip()
+        }
+        resolved_target_column_list = sorted(resolved_target_columns)
+        source_target_column = resolved_target_column_list[0] if resolved_target_column_list else str(target_column)
 
-        if profile_family == "ygas":
+        if profile_family == "ygas" and len(resolved_target_columns) == 1:
             merged_parsed, summary = core.load_and_merge_ygas_files_fast(
                 source_paths,
-                required_columns=[target_column],
+                required_columns=[source_target_column],
+            )
+            merged_parsed = self.align_grouped_spectral_target_column(
+                merged_parsed,
+                target_column=target_column,
+                resolved_target_column=source_target_column,
             )
             merge_metadata: dict[str, Any] = {
                 "device_id": selection_device_id,
@@ -3239,12 +3733,16 @@ class FileViewerApp:
             }
         else:
             merged_parsed, merge_metadata = core.merge_parsed_results_for_device_group(
-                [entry["parsed"] for entry in parsed_entries],
+                [entry.get("aligned_parsed", entry["parsed"]) for entry in parsed_entries],
                 source_paths=source_paths,
                 device_id=selection_device_id,
             )
             merge_metadata = dict(merge_metadata)
-            merge_metadata["merge_strategy"] = "selection_scope_profile_merge"
+            merge_metadata["merge_strategy"] = (
+                "selection_scope_profile_merge"
+                if profile_family != "ygas"
+                else "selection_scope_aligned_profile_merge"
+            )
             merge_metadata["selection_merge_scope"] = "selection_level"
             merge_metadata["group_device_source"] = "selection_scope:filename_hint"
             merge_metadata["normalized_hints"] = list(selection_hint.get("normalized_hints", []))
@@ -3267,7 +3765,875 @@ class FileViewerApp:
             "source_paths": source_paths,
             "valid_value_count": valid_count,
             "selection_merge_scope": str(merge_metadata.get("selection_merge_scope") or "selection_level"),
+            "resolved_target_columns": list(resolved_target_column_list),
+            "target_resolution_sources": [
+                str(entry.get("target_resolution_source") or "")
+                for entry in parsed_entries
+            ],
         }
+
+    def resolve_effective_device_groups(
+        self,
+        selected_files: list[Path],
+        *,
+        target_column: str,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized_selected_files = [Path(path) for path in selected_files]
+        selection_summary = self.extract_single_device_txt_selection(normalized_selected_files)
+        selected_txt_paths = list(selection_summary["selected_txt_paths"])
+        compare_context_paths = selected_txt_paths or list(normalized_selected_files)
+        if compare_context_paths:
+            self.ensure_auto_compare_context_for_selection(
+                compare_context_paths,
+                source="single_device_button_bootstrap",
+            )
+
+        device_groups, skipped_files = self.build_device_grouped_spectral_selection(
+            normalized_selected_files,
+            target_column=target_column,
+            reporter=reporter,
+        )
+        effective_device_ids = [str(group["device_id"]) for group in device_groups]
+        return {
+            "selection_summary": selection_summary,
+            "device_groups": device_groups,
+            "skipped_files": skipped_files,
+            "effective_device_count": int(len(device_groups)),
+            "effective_device_ids": effective_device_ids,
+            "data_context_source": "effective_device_grouping",
+        }
+
+    def resolve_target_spectrum_render_semantics(self, effective_device_count: int) -> str:
+        normalized_count = int(max(effective_device_count, 0))
+        if normalized_count <= 0:
+            return "target_spectrum_empty"
+        if normalized_count == 1:
+            return "target_spectrum_single_group"
+        if normalized_count == 2:
+            return "target_spectrum_dual_group"
+        return "target_spectrum_multi_group"
+
+    def resolve_target_spectrum_visible_series_scope(
+        self,
+        target_metadata: dict[str, Any],
+        *,
+        is_psd_mode: bool,
+    ) -> str:
+        if not is_psd_mode:
+            return "all_series"
+        selection_file_count = int(target_metadata.get("selection_file_count", 0) or 0)
+        selected_txt_file_count = int(target_metadata.get("selected_txt_file_count", 0) or 0)
+        selected_dat_file_count = int(target_metadata.get("selected_dat_file_count", 0) or 0)
+        if selection_file_count == 1 and selected_txt_file_count == 1 and selected_dat_file_count == 0:
+            return "ygas_only"
+        if selection_file_count == 1 and selected_dat_file_count == 1 and selected_txt_file_count == 0:
+            return "dat_only"
+        return "all_series"
+
+    def is_target_spectrum_series_visible(
+        self,
+        item: dict[str, Any],
+        *,
+        visible_series_scope: str,
+    ) -> bool:
+        if visible_series_scope == "all_series":
+            return True
+        device_kind = str(item.get("device_kind", "")).strip()
+        if visible_series_scope == "ygas_only":
+            return device_kind == "ygas"
+        if visible_series_scope == "dat_only":
+            return device_kind == "dat"
+        return True
+
+    def compute_positive_log_axis_limits(self, values: np.ndarray) -> tuple[float, float] | None:
+        value_array = np.asarray(values, dtype=float)
+        mask = np.isfinite(value_array) & (value_array > 0)
+        if not np.any(mask):
+            return None
+        positive_values = value_array[mask]
+        vmin = float(np.min(positive_values))
+        vmax = float(np.max(positive_values))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= 0:
+            return None
+        if math.isclose(vmin, vmax, rel_tol=1e-12, abs_tol=1e-18):
+            return vmin / 1.5, vmax * 1.5
+        log_min = float(np.log10(vmin))
+        log_max = float(np.log10(vmax))
+        padding = max((log_max - log_min) * 0.05, 0.05)
+        return 10 ** (log_min - padding), 10 ** (log_max + padding)
+
+    def build_target_spectrum_dispatch_groups(
+        self,
+        target_metadata: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        group_records = list(target_metadata.get("group_records", []))
+        kept_records = [
+            dict(record)
+            for record in group_records
+            if record.get("status") in {"保留", "手动保留"}
+        ]
+
+        device_groups: list[dict[str, Any]] = []
+        effective_device_ids: list[str] = []
+        for index, record in enumerate(kept_records, start=1):
+            raw_device_id = str(
+                record.get("group_key")
+                or record.get("group_label")
+                or record.get("ygas_label")
+                or f"target_group_{index}"
+            ).strip()
+            device_id = raw_device_id or f"target_group_{index}"
+            if device_id in effective_device_ids:
+                device_id = f"{device_id}#{index}"
+            effective_device_ids.append(device_id)
+
+            device_groups.append(
+                {
+                    "device_id": device_id,
+                    "device_label": str(record.get("group_label") or record.get("ygas_label") or device_id),
+                    "device_source": str(record.get("group_source") or "target_spectrum_grouping"),
+                    "group_device_source": str(record.get("group_source") or "target_spectrum_grouping"),
+                    "file_count": 1,
+                    "merge_strategy": "target_spectrum_grouping",
+                    "selection_merge_scope": "target_spectrum_group",
+                    "raw_source_rows": int(record.get("ygas_points", 0) or 0),
+                    "merged_rows": int(record.get("ygas_points", 0) or 0),
+                    "resolved_target_columns": [
+                        str(value)
+                        for value in (
+                            record.get("ygas_column"),
+                            record.get("dat_column"),
+                        )
+                        if str(value or "").strip()
+                    ],
+                    "target_resolution_sources": ["target_spectrum_grouping"],
+                }
+            )
+        return device_groups, effective_device_ids
+
+    def finalize_target_spectrum_dispatch_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        selection_file_count: int,
+        selected_txt_file_count: int,
+        selected_dat_file_count: int,
+        data_context_source: str,
+        active_compare_context: dict[str, Any] | None = None,
+        dat_context_file_name: str = "",
+    ) -> dict[str, Any]:
+        target_metadata = dict(payload.get("target_metadata", {}))
+        device_groups, effective_device_ids = self.build_target_spectrum_dispatch_groups(target_metadata)
+        effective_device_count = int(target_metadata.get("kept_group_count", len(device_groups)))
+        series_results = list(payload.get("series_results", []))
+        if effective_device_count <= 0 or not series_results:
+            raise ValueError("目标谱图 payload 未生成有效分组。")
+
+        first_details = dict(series_results[0].get("details", {}))
+        render_semantics = self.resolve_target_spectrum_render_semantics(effective_device_count)
+        time_range_policy = str(
+            target_metadata.get("time_range_policy")
+            or first_details.get("time_range_policy")
+            or (
+                active_compare_context.get("compare_context_time_range_policy")
+                if active_compare_context is not None
+                else ""
+            )
+            or ""
+        )
+        resolved_dat_context_file_name = str(dat_context_file_name or "").strip()
+        if not resolved_dat_context_file_name:
+            group_records = list(target_metadata.get("group_records", []))
+            if group_records:
+                resolved_dat_context_file_name = str(group_records[0].get("dat_label") or "").strip()
+
+        finalized = self.finalize_device_dispatch_payload(
+            payload,
+            device_groups=device_groups,
+            effective_device_ids=effective_device_ids,
+            effective_device_count=effective_device_count,
+            plot_execution_path="target_spectrum_render",
+            render_semantics=render_semantics,
+            selection_file_count=int(selection_file_count),
+            selected_txt_file_count=int(selected_txt_file_count),
+            selected_dat_file_count=int(selected_dat_file_count),
+            data_context_source=data_context_source,
+            time_range_policy=time_range_policy,
+            active_compare_context=active_compare_context,
+        )
+
+        target_metadata.update(
+            {
+                "effective_device_count": int(effective_device_count),
+                "effective_device_ids": list(effective_device_ids),
+                "target_spectrum_group_count": int(effective_device_count),
+                "plot_execution_path": "target_spectrum_render",
+                "render_semantics": render_semantics,
+                "selection_file_count": int(selection_file_count),
+                "selected_txt_file_count": int(selected_txt_file_count),
+                "selected_dat_file_count": int(selected_dat_file_count),
+                "data_context_source": data_context_source,
+                "time_range_policy": time_range_policy,
+                "current_plot_kind": "target_spectrum",
+                "default_dispatch_family": "target_spectrum",
+            }
+        )
+        if resolved_dat_context_file_name:
+            target_metadata["target_spectrum_context_dat_file_name"] = resolved_dat_context_file_name
+        if active_compare_context is not None:
+            target_metadata["active_compare_context_available"] = True
+            target_metadata["active_compare_context_dat_file_name"] = str(Path(active_compare_context["dat_path"]).name)
+            target_metadata["active_compare_context_time_range_policy"] = str(
+                active_compare_context.get("compare_context_time_range_policy") or ""
+            )
+        else:
+            target_metadata["active_compare_context_available"] = False
+
+        total_series_count = int(len(finalized.get("series_results", [])))
+        annotated_series_results: list[dict[str, Any]] = []
+        for raw_item in list(finalized.get("series_results", [])):
+            item = dict(raw_item)
+            details = dict(item.get("details", {}))
+            details["current_plot_kind"] = "target_spectrum"
+            details["target_spectrum_group_count"] = int(effective_device_count)
+            details["target_spectrum_series_count"] = int(total_series_count)
+            details["series_count"] = int(total_series_count)
+            if resolved_dat_context_file_name:
+                details["target_spectrum_context_dat_file_name"] = resolved_dat_context_file_name
+            item["details"] = details
+            annotated_series_results.append(item)
+
+        finalized["series_results"] = annotated_series_results
+        finalized["target_metadata"] = target_metadata
+        finalized["default_dispatch_family"] = "target_spectrum"
+        finalized["target_spectrum_group_count"] = int(effective_device_count)
+        return finalized
+
+    def ensure_target_spectrum_dispatch_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        series_results = list(payload.get("series_results", []))
+        if not series_results:
+            return payload
+        first_details = dict(series_results[0].get("details", {}))
+        if str(payload.get("plot_execution_path") or first_details.get("plot_execution_path") or "").strip():
+            return payload
+
+        target_metadata = dict(payload.get("target_metadata", {}))
+        total_group_count = int(target_metadata.get("total_group_count", target_metadata.get("kept_group_count", 0)) or 0)
+        selected_txt_file_count = max(total_group_count, 1)
+        selected_dat_file_count = 1 if total_group_count > 0 else 0
+        dat_context_file_name = ""
+        group_records = list(target_metadata.get("group_records", []))
+        if group_records:
+            dat_context_file_name = str(group_records[0].get("dat_label") or "").strip()
+        return self.finalize_target_spectrum_dispatch_payload(
+            payload,
+            selection_file_count=int(selected_txt_file_count + selected_dat_file_count),
+            selected_txt_file_count=int(selected_txt_file_count),
+            selected_dat_file_count=int(selected_dat_file_count),
+            data_context_source="target_spectrum_builder",
+            active_compare_context=None,
+            dat_context_file_name=dat_context_file_name,
+        )
+
+    def prepare_ygas_only_target_spectrum_dispatch_payload(
+        self,
+        selected_txt_paths: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        *,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        target_element = self.resolve_target_element_name()
+        ygas_required_columns = self.build_target_required_columns(
+            target_element=target_element,
+            device_kind="ygas",
+        )
+        use_requested_nsegment = self.should_target_spectrum_use_requested_nsegment(requested_nsegment)
+        selected_psd_kernel = core.LEGACY_TARGET_PSD_KERNEL_DEFAULT
+        skipped_windows: list[str] = []
+        group_records: list[dict[str, Any]] = []
+        wrapped_series_results: list[dict[str, Any]] = []
+        effective_nsegment_values: list[int] = []
+        positive_freq_values: list[int] = []
+        first_positive_freq_values: list[float] = []
+        ygas_windows: list[dict[str, Any]] = []
+        total_paths = len(selected_txt_paths)
+
+        def _resolve_ygas_fs(parsed: ParsedFileResult, frame: pd.DataFrame, ui_fs: float) -> float:
+            manual_override = not math.isclose(ui_fs, DEFAULT_FS, rel_tol=0.0, abs_tol=1e-9)
+            if manual_override:
+                return float(ui_fs)
+            estimated = core.estimate_fs_from_timestamp(frame, core.TIMESTAMP_COL)
+            if estimated:
+                return float(estimated)
+            return float(DEFAULT_FS)
+
+        def _build_skip_record(
+            *,
+            group_key: str,
+            labels: dict[str, str],
+            window_label: str,
+            window_start: pd.Timestamp | None,
+            window_end: pd.Timestamp | None,
+            reason: str,
+            ygas_column_name: str | None,
+        ) -> dict[str, Any]:
+            return {
+                "group_key": group_key,
+                "group_label": labels["group_label"],
+                "window_label": window_label,
+                "ygas_start": window_start,
+                "ygas_end": window_end,
+                "dat_start": None,
+                "dat_end": None,
+                "ygas_points": 0,
+                "dat_points": 0,
+                "ygas_fs": None,
+                "dat_fs": None,
+                "ygas_coverage_ratio": None,
+                "dat_coverage_ratio": None,
+                "ygas_leading_invalid_gap_s": None,
+                "dat_leading_invalid_gap_s": None,
+                "ygas_trailing_invalid_gap_s": None,
+                "dat_trailing_invalid_gap_s": None,
+                "ygas_non_null_ratio": None,
+                "dat_non_null_ratio": None,
+                "ygas_freq_points": 0,
+                "dat_freq_points": 0,
+                "ygas_column": ygas_column_name,
+                "dat_column": "",
+                "ygas_label": labels["ygas_label"],
+                "dat_label": "",
+                "keep": False,
+                "forced_include": False,
+                "reason": str(reason),
+                "status": "跳过",
+                "forceable": False,
+                "group_source": "ygas_only_target_spectrum",
+                "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+            }
+
+        for index, path in enumerate(selected_txt_paths, start=1):
+            if reporter is not None:
+                reporter(f"正在解析 ygas 文件 {index}/{total_paths}: {path.name}")
+            try:
+                parsed_ygas = self.parse_target_profiled_file(
+                    path,
+                    device_kind="ygas",
+                    required_columns=ygas_required_columns,
+                )
+                window_start, window_end, _window_points = core.get_parsed_time_bounds(parsed_ygas)
+                labels = core.build_legacy_group_labels(
+                    target_element=target_element,
+                    window_start=pd.Timestamp(window_start),
+                    ygas_path=path,
+                )
+                group_key = core.build_target_group_key(path, pd.Timestamp(window_start))
+                window_label = f"{pd.Timestamp(window_start):%Y-%m-%d %H:%M} ~ {pd.Timestamp(window_end):%H:%M}"
+                resolved_target_column = str(target_column or "").strip()
+                if resolved_target_column not in parsed_ygas.dataframe.columns:
+                    resolved_target_column = str(
+                        self.select_target_element_column(
+                            parsed_ygas,
+                            device_key="A",
+                            target_element=target_element,
+                        )
+                        or ""
+                    ).strip()
+                if not resolved_target_column:
+                    skipped_windows.append(f"{group_key}(未找到{target_element}列)")
+                    group_records.append(
+                        _build_skip_record(
+                            group_key=group_key,
+                            labels=labels,
+                            window_label=window_label,
+                            window_start=pd.Timestamp(window_start),
+                            window_end=pd.Timestamp(window_end),
+                            reason=f"未找到{target_element}列",
+                            ygas_column_name=None,
+                        )
+                    )
+                    continue
+                ygas_windows.append(
+                    {
+                        "path": path,
+                        "parsed": parsed_ygas,
+                        "column": resolved_target_column,
+                        "start": pd.Timestamp(window_start),
+                        "end": pd.Timestamp(window_end),
+                        "labels": labels,
+                        "group_key": group_key,
+                    }
+                )
+            except Exception as exc:
+                fallback_start = pd.Timestamp(start_dt) if start_dt is not None else None
+                fallback_end = pd.Timestamp(end_dt) if end_dt is not None else None
+                labels = {
+                    "group_label": path.name,
+                    "ygas_label": path.name,
+                    "dat_label": "",
+                }
+                group_records.append(
+                    _build_skip_record(
+                        group_key=path.name,
+                        labels=labels,
+                        window_label=path.name,
+                        window_start=fallback_start,
+                        window_end=fallback_end,
+                        reason=str(exc),
+                        ygas_column_name=str(target_column or "").strip() or None,
+                    )
+                )
+                skipped_windows.append(f"{path.name}({exc})")
+
+        if not ygas_windows:
+            raise ValueError(f"没有找到可用于生成“{target_element}”目标谱图的 ygas 时间窗口。")
+
+        txt_summary = core.build_range_summary_from_entries(
+            [
+                {
+                    "path": item["path"],
+                    "start": item["start"],
+                    "end": item["end"],
+                    "points": int(item["parsed"].timestamp_valid_count),
+                    "raw_rows": int(item["parsed"].source_row_count or len(item["parsed"].dataframe)),
+                    "valid_timestamp_points": int(item["parsed"].timestamp_valid_count),
+                }
+                for item in ygas_windows
+            ]
+        )
+        resolved_start, resolved_end, resolved_strategy_label = self.resolve_target_time_range_for_strategy(
+            self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            self.time_start_var.get().strip(),
+            self.time_end_var.get().strip(),
+            txt_summary,
+            None,
+        )
+        effective_start_override = pd.Timestamp(start_dt) if start_dt is not None else (
+            pd.Timestamp(resolved_start) if resolved_start is not None else None
+        )
+        effective_end_override = pd.Timestamp(end_dt) if end_dt is not None else (
+            pd.Timestamp(resolved_end) if resolved_end is not None else None
+        )
+        time_range_policy = (
+            "full_file"
+            if effective_start_override is None and effective_end_override is None
+            else "manual_time_range"
+        )
+        time_range_policy_label = "全文件" if time_range_policy == "full_file" else (
+            str(resolved_strategy_label or "手动时间范围")
+        )
+
+        for group_index, item in enumerate(sorted(ygas_windows, key=lambda value: pd.Timestamp(value["start"]))):
+            window_start = pd.Timestamp(item["start"])
+            window_end = pd.Timestamp(item["end"])
+            effective_start = max([window_start] + ([effective_start_override] if effective_start_override is not None else []))
+            effective_end = min([window_end] + ([effective_end_override] if effective_end_override is not None else []))
+            window_label = f"{effective_start:%Y-%m-%d %H:%M} ~ {effective_end:%H:%M}"
+            if effective_start >= effective_end:
+                reason = "不在当前目标时间范围内"
+                skipped_windows.append(f"{item['group_key']}({reason})")
+                group_records.append(
+                    _build_skip_record(
+                        group_key=str(item["group_key"]),
+                        labels=dict(item["labels"]),
+                        window_label=window_label,
+                        window_start=effective_start,
+                        window_end=effective_end,
+                        reason=reason,
+                        ygas_column_name=str(item["column"]),
+                    )
+                )
+                continue
+
+            try:
+                ygas_frame, ygas_meta = core.build_target_window_series(
+                    item["parsed"],
+                    str(item["column"]),
+                    effective_start,
+                    effective_end,
+                )
+                group_requested_nsegment = int(
+                    requested_nsegment
+                    if use_requested_nsegment
+                    else core.legacy_target_nsegment_resolver(len(ygas_frame))
+                )
+                ygas_fs = _resolve_ygas_fs(item["parsed"], ygas_frame, fs)
+                freq, density, details = core.compute_legacy_target_psd_from_array(
+                    ygas_frame["value"].to_numpy(dtype=float),
+                    float(ygas_fs),
+                    int(group_requested_nsegment),
+                    overlap_ratio,
+                    psd_kernel=selected_psd_kernel,
+                )
+                mask = core.build_spectrum_plot_mask(freq, density, CROSS_SPECTRUM_MAGNITUDE)
+                valid_freq_points = int(np.count_nonzero(mask))
+                if valid_freq_points <= 0:
+                    raise ValueError("目标谱图没有生成有效正频点。")
+                details = dict(details)
+                details.update(
+                    {
+                        "device_kind": "ygas",
+                        "data_context_source": "ygas_only_target_spectrum_no_dat",
+                        "time_range_policy": time_range_policy,
+                        "time_range_policy_label": time_range_policy_label,
+                        "time_range_policy_note": str(resolved_strategy_label or time_range_policy_label),
+                        "base_source_start": ygas_meta.get("source_start"),
+                        "base_source_end": ygas_meta.get("source_end"),
+                        "base_requested_start": ygas_meta.get("requested_start"),
+                        "base_requested_end": ygas_meta.get("requested_end"),
+                        "base_actual_start": ygas_meta.get("actual_start"),
+                        "base_actual_end": ygas_meta.get("actual_end"),
+                        "base_requested_duration_s": ygas_meta.get("requested_duration_s"),
+                        "base_actual_duration_s": ygas_meta.get("actual_duration_s"),
+                        "base_leading_invalid_gap_s": ygas_meta.get("leading_invalid_gap_s"),
+                        "base_trailing_invalid_gap_s": ygas_meta.get("trailing_invalid_gap_s"),
+                        "base_non_null_ratio": ygas_meta.get("non_null_ratio"),
+                        "base_timestamp_valid_count": ygas_meta.get("timestamp_valid_count"),
+                        "base_timestamp_valid_ratio": ygas_meta.get("timestamp_valid_ratio"),
+                        "base_timestamp_warning": ygas_meta.get("timestamp_warning"),
+                        "coverage_ratio": ygas_meta.get("coverage_ratio"),
+                        "window_start": effective_start,
+                        "window_end": effective_end,
+                        "selected_target_column": str(item["column"]),
+                    }
+                )
+                wrapped_series_results.append(
+                    {
+                        "label": str(item["labels"]["ygas_label"]),
+                        "device_kind": "ygas",
+                        "group_index": group_index,
+                        "freq": freq,
+                        "density": density,
+                        "valid_points": int(ygas_meta.get("valid_points", len(ygas_frame))),
+                        "valid_freq_points": valid_freq_points,
+                        "details": details,
+                    }
+                )
+                effective_nsegment = int(details.get("effective_nsegment", details.get("nsegment", 0)) or 0)
+                if effective_nsegment > 0:
+                    effective_nsegment_values.append(effective_nsegment)
+                positive_freq_values.append(valid_freq_points)
+                if details.get("first_positive_freq") is not None:
+                    first_positive_freq_values.append(float(details["first_positive_freq"]))
+                group_records.append(
+                    {
+                        "group_key": str(item["group_key"]),
+                        "group_label": str(item["labels"]["group_label"]),
+                        "window_label": window_label,
+                        "ygas_start": effective_start,
+                        "ygas_end": effective_end,
+                        "dat_start": None,
+                        "dat_end": None,
+                        "ygas_points": int(ygas_meta.get("valid_points", len(ygas_frame))),
+                        "dat_points": 0,
+                        "ygas_fs": float(ygas_fs),
+                        "dat_fs": None,
+                        "ygas_coverage_ratio": ygas_meta.get("coverage_ratio"),
+                        "dat_coverage_ratio": None,
+                        "ygas_leading_invalid_gap_s": ygas_meta.get("leading_invalid_gap_s"),
+                        "dat_leading_invalid_gap_s": None,
+                        "ygas_trailing_invalid_gap_s": ygas_meta.get("trailing_invalid_gap_s"),
+                        "dat_trailing_invalid_gap_s": None,
+                        "ygas_non_null_ratio": ygas_meta.get("non_null_ratio"),
+                        "dat_non_null_ratio": None,
+                        "ygas_freq_points": valid_freq_points,
+                        "dat_freq_points": 0,
+                        "ygas_column": str(item["column"]),
+                        "dat_column": "",
+                        "ygas_label": str(item["labels"]["ygas_label"]),
+                        "dat_label": "",
+                        "keep": True,
+                        "forced_include": False,
+                        "reason": "未提供dat，按单设备目标谱图语义生成",
+                        "status": "保留",
+                        "forceable": False,
+                        "group_source": "ygas_only_target_spectrum",
+                        "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+                        **core.build_legacy_target_spectrum_fields(
+                            "ygas",
+                            details,
+                            valid_freq_points=valid_freq_points,
+                        ),
+                        "dat_effective_fs": None,
+                        "dat_requested_nsegment": None,
+                        "dat_effective_nsegment": None,
+                        "dat_noverlap": None,
+                        "dat_nsegment_source": None,
+                        "dat_psd_kernel": None,
+                        "dat_positive_freq_points": None,
+                        "dat_first_positive_freq": None,
+                        "dat_window_type": None,
+                        "dat_detrend": None,
+                        "dat_overlap": None,
+                        "dat_scaling_mode": None,
+                        "dat_valid_freq_points": None,
+                    }
+                )
+            except Exception as exc:
+                skipped_windows.append(f"{item['group_key']}({exc})")
+                group_records.append(
+                    _build_skip_record(
+                        group_key=str(item["group_key"]),
+                        labels=dict(item["labels"]),
+                        window_label=window_label,
+                        window_start=effective_start,
+                        window_end=effective_end,
+                        reason=str(exc),
+                        ygas_column_name=str(item["column"]),
+                    )
+                )
+
+        if not wrapped_series_results:
+            raise ValueError("当前选择没有可用于目标谱图语义渲染的有效 ygas 谱值。")
+
+        group_count = int(len(wrapped_series_results))
+        render_semantics = self.resolve_target_spectrum_render_semantics(group_count)
+        for item in wrapped_series_results:
+            details = dict(item.get("details", {}))
+            details["plot_execution_path"] = "target_spectrum_render"
+            details["render_semantics"] = render_semantics
+            details["current_plot_kind"] = "target_spectrum"
+            details["selection_file_count"] = int(len(selected_txt_paths))
+            details["selected_file_count"] = int(len(selected_txt_paths))
+            details["selected_txt_file_count"] = int(len(selected_txt_paths))
+            details["selected_dat_file_count"] = 0
+            details["target_spectrum_group_count"] = group_count
+            details["target_spectrum_series_count"] = group_count
+            item["details"] = details
+
+        preview_frame = self.build_target_group_preview_frame(group_records)
+        qc_frame = self.build_target_group_qc_export_frame(group_records)
+        kept_group_records = [
+            dict(record)
+            for record in group_records
+            if record.get("status") in {"保留", "手动保留"}
+        ]
+        first_kept_record = kept_group_records[0]
+        requested_nsegment_summary = int(
+            requested_nsegment
+            if use_requested_nsegment
+            else max(
+                int(record.get("ygas_requested_nsegment", 0) or 0)
+                for record in kept_group_records
+            )
+        )
+        target_metadata = {
+            "mode_label": "目标谱图",
+            "spectrum_mode": core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+            "ygas_column": str(first_kept_record.get("ygas_column") or target_column),
+            "dat_column": None,
+            "ygas_target_column": str(first_kept_record.get("ygas_column") or target_column),
+            "dat_target_column": None,
+            "time_range_label": (
+                f"{time_range_policy_label}: "
+                f"{(effective_start_override if effective_start_override is not None else pd.Timestamp(txt_summary['start'])):%Y-%m-%d %H:%M:%S}"
+                " ~ "
+                f"{(effective_end_override if effective_end_override is not None else pd.Timestamp(txt_summary['end'])):%Y-%m-%d %H:%M:%S}"
+            ),
+            "group_records": group_records,
+            "group_preview_frame": preview_frame,
+            "group_qc_export_frame": qc_frame,
+            "total_group_count": int(len(group_records)),
+            "kept_group_count": group_count,
+            "skipped_group_count": int(sum(1 for record in group_records if record.get("status") == "跳过")),
+            "expected_series_count": group_count,
+            "actual_series_count": group_count,
+            "requested_nsegment": requested_nsegment_summary,
+            "legacy_target_uses_requested_nsegment": bool(use_requested_nsegment),
+            "legacy_target_use_analysis_params_enabled": bool(self.legacy_target_use_analysis_params_var.get()),
+            "legacy_psd_kernel_requested": selected_psd_kernel,
+            "legacy_psd_kernel": selected_psd_kernel,
+            "legacy_psd_kernel_selection_basis": "未提供 dat，沿用目标谱图默认 PSD 核。",
+            "legacy_psd_candidate_results": [],
+            "reference_line_mode": "fixed_f_pow_-2_3",
+            "reference_line_at_1hz": 1.0,
+            "effective_nsegment_values": effective_nsegment_values,
+            "positive_freq_points_min": min(positive_freq_values) if positive_freq_values else None,
+            "positive_freq_points_max": max(positive_freq_values) if positive_freq_values else None,
+            "first_positive_freq_min": min(first_positive_freq_values) if first_positive_freq_values else None,
+            "first_positive_freq_max": max(first_positive_freq_values) if first_positive_freq_values else None,
+            "matched_count_min": None,
+            "matched_count_max": None,
+            "tolerance_seconds_min": None,
+            "tolerance_seconds_max": None,
+            "generated_cross_series_count": None,
+            "generated_cross_series_roles": None,
+            "skipped_windows": skipped_windows,
+            "time_range_policy": time_range_policy,
+            "time_range_policy_label": time_range_policy_label,
+            "target_spectrum_context_mode": "ygas_only_no_dat",
+        }
+        payload = {
+            "series_results": wrapped_series_results,
+            "target_element": str(target_element),
+            "target_column": str(target_column),
+            "target_metadata": target_metadata,
+        }
+        finalized = self.finalize_target_spectrum_dispatch_payload(
+            payload,
+            selection_file_count=int(len(selected_txt_paths)),
+            selected_txt_file_count=int(len(selected_txt_paths)),
+            selected_dat_file_count=0,
+            data_context_source="ygas_only_target_spectrum_no_dat",
+            active_compare_context=None,
+            dat_context_file_name="",
+        )
+        finalized_target_metadata = dict(finalized.get("target_metadata", {}))
+        finalized_target_metadata["target_spectrum_context_mode"] = "ygas_only_no_dat"
+        finalized["target_metadata"] = finalized_target_metadata
+        return finalized
+
+    def prepare_default_target_spectrum_dispatch_payload(
+        self,
+        selected_files: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized_selected_files = [Path(path) for path in selected_files]
+        selection_summary = self.extract_single_device_txt_selection(normalized_selected_files)
+        selected_txt_paths = [Path(path) for path in selection_summary.get("selected_txt_paths", [])]
+        selected_dat_paths = [Path(path) for path in selection_summary.get("selected_dat_paths", [])]
+        if not selected_txt_paths:
+            raise ValueError("当前选择中没有可用于目标谱图的 txt/ygas 文件。")
+
+        self.ensure_auto_compare_context_for_selection(
+            selected_txt_paths,
+            source="direct_generate_target_spectrum",
+        )
+        active_compare_context: dict[str, Any] | None = None
+        try:
+            active_compare_context = self.resolve_active_compare_context(selected_txt_paths)
+        except ValueError:
+            active_compare_context = None
+
+        dat_path = selected_dat_paths[0] if selected_dat_paths else None
+        data_context_source = "selected_txt_plus_dat"
+        if dat_path is None and active_compare_context is not None:
+            dat_path = Path(active_compare_context["dat_path"])
+            data_context_source = "active_compare_context_reuse"
+        if dat_path is None:
+            return self.prepare_ygas_only_target_spectrum_dispatch_payload(
+                selected_txt_paths,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                reporter=reporter,
+            )
+
+        payload = self.prepare_target_spectrum_payload(
+            ygas_paths=selected_txt_paths,
+            dat_path=dat_path,
+            fs_ui=fs,
+            requested_nsegment=requested_nsegment,
+            overlap_ratio=overlap_ratio,
+            time_range_strategy=self.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+            start_raw=self.time_start_var.get().strip(),
+            end_raw=self.time_end_var.get().strip(),
+            grouping_mode="每个 ygas 文件视为一个组",
+            legacy_target_spectrum_mode=(
+                self.legacy_target_spectrum_mode_var.get().strip()
+                or core.LEGACY_TARGET_SPECTRUM_MODE_PSD
+            ),
+            use_requested_nsegment=self.should_target_spectrum_use_requested_nsegment(requested_nsegment),
+            forced_include_group_keys=self.get_selected_target_group_overrides(),
+            reporter=reporter,
+        )
+        finalized = self.finalize_target_spectrum_dispatch_payload(
+            payload,
+            selection_file_count=int(selection_summary.get("selected_file_count", len(normalized_selected_files))),
+            selected_txt_file_count=int(selection_summary.get("selected_txt_file_count", len(selected_txt_paths))),
+            selected_dat_file_count=int(selection_summary.get("selected_dat_file_count", len(selected_dat_paths))),
+            data_context_source=data_context_source,
+            active_compare_context=active_compare_context,
+            dat_context_file_name=str(dat_path.name),
+        )
+        finalized_target_metadata = dict(finalized.get("target_metadata", {}))
+        finalized_target_metadata["target_spectrum_context_mode"] = "txt_plus_dat"
+        finalized["target_metadata"] = finalized_target_metadata
+        return finalized
+
+    def prepare_selected_files_default_render_payload(
+        self,
+        selected_files: list[Path],
+        target_column: str,
+        fs: float,
+        requested_nsegment: int,
+        overlap_ratio: float,
+        start_dt: pd.Timestamp | None = None,
+        end_dt: pd.Timestamp | None = None,
+        reporter: Any | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self.prepare_default_target_spectrum_dispatch_payload(
+                selected_files,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                reporter=reporter,
+            )
+        except Exception as exc:
+            return {
+                "default_dispatch_family": "plain_spectral_fallback",
+                "target_column": str(target_column),
+                "target_spectrum_default_fallback_reason": str(exc),
+            }
+
+    def resolve_device_count_render_semantics(
+        self,
+        effective_device_count: int,
+        *,
+        single_device_compare_ready: bool = False,
+        dual_compare_ready: bool = False,
+    ) -> str:
+        normalized_count = int(max(effective_device_count, 0))
+        if normalized_count <= 0:
+            return "empty_device_selection"
+        if normalized_count == 1:
+            if single_device_compare_ready:
+                return "single_device_compare_psd"
+            return "single_device"
+        if normalized_count == 2:
+            if dual_compare_ready:
+                return "dual_psd_compare"
+            return "multi_device_compare"
+        return "multi_device_overlay"
+
+    def resolve_device_count_plot_execution_path(
+        self,
+        effective_device_count: int,
+        *,
+        single_device_compare_ready: bool = False,
+        dual_compare_ready: bool = False,
+    ) -> str:
+        normalized_count = int(max(effective_device_count, 0))
+        if normalized_count <= 0:
+            return "empty_device_selection"
+        if normalized_count == 1:
+            if single_device_compare_ready:
+                return "single_device_compare_psd_render"
+            return "single_device_spectrum"
+        if normalized_count == 2:
+            if dual_compare_ready:
+                return "dual_psd_compare"
+            return "multi_device_compare"
+        return "multi_device_overlay"
 
     def prepare_multi_spectral_compare_payload(
         self,
@@ -3280,34 +4646,36 @@ class FileViewerApp:
         end_dt: pd.Timestamp | None = None,
         reporter: Any | None = None,
     ) -> dict[str, Any]:
-        selection_summary = self.extract_single_device_txt_selection(selected_files)
-        selected_txt_paths = list(selection_summary["selected_txt_paths"])
-        compare_context_paths = selected_txt_paths or [Path(path) for path in selected_files]
-        if compare_context_paths:
-            self.ensure_auto_compare_context_for_selection(compare_context_paths, source="single_device_button_bootstrap")
-
-        compare_side_payload: dict[str, Any] | None = None
-        compare_side_fallback_reason: str | None = None
-        if selected_txt_paths:
-            compare_side_payload, compare_side_fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
-                selected_txt_paths,
-                target_column=target_column,
-                fs=fs,
-                requested_nsegment=requested_nsegment,
-                overlap_ratio=overlap_ratio,
-                selection_summary=selection_summary,
-            )
-        else:
-            compare_side_fallback_reason = "selection_not_txt_side"
-        if compare_side_payload is not None:
-            return compare_side_payload
-
+        normalized_selected_files = [Path(path) for path in selected_files]
         series_results: list[dict[str, Any]] = []
-        device_groups, skipped_files = self.build_device_grouped_spectral_selection(
-            selected_files,
+        resolved_groups = self.resolve_effective_device_groups(
+            normalized_selected_files,
             target_column=target_column,
             reporter=reporter,
         )
+        selection_summary = dict(resolved_groups["selection_summary"])
+        device_groups = list(resolved_groups["device_groups"])
+        skipped_files = list(resolved_groups["skipped_files"])
+        selected_txt_files = [Path(path) for path in selection_summary.get("selected_txt_paths", [])]
+
+        active_compare_context: dict[str, Any] | None = None
+        if selected_txt_files:
+            try:
+                active_compare_context = self.resolve_active_compare_context(selected_txt_files)
+            except ValueError:
+                active_compare_context = None
+
+        compare_geometry_series_results: list[dict[str, Any]] = []
+        if active_compare_context is not None:
+            compare_geometry_series_results = list(
+                self.build_compare_geometry_series_results(
+                    context=active_compare_context,
+                    target_column=target_column,
+                    fs_ui=fs,
+                    requested_nsegment=requested_nsegment,
+                    overlap_ratio=overlap_ratio,
+                )
+            )
 
         for index, group in enumerate(device_groups, start=1):
             if reporter is not None:
@@ -3337,12 +4705,12 @@ class FileViewerApp:
                 details["selection_merge_scope"] = str(group.get("selection_merge_scope") or "device_group")
                 details["source_paths"] = [str(path) for path in group["source_paths"]]
                 details["grouped_profile_name"] = str(merged_parsed.profile_name)
+                details["group_resolved_target_columns"] = list(group.get("resolved_target_columns", []))
+                details["group_target_resolution_sources"] = list(group.get("target_resolution_sources", []))
                 details["raw_source_rows"] = int(
                     group["merge_metadata"].get("raw_rows", merged_parsed.source_row_count or len(merged_parsed.dataframe))
                 )
                 details["merged_rows"] = int(group["merge_metadata"].get("merged_points", len(merged_parsed.dataframe)))
-                details["analysis_context"] = "single_device_grouped_spectrum"
-                details["plot_execution_path"] = "single_device_grouped_spectrum"
                 details["rendered_point_count"] = int(len(payload["freq"]))
                 details.update(
                     core.build_single_time_range_metadata(
@@ -3368,81 +4736,217 @@ class FileViewerApp:
                         "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
                         "selection_merge_scope": str(group.get("selection_merge_scope") or "device_group"),
                         "source_paths": [str(path) for path in group["source_paths"]],
+                        "resolved_target_columns": list(group.get("resolved_target_columns", [])),
+                        "target_resolution_sources": list(group.get("target_resolution_sources", [])),
                     }
                 )
             except Exception as exc:
                 skipped_files.append(f"{group['device_label']}(计算失败: {exc})")
 
-        for item in series_results:
-            item["details"]["series_count"] = int(len(series_results))
-        if len(series_results) == 1:
-            single_details = series_results[0]["details"]
-            single_details["single_device_execution_path"] = "legacy_device_group_scope"
-            single_details["single_device_selection_scope"] = str(
-                single_details.get("selection_merge_scope") or "device_group"
-            )
-            single_details["single_device_time_range_policy"] = str(single_details.get("time_range_policy") or "")
-            single_details["auto_compare_context_built"] = bool(self.auto_compare_context_available)
-            single_details["auto_compare_context_available"] = bool(self.auto_compare_context_available)
-            single_details["auto_compare_context_source"] = str(self.auto_compare_context_source or "")
-            single_details["auto_compare_context_dat_file_name"] = str(self.auto_compare_context_dat_file_name or "")
-            single_details["auto_compare_context_txt_count"] = int(self.auto_compare_context_txt_count or 0)
-            single_details["selected_file_count"] = int(selection_summary.get("selected_file_count", len(selected_files)))
-            single_details["selected_txt_file_count"] = int(selection_summary.get("selected_txt_file_count", 0))
-            single_details["selected_dat_file_count"] = int(selection_summary.get("selected_dat_file_count", 0))
-            single_details["single_device_selection_filtered_to_txt_side"] = bool(
-                selection_summary.get("single_device_selection_filtered_to_txt_side", False)
-            )
-            if compare_side_fallback_reason:
-                single_details["single_device_compare_side_fallback_reason"] = compare_side_fallback_reason
+        effective_device_count = int(len(series_results))
+        effective_device_ids = [str(item.get("device_id") or "") for item in series_results if str(item.get("device_id") or "").strip()]
+        selection_file_count = int(selection_summary.get("selected_file_count", len(normalized_selected_files)))
+        selected_txt_file_count = int(selection_summary.get("selected_txt_file_count", 0))
+        selected_dat_file_count = int(selection_summary.get("selected_dat_file_count", 0))
+        exported_device_groups = [
+            {
+                "device_id": str(group["device_id"]),
+                "device_label": str(group["device_label"]),
+                "device_source": str(group["device_source"]),
+                "group_device_source": str(group["device_source"]),
+                "file_count": int(group["file_count"]),
+                "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
+                "selection_merge_scope": str(group.get("selection_merge_scope") or "device_group"),
+                "raw_source_rows": int(
+                    group["merge_metadata"].get(
+                        "raw_rows",
+                        group["merged_parsed"].source_row_count or len(group["merged_parsed"].dataframe),
+                    )
+                ),
+                "merged_rows": int(group["merge_metadata"].get("merged_points", len(group["merged_parsed"].dataframe))),
+                "resolved_target_columns": list(group.get("resolved_target_columns", [])),
+                "target_resolution_sources": list(group.get("target_resolution_sources", [])),
+            }
+            for group in device_groups
+        ]
 
-        return {
-            "target_column": target_column,
-            "series_results": series_results,
-            "skipped_files": skipped_files,
-            "device_groups": [
-                {
-                    "device_id": str(group["device_id"]),
-                    "device_label": str(group["device_label"]),
-                    "device_source": str(group["device_source"]),
-                    "group_device_source": str(group["device_source"]),
-                    "file_count": int(group["file_count"]),
-                    "merge_strategy": str(group["merge_metadata"].get("merge_strategy", "")),
-                    "selection_merge_scope": str(group.get("selection_merge_scope") or "device_group"),
-                    "raw_source_rows": int(
-                        group["merge_metadata"].get(
-                            "raw_rows",
-                            group["merged_parsed"].source_row_count or len(group["merged_parsed"].dataframe),
-                        )
-                    ),
-                    "merged_rows": int(group["merge_metadata"].get("merged_points", len(group["merged_parsed"].dataframe))),
-                }
-                for group in device_groups
-            ],
-            "device_count": len(series_results),
-            "file_count": len(selected_files),
-            "start_dt": start_dt,
-            "end_dt": end_dt,
-        }
+        single_device_compare_payload: dict[str, Any] | None = None
+        if effective_device_count == 1 and selected_txt_files:
+            single_device_compare_payload, _fallback_reason = self.build_single_device_txt_compare_equivalent_payload(
+                selected_txt_files,
+                target_column=target_column,
+                fs=fs,
+                requested_nsegment=requested_nsegment,
+                overlap_ratio=overlap_ratio,
+                selection_summary=selection_summary,
+            )
+            if single_device_compare_payload is not None and not list(
+                single_device_compare_payload.get("compare_geometry_series_results", [])
+            ):
+                single_device_compare_payload = None
+
+        dual_compare_payload: dict[str, Any] | None = None
+        if effective_device_count == 2:
+            dual_compare_payload, _fallback_reason = self.build_dual_device_compare_dispatch_payload(
+                selected_files=normalized_selected_files,
+                target_column=target_column,
+                fs=fs,
+                requested_nsegment=requested_nsegment,
+                overlap_ratio=overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                active_compare_context=active_compare_context,
+            )
+
+        single_device_compare_ready = single_device_compare_payload is not None
+        dual_compare_ready = dual_compare_payload is not None
+        plot_execution_path = self.resolve_device_count_plot_execution_path(
+            effective_device_count,
+            single_device_compare_ready=single_device_compare_ready,
+            dual_compare_ready=dual_compare_ready,
+        )
+        render_semantics = self.resolve_device_count_render_semantics(
+            effective_device_count,
+            single_device_compare_ready=single_device_compare_ready,
+            dual_compare_ready=dual_compare_ready,
+        )
+        time_range_policy = ""
+        if active_compare_context is not None:
+            time_range_policy = str(active_compare_context.get("compare_context_time_range_policy") or "")
+        elif series_results:
+            time_range_policy = str(series_results[0]["details"].get("time_range_policy") or "")
+
+        if effective_device_count == 1 and single_device_compare_payload is not None:
+            final_payload = dict(single_device_compare_payload)
+            final_data_context_source = "compare_context_reuse"
+        elif effective_device_count == 2 and dual_compare_payload is not None:
+            final_payload = dict(dual_compare_payload)
+            final_data_context_source = (
+                "compare_context_reuse"
+                if active_compare_context is not None
+                else str(resolved_groups.get("data_context_source") or "effective_device_grouping")
+            )
+        else:
+            final_payload = {
+                "target_column": target_column,
+                "series_results": series_results,
+                "skipped_files": skipped_files,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            }
+            final_data_context_source = str(resolved_groups.get("data_context_source") or "effective_device_grouping")
+
+        final_payload["target_column"] = target_column
+        final_payload["skipped_files"] = list(final_payload.get("skipped_files", skipped_files))
+        if "start_dt" not in final_payload:
+            final_payload["start_dt"] = active_compare_context.get("start_dt") if active_compare_context is not None else start_dt
+        if "end_dt" not in final_payload:
+            final_payload["end_dt"] = active_compare_context.get("end_dt") if active_compare_context is not None else end_dt
+
+        return self.finalize_device_dispatch_payload(
+            final_payload,
+            device_groups=exported_device_groups,
+            effective_device_ids=effective_device_ids,
+            effective_device_count=effective_device_count,
+            plot_execution_path=plot_execution_path,
+            render_semantics=render_semantics,
+            selection_file_count=selection_file_count,
+            selected_txt_file_count=selected_txt_file_count,
+            selected_dat_file_count=selected_dat_file_count,
+            data_context_source=final_data_context_source,
+            time_range_policy=time_range_policy,
+            active_compare_context=active_compare_context,
+            compare_geometry_series_results=compare_geometry_series_results
+            if compare_geometry_series_results
+            else final_payload.get("compare_geometry_series_results"),
+        )
+
+    def dispatch_spectral_render_by_device_count(self, payload: dict[str, Any]) -> None:
+        series_results = list(payload.get("series_results", []))
+        effective_device_count = int(
+            payload.get("effective_device_count", payload.get("device_count", len(series_results)))
+        )
+        if effective_device_count <= 0 or not series_results:
+            raise ValueError("按有效设备数分流时没有可用设备。")
+        if effective_device_count == 1 and str(payload.get("plot_execution_path") or "") == "single_device_compare_psd_render":
+            self.render_single_device_compare_psd_payload(payload)
+            return
+        if effective_device_count == 1:
+            self.render_single_device_spectrum_payload(payload)
+            return
+        if effective_device_count == 2 and str(payload.get("plot_execution_path") or "") == "dual_psd_compare":
+            self.on_prepared_dual_plot_ready(payload)
+            return
+        self.render_multi_device_compare_payload(payload)
+
+    def render_single_device_spectrum_payload(self, payload: dict[str, Any]) -> None:
+        self.plot_multi_spectral_results(
+            str(payload["target_column"]),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
+
+    def render_multi_device_compare_payload(self, payload: dict[str, Any]) -> None:
+        self.plot_multi_spectral_results(
+            str(payload["target_column"]),
+            list(payload["series_results"]),
+            list(payload["skipped_files"]),
+            payload=payload,
+        )
 
     def on_multi_spectral_compare_ready(self, payload: dict[str, Any]) -> None:
         target_column = str(payload["target_column"])
         series_results = list(payload["series_results"])
         skipped_files = list(payload["skipped_files"])
-        device_count = int(payload.get("device_count", len(series_results)))
+        device_count = int(
+            payload.get("effective_device_count", payload.get("device_count", len(series_results)))
+        )
         if not series_results:
             self.status_var.set("设备图谱生成失败：没有有效系列")
             self.update_diagnostic_info(layout="设备分组模式", analysis_label=target_column, batch_success=0, batch_skips=len(skipped_files))
             self.render_plot_message("按设备分组后没有找到可用于生成图谱的有效系列。", level="warning")
             messagebox.showerror("分析失败", "所选文件在设备分组后没有可用于生成图谱的有效数据。")
             return
-        mode_title = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
+        if device_count == 1:
+            mode_title = "单设备图谱"
+        elif device_count == 2:
+            mode_title = "设备对比图"
+        else:
+            mode_title = "多设备图谱"
         self.status_var.set(f"正在生成图：{mode_title} / {target_column}")
         self.root.update_idletasks()
-        if self.should_render_single_device_with_compare_psd_semantics(payload):
-            self.render_single_device_compare_psd_payload(payload)
+        self.dispatch_spectral_render_by_device_count(payload)
+
+    def on_selected_files_default_plot_ready(self, payload: dict[str, Any]) -> None:
+        if str(payload.get("default_dispatch_family") or "") == "target_spectrum":
+            target_element = str(payload.get("target_element") or payload.get("target_column") or "目标谱图")
+            self.status_var.set(f"正在生成图：目标谱图 / {target_element}")
+            self.root.update_idletasks()
+            self.on_target_spectrum_ready(payload)
             return
-        self.plot_multi_spectral_results(target_column, series_results, skipped_files, payload=payload)
+        if str(payload.get("default_dispatch_family") or "") == "plain_spectral_fallback":
+            fallback_reason = str(payload.get("target_spectrum_default_fallback_reason") or "").strip()
+            target_column = str(payload.get("target_column") or (self.selected_columns[0] if self.selected_columns else ""))
+            fallback_quiet = bool(self.pending_selected_files_default_render_quiet)
+            if fallback_reason:
+                self.render_plot_message(
+                    f"目标谱图主链不可用，已回退普通功率谱密度：{fallback_reason}",
+                    level="warning",
+                )
+            if target_column:
+                self.status_var.set(f"正在生成图：功率谱密度 / {target_column}")
+                self.root.update_idletasks()
+            previous_reason = self.pending_direct_generate_target_spectrum_fallback_reason
+            self.pending_direct_generate_target_spectrum_fallback_reason = (
+                fallback_reason or "target_spectrum_payload_unavailable"
+            )
+            try:
+                self.perform_analysis("spectral", quiet=fallback_quiet)
+            finally:
+                self.pending_direct_generate_target_spectrum_fallback_reason = previous_reason
+            return
+        self.on_multi_spectral_compare_ready(payload)
 
     def prepare_dual_compare_payload(
         self,
@@ -6163,7 +7667,10 @@ class FileViewerApp:
         self.auto_analysis_after_id = None
         chosen = self.selected_columns
         if len(chosen) == 1:
-            self.perform_analysis("spectral", quiet=True)
+            if self.current_data_source_kind == "file" and self.get_selected_file_paths():
+                self.perform_default_single_column_render(quiet=True)
+            else:
+                self.perform_analysis("spectral", quiet=True)
         elif len(chosen) == 2:
             self.perform_analysis("cross", quiet=True)
         elif len(chosen) == 0:
@@ -6192,15 +7699,11 @@ class FileViewerApp:
         chosen = self.selected_columns
         selected_files = self.get_selected_file_paths()
 
-        if len(chosen) == 1 and len(selected_files) > 1:
-            if messagebox.askyesno("生成图", "检测到已选择多个文件，是否按设备分组后生成图谱？\n\n单设备会先合并同设备文件，多设备会保留叠加对比。"):
+        if len(chosen) == 1:
+            if selected_files:
                 self.perform_multi_spectral_compare()
             else:
                 self.perform_analysis("spectral")
-            return
-
-        if len(chosen) == 1:
-            self.perform_analysis("spectral")
             return
 
         if len(chosen) == 2:
@@ -6216,6 +7719,46 @@ class FileViewerApp:
         self.status_var.set("生成图失败：选择列数量不正确")
         self.update_diagnostic_info(layout=self.current_layout_label)
         self.render_plot_message("当前最多支持 1 列功率谱密度或 2 列互谱分析。", level="warning")
+
+    def perform_default_single_column_render(self, quiet: bool = False) -> None:
+        selected_files = self.get_selected_file_paths()
+        if not selected_files or self.current_data_source_kind == "comparison_analysis":
+            self.perform_analysis("spectral", quiet=quiet)
+            return
+
+        try:
+            target_column = self.selected_columns[0]
+            fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
+            start_dt, end_dt = self.resolve_optional_time_range_inputs()
+            payload = self.prepare_selected_files_default_render_payload(
+                selected_files,
+                target_column,
+                fs,
+                requested_nsegment,
+                overlap_ratio,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
+            previous_quiet = bool(self.pending_selected_files_default_render_quiet)
+            self.pending_selected_files_default_render_quiet = bool(quiet)
+            try:
+                self.on_selected_files_default_plot_ready(payload)
+            finally:
+                self.pending_selected_files_default_render_quiet = previous_quiet
+            self.last_param_error_message = None
+        except Exception as exc:
+            message = str(exc)
+            self.status_var.set(f"分析失败：{message}")
+            self.update_diagnostic_info(layout=self.current_layout_label)
+            level = "warning" if message.startswith("参数错误") else "error"
+            self.render_plot_message(message, level=level)
+            is_param_error = message.startswith("参数错误")
+            if is_param_error:
+                if self.last_param_error_message != message and not quiet:
+                    messagebox.showerror("参数错误", message)
+                self.last_param_error_message = message
+            elif not quiet:
+                messagebox.showerror("分析失败", message)
 
     def perform_analysis(self, analysis_type: str, quiet: bool = False) -> None:
         try:
@@ -6305,6 +7848,15 @@ class FileViewerApp:
             raise ValueError("参数错误：OVERLAP_RATIO 必须在 [0, 1) 范围内。")
 
         return fs, nsegment, overlap_ratio
+
+    def should_target_spectrum_use_requested_nsegment(self, requested_nsegment: int) -> bool:
+        if bool(self.legacy_target_use_analysis_params_var.get()):
+            return True
+        try:
+            normalized_requested_nsegment = int(requested_nsegment)
+        except (TypeError, ValueError):
+            return False
+        return normalized_requested_nsegment != int(DEFAULT_NSEGMENT)
 
     def get_selected_cross_spectrum_type(self, compare_mode: str | None = None) -> str:
         if compare_mode == "互谱幅值":
@@ -6400,15 +7952,20 @@ class FileViewerApp:
 
     def spectral_analysis(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         col = self.selected_columns[0]
+        direct_generate_fallback_reason = str(
+            self.pending_direct_generate_target_spectrum_fallback_reason or ""
+        ).strip()
+        force_plain_psd_fallback = bool(direct_generate_fallback_reason)
         if self.current_data_source_kind == "file" and self.current_file_parsed is not None:
-            compare_equivalent_payload = self.build_single_txt_compare_equivalent_payload(col)
-            if compare_equivalent_payload is not None:
-                details = dict(compare_equivalent_payload["details"])
-                return (
-                    np.asarray(compare_equivalent_payload["freq"], dtype=float),
-                    np.asarray(compare_equivalent_payload["density"], dtype=float),
-                    details,
-                )
+            if not force_plain_psd_fallback:
+                compare_equivalent_payload = self.build_single_txt_compare_equivalent_payload(col)
+                if compare_equivalent_payload is not None:
+                    details = dict(compare_equivalent_payload["details"])
+                    return (
+                        np.asarray(compare_equivalent_payload["freq"], dtype=float),
+                        np.asarray(compare_equivalent_payload["density"], dtype=float),
+                        details,
+                    )
             start_dt, end_dt = self.resolve_optional_time_range_inputs()
             payload = self.compute_base_psd_payload(
                 self.current_file_parsed,
@@ -6419,7 +7976,6 @@ class FileViewerApp:
             )
             details = dict(payload["details"])
             details["analysis_context"] = "single_file_base_spectrum"
-            details["plot_execution_path"] = "single_file_base_spectrum"
             details.update(
                 core.build_single_time_range_metadata(
                     start_dt=start_dt,
@@ -6431,6 +7987,22 @@ class FileViewerApp:
                     actual_end=details.get("base_actual_end"),
                 )
             )
+            selection_summary = self.extract_single_device_txt_selection([Path(self.current_file)])
+            device_id = core.resolve_device_identifier(self.current_file_parsed, Path(self.current_file)).get("device_id")
+            annotate_device_dispatch_details(
+                details,
+                effective_device_ids=[str(device_id or Path(self.current_file).stem)],
+                plot_execution_path="single_device_spectrum",
+                render_semantics="single_device",
+                selection_file_count=1,
+                selected_txt_file_count=int(selection_summary.get("selected_txt_file_count", 0)),
+                selected_dat_file_count=int(selection_summary.get("selected_dat_file_count", 0)),
+                data_context_source="current_file",
+            )
+            if force_plain_psd_fallback:
+                details["single_txt_execution_path"] = "direct_generate_plain_spectral_fallback"
+                details["single_txt_selection_scope"] = "current_file"
+                details["direct_generate_target_spectrum_fallback_reason"] = direct_generate_fallback_reason
             return np.asarray(payload["freq"], dtype=float), np.asarray(payload["density"], dtype=float), details
         data = self.column_data[col]
         return self.compute_psd_from_array(data)
@@ -7731,7 +9303,7 @@ class FileViewerApp:
             self.ensure_legacy_target_selection_valid(ygas_paths, dat_path, other_paths)
 
             fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
-            use_requested_nsegment = bool(self.legacy_target_use_analysis_params_var.get())
+            use_requested_nsegment = self.should_target_spectrum_use_requested_nsegment(requested_nsegment)
             legacy_target_spectrum_mode = (
                 self.legacy_target_spectrum_mode_var.get().strip() or core.LEGACY_TARGET_SPECTRUM_MODE_PSD
             )
@@ -7785,6 +9357,7 @@ class FileViewerApp:
         self.on_target_spectrum_ready(payload)
 
     def on_target_spectrum_ready(self, payload: dict[str, Any]) -> None:
+        payload = self.ensure_target_spectrum_dispatch_payload(payload)
         target_metadata = dict(payload["target_metadata"])
         self.current_data_source_kind = "legacy_target_spectrum"
         self.current_file_parsed = None
@@ -7824,6 +9397,10 @@ class FileViewerApp:
             if is_psd_mode
             else str(target_metadata.get("display_semantics") or series_results[0].get("details", {}).get("display_semantics") or "")
         )
+        visible_series_scope = self.resolve_target_spectrum_visible_series_scope(
+            target_metadata,
+            is_psd_mode=is_psd_mode,
+        )
 
         if is_psd_mode:
             series_results = sorted(
@@ -7854,8 +9431,11 @@ class FileViewerApp:
         ax = self.figure.add_subplot(111)
         ax.set_xscale("log")
 
+        visible_series_results: list[dict[str, Any]] = []
         combined_freq: list[np.ndarray] = []
         combined_values: list[np.ndarray] = []
+        reference_freq: list[np.ndarray] = []
+        reference_values: list[np.ndarray] = []
         point_summaries: list[str] = []
         aligned_frames: list[pd.DataFrame] = []
 
@@ -7881,6 +9461,10 @@ class FileViewerApp:
             values_plot = y_values[mask]
             if len(freq_plot) == 0:
                 continue
+            reference_freq.append(freq_plot)
+            reference_values.append(values_plot)
+            if not self.is_target_spectrum_series_visible(item, visible_series_scope=visible_series_scope):
+                continue
 
             self.apply_series_style(
                 ax,
@@ -7896,6 +9480,12 @@ class FileViewerApp:
                 line_style=str(style["linestyle"]),
                 zorder=float(style["zorder"]),
             )
+            visible_item = dict(item)
+            visible_details = dict(visible_item.get("details", {}))
+            visible_details["target_spectrum_visible_series_scope"] = visible_series_scope
+            visible_details["target_spectrum_visible_series_count"] = 0
+            visible_item["details"] = visible_details
+            visible_series_results.append(visible_item)
             combined_freq.append(freq_plot)
             combined_values.append(values_plot)
             if is_psd_mode:
@@ -7916,10 +9506,12 @@ class FileViewerApp:
 
         all_freq = np.concatenate(combined_freq)
         all_values = np.concatenate(combined_values)
+        reference_all_freq = np.concatenate(reference_freq) if reference_freq else all_freq
+        reference_all_values = np.concatenate(reference_values) if reference_values else all_values
         if is_psd_mode or display_semantics == core.CROSS_DISPLAY_SEMANTICS_ABS or spectrum_type == CROSS_SPECTRUM_MAGNITUDE:
             ax.set_yscale("log")
         else:
-            max_abs = float(np.nanmax(np.abs(all_values))) if len(all_values) else 0.0
+            max_abs = float(np.nanmax(np.abs(reference_all_values))) if len(reference_all_values) else 0.0
             linthresh = max(max_abs * 1e-3, 1e-12)
             ax.set_yscale("symlog", linthresh=linthresh)
             ax.axhline(0.0, color="#666666", linestyle="--", linewidth=1.0, alpha=0.8, zorder=1)
@@ -7927,8 +9519,8 @@ class FileViewerApp:
         if is_psd_mode:
             self.add_selected_reference_slopes(
                 ax,
-                all_freq,
-                all_values,
+                reference_all_freq,
+                reference_all_values,
                 is_psd=True,
                 use_fixed_power_law=True,
                 amplitude_at_1hz=1.0,
@@ -7942,11 +9534,19 @@ class FileViewerApp:
             ylabel = display_meta["ylabel"]
             self.add_selected_reference_slopes(
                 ax,
-                all_freq,
-                all_values,
+                reference_all_freq,
+                reference_all_values,
                 is_psd=False,
                 spectrum_type=spectrum_type,
             )
+
+        if visible_series_scope != "all_series" and is_psd_mode:
+            x_limits = self.compute_positive_log_axis_limits(reference_all_freq)
+            y_limits = self.compute_positive_log_axis_limits(reference_all_values)
+            if x_limits is not None:
+                ax.set_xlim(*x_limits)
+            if y_limits is not None:
+                ax.set_ylim(*y_limits)
 
         ax.set_title(title)
         ax.set_xlabel("Frequency (Hz)")
@@ -7969,12 +9569,18 @@ class FileViewerApp:
             ]
         self.current_result_freq = None
         self.current_result_values = None
-        self.current_result_frame = self.build_overlay_export_frame(series_results)
+        for visible_item in visible_series_results:
+            visible_details = dict(visible_item.get("details", {}))
+            visible_details["target_spectrum_visible_series_count"] = int(len(visible_series_results))
+            visible_item["details"] = visible_details
+        self.current_result_frame = self.build_overlay_export_frame(visible_series_results)
         self.current_aligned_frame = None
         if aligned_frames:
             self.current_target_plot_metadata["aligned_frames"] = aligned_frames
         else:
             self.current_target_plot_metadata.pop("aligned_frames", None)
+        self.current_target_plot_metadata["target_spectrum_visible_series_scope"] = visible_series_scope
+        self.current_target_plot_metadata["target_spectrum_visible_series_count"] = int(len(visible_series_results))
         self.current_aligned_metadata = {
             "spectrum_mode": spectrum_mode,
             "alignment_strategy": target_metadata.get("alignment_strategy"),
@@ -7996,9 +9602,9 @@ class FileViewerApp:
                     ),
                 }
             )
-        self.current_compare_files = [str(item["label"]) for item in series_results]
+        self.current_compare_files = [str(item["label"]) for item in visible_series_results]
 
-        first_details = dict(series_results[0]["details"])
+        first_details = dict(visible_series_results[0]["details"])
         mode_label = str(target_metadata.get("mode_label", "目标谱图"))
         group_records = list(target_metadata.get("group_records", []))
         kept_group_count = int(
@@ -8016,12 +9622,29 @@ class FileViewerApp:
         total_group_count = int(target_metadata.get("total_group_count", len(group_records)))
         expected_series_count = int(target_metadata.get("expected_series_count", len(series_results)))
         actual_series_count = int(target_metadata.get("actual_series_count", len(series_results)))
+        visible_series_count = int(len(visible_series_results))
         requested_nsegment_ui = int(
             target_metadata.get(
                 "requested_nsegment",
                 first_details.get("requested_nsegment", first_details.get("nsegment", 0)),
             )
         )
+        target_context_mode = str(target_metadata.get("target_spectrum_context_mode") or "").strip()
+        target_context_dat_file_name = str(target_metadata.get("target_spectrum_context_dat_file_name") or "").strip()
+        if self.current_result_frame is not None and not self.current_result_frame.empty:
+            self.current_result_frame = self.attach_metadata_columns(
+                self.current_result_frame,
+                {
+                    "current_plot_kind": "target_spectrum",
+                    "plot_execution_path": "target_spectrum_render",
+                    "render_semantics": str(target_metadata.get("render_semantics") or first_details.get("render_semantics") or ""),
+                    "target_spectrum_group_count": kept_group_count,
+                    "target_spectrum_visible_series_scope": visible_series_scope,
+                    "target_spectrum_visible_series_count": visible_series_count,
+                    "target_spectrum_context_mode": target_context_mode or None,
+                    "target_spectrum_context_dat_file_name": target_context_dat_file_name or None,
+                },
+            )
         effective_nsegment_values = [
             int(value)
             for value in target_metadata.get("effective_nsegment_values", [])
@@ -8062,15 +9685,26 @@ class FileViewerApp:
             f"plot_style={plot_style}",
             f"color_mode={color_mode}",
             f"当前目标要素={target_element}",
+            *build_device_dispatch_items(first_details, include_plot_execution_path=True),
+            f"target_spectrum_group_count={kept_group_count}",
+            f"target_spectrum_visible_series_scope={visible_series_scope}",
+            f"target_spectrum_visible_series_count={visible_series_count}",
+            "current_plot_kind=target_spectrum",
             f"总组数={total_group_count}",
             f"保留组数={kept_group_count}",
             f"跳过组数={skipped_group_count}",
             f"预期系列数={expected_series_count}",
             f"实际系列数={actual_series_count}",
-            f"目标谱图沿用当前分析参数={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
+            f"可见系列数={visible_series_count}",
+            f"目标谱图沿用当前 NSEGMENT={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
+            f"目标谱图沿用整套分析参数={'是' if target_metadata.get('legacy_target_use_analysis_params_enabled') else '否'}",
             f"requested_nsegment={requested_nsegment_ui}",
             f"系列有效点数={'；'.join(point_summaries)}",
         ]
+        if target_context_mode:
+            extra_items.append(f"target_spectrum_context_mode={target_context_mode}")
+        if target_context_dat_file_name:
+            extra_items.append(f"target_spectrum_context_dat_file_name={target_context_dat_file_name}")
         if effective_nsegment_values:
             extra_items.append(f"effective_nsegment={'/'.join(str(value) for value in effective_nsegment_values)}")
         if positive_freq_points_min is not None and positive_freq_points_max is not None:
@@ -8160,7 +9794,21 @@ class FileViewerApp:
             batch_skips=skipped_group_count,
             extra_items=extra_items,
         )
-        status_text = f"{mode_label}已生成：保留 {kept_group_count}/{total_group_count} 组 | 输出 {actual_series_count} 条系列"
+        status_text = (
+            f"{mode_label}已生成：保留 {kept_group_count}/{total_group_count} 组"
+            f" | 输出 {visible_series_count}/{actual_series_count} 条可见系列"
+        )
+        status_items = build_device_dispatch_items(first_details)
+        status_items.append(f"target_spectrum_group_count={kept_group_count}")
+        status_items.append(f"target_spectrum_visible_series_scope={visible_series_scope}")
+        status_items.append(f"target_spectrum_visible_series_count={visible_series_count}")
+        if target_context_mode:
+            status_items.append(f"target_spectrum_context_mode={target_context_mode}")
+        if target_context_dat_file_name:
+            status_items.append(f"target_spectrum_context_dat_file_name={target_context_dat_file_name}")
+        status_items.append("current_plot_kind=target_spectrum")
+        if status_items:
+            status_text += f" | {' | '.join(status_items)}"
         if skipped_group_count:
             status_text += f" | 已自动跳过 {skipped_group_count} 组"
         self.status_var.set(status_text)
@@ -8700,6 +10348,16 @@ class FileViewerApp:
                     self.show_separate_plot_windows(entries)
 
         self.current_plot_kind = "single_device_compare_psd" if single_side_compare else "dual_psd_compare"
+        for index, item in enumerate(normalized_series_results):
+            details = dict(item.get("details", {}))
+            details["current_plot_kind"] = self.current_plot_kind
+            if single_side_compare:
+                details["plot_execution_path"] = "single_device_compare_psd_render"
+            elif not str(details.get("plot_execution_path") or "").strip():
+                details["plot_execution_path"] = "dual_psd_compare"
+            item["details"] = details
+            if index == 0:
+                first_details = details
         self.current_plot_columns = [item["label"] for item in normalized_series_results]
         self.current_result_freq = None
         self.current_result_values = None
@@ -8773,6 +10431,7 @@ class FileViewerApp:
             extra_items = [
                 f"当前要素映射={mapping_name}",
                 f"当前谱类型=PSD",
+                *build_device_dispatch_items(first_details, include_plot_execution_path=True),
                 *build_series_point_count_items(point_count_contract),
                 *build_series_point_count_items(txt_point_count_contract, prefix="txt"),
                 *build_series_point_count_items(dat_point_count_contract, prefix="dat"),
@@ -8801,6 +10460,7 @@ class FileViewerApp:
             )
             status = (
                 f"图已生成：时间段内 PSD 对比 / {mapping_name} / 成功系列数={len(normalized_series_results)}"
+                f" | {' | '.join(build_device_dispatch_items(first_details, include_plot_execution_path=True))}"
                 f" | {' | '.join(build_series_point_count_status_items(txt_point_count_contract, prefix='txt', include_totals=False))}"
                 f" | {' | '.join(build_series_point_count_status_items(dat_point_count_contract, prefix='dat', include_totals=False))}"
                 f" | series_count={point_count_contract['series_count']}"
@@ -9183,9 +10843,21 @@ class FileViewerApp:
         ax = self.figure.add_subplot(111)
         payload = dict(payload or {})
         device_groups = list(payload.get("device_groups", []))
-        device_count = int(payload.get("device_count", len(series_results)))
-        file_count = int(payload.get("file_count", sum(int(item.get("file_count", 1)) for item in series_results)))
+        effective_device_count = int(
+            payload.get("effective_device_count", payload.get("device_count", len(series_results)))
+        )
+        file_count = int(
+            payload.get(
+                "selection_file_count",
+                payload.get("file_count", sum(int(item.get("file_count", 1)) for item in series_results)),
+            )
+        )
         first_details = dict(series_results[0].get("details", {})) if series_results else {}
+        render_semantics = str(
+            payload.get("dispatch_render_semantics")
+            or first_details.get("render_semantics")
+            or self.resolve_device_count_render_semantics(effective_device_count)
+        )
         time_range_display_suffix = core.build_time_range_display_suffix(first_details)
 
         combined_freq: list[np.ndarray] = []
@@ -9209,8 +10881,10 @@ class FileViewerApp:
         all_freq = np.concatenate(combined_freq)
         all_density = np.concatenate(combined_density)
         self.add_selected_reference_slopes(ax, all_freq, all_density, is_psd=True)
-        if device_count == 1:
-            title = f"单台设备图谱 - {series_results[0]['label']} - {target_column}{time_range_display_suffix}"
+        if effective_device_count == 1:
+            title = f"单设备图谱 - {series_results[0]['label']} - {target_column}{time_range_display_suffix}"
+        elif render_semantics in {"multi_device_compare", "dual_psd_compare"}:
+            title = f"设备对比图 - {target_column}{time_range_display_suffix}"
         else:
             title = f"多设备图谱对比 - {target_column}{time_range_display_suffix}"
         ax.set_title(title)
@@ -9231,11 +10905,19 @@ class FileViewerApp:
         self.current_result_frame = self.build_overlay_export_frame(series_results)
         point_count_contract = build_series_point_count_contract(series_results)
         self.current_point_count_contract = {"global": dict(point_count_contract)}
+        if render_semantics == "single_device":
+            self.current_plot_kind = "single_device_spectrum"
+        elif render_semantics in {"multi_device_compare", "dual_psd_compare"}:
+            self.current_plot_kind = "multi_device_compare"
+        else:
+            self.current_plot_kind = "multi_device_overlay"
         first_details = series_results[0]["details"]
         group_items = [
             f"{item['device_label']} | 文件数={item['file_count']} | 来源={item['device_source']} | "
             f"merge_scope={item.get('selection_merge_scope', 'device_group')} | 合并={item['merge_strategy']} | "
-            f"raw_rows={item.get('raw_source_rows')} | merged_rows={item.get('merged_rows')}"
+            f"raw_rows={item.get('raw_source_rows')} | merged_rows={item.get('merged_rows')} | "
+            f"resolved_target_columns={','.join(str(value) for value in (item.get('resolved_target_columns') or []))} | "
+            f"target_resolution_sources={','.join(str(value) for value in (item.get('target_resolution_sources') or []))}"
             for item in device_groups
         ]
         series_items = [
@@ -9246,7 +10928,11 @@ class FileViewerApp:
             for item in series_results
         ]
         self.update_diagnostic_info(
-            layout="单设备模式" if device_count == 1 else "设备分组模式",
+            layout=(
+                "单设备图"
+                if effective_device_count == 1
+                else ("设备对比图" if render_semantics == "multi_device_compare" else "多设备图")
+            ),
             analysis_label=target_column,
             fs=float(first_details["fs"]),
             nsegment=int(first_details["nsegment"]),
@@ -9256,11 +10942,8 @@ class FileViewerApp:
             batch_success=len(series_results),
             batch_skips=len(skipped_files),
             extra_items=[
-                f"选中文件数={file_count}",
-                f"selected_file_count={first_details.get('selected_file_count', file_count)}",
-                f"selected_txt_file_count={first_details.get('selected_txt_file_count', 0)}",
-                f"selected_dat_file_count={first_details.get('selected_dat_file_count', 0)}",
-                f"识别设备数={device_count}",
+                f"selection_file_count={file_count}",
+                *build_device_dispatch_items(first_details, include_plot_execution_path=True),
                 *build_series_point_count_items(point_count_contract),
                 f"base_spectrum_builder={first_details.get('base_spectrum_builder')}",
                 f"base_fs_source={first_details.get('base_fs_source')}",
@@ -9272,17 +10955,6 @@ class FileViewerApp:
                 f"valid_freq_points={first_details.get('valid_freq_points')}",
                 f"frequency_point_count={first_details.get('frequency_point_count')}",
                 f"rendered_point_count={first_details.get('rendered_point_count', len(series_results[0]['freq']))}",
-                *build_single_device_execution_items(first_details, include_plot_execution_path=True),
-                *(
-                    [f"single_device_compare_context_start={first_details.get('single_device_compare_context_start')}"]
-                    if "single_device_compare_context_start" in first_details
-                    else []
-                ),
-                *(
-                    [f"single_device_compare_context_end={first_details.get('single_device_compare_context_end')}"]
-                    if "single_device_compare_context_end" in first_details
-                    else []
-                ),
                 *core.build_time_range_diagnostic_items(first_details),
                 *group_items,
                 *series_items,
@@ -9290,10 +10962,16 @@ class FileViewerApp:
             ],
         )
 
-        status_prefix = "单台设备图谱" if device_count == 1 else "多设备图谱对比"
+        status_prefix = (
+            "单设备图谱"
+            if effective_device_count == 1
+            else ("设备对比图" if render_semantics in {"multi_device_compare", "dual_psd_compare"} else "多设备图谱对比")
+        )
+        status_items = build_device_dispatch_items(first_details)
+        status_items.extend(build_series_point_count_status_items(point_count_contract))
         status = (
             f"图已生成：{status_prefix} / {target_column} / 成功系列数={len(series_results)}"
-            f" | {' | '.join(build_series_point_count_status_items(point_count_contract) + build_single_device_execution_items(first_details))}"
+            f" | {' | '.join(status_items)}"
             f" | 时间窗={first_details.get('time_range_policy_label') or '默认'}"
             f" | {first_details.get('time_range_difference_hint') or core.TIME_RANGE_DIFFERENCE_HINT}"
         )
@@ -9302,19 +10980,6 @@ class FileViewerApp:
             if len(skipped_files) > 3:
                 preview += " 等"
             status += f" | 已跳过 {len(skipped_files)} 个文件：{preview}"
-        if bool(first_details.get("single_device_selection_filtered_to_txt_side")):
-            status += " | 当前 selection 包含 dat，已自动忽略 dat 并按 txt-side 复用"
-        if str(first_details.get("single_device_compare_context_source") or "") == "auto_bootstrap_fallback":
-            status += " | 当前 compare UI 状态不完整，单设备暂用 auto bootstrap 上下文"
-        if (
-            "single_device_compare_context_dat_matches_selected_dat" in first_details
-            and not bool(first_details.get("single_device_compare_context_dat_matches_selected_dat"))
-        ):
-            status += " | 警告：单设备复用的 dat 与当前 compare 页 dat 不一致"
-        if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "no_compare_dat_context":
-            status += " | 当前没有建立 compare 上下文，已回退旧单设备路径"
-        if str(first_details.get("single_device_compare_side_fallback_reason") or "") == "selection_not_txt_side":
-            status += " | 当前 selection 不属于 txt/ygas 一侧，已回退旧单设备路径"
         self.status_var.set(status)
 
     def perform_multi_spectral_compare(self) -> None:
@@ -9336,8 +11001,8 @@ class FileViewerApp:
         fs, requested_nsegment, overlap_ratio = self.get_analysis_params()
         start_dt, end_dt = self.resolve_optional_time_range_inputs()
         self.start_background_task(
-            status_text=f"正在按设备分组准备图谱：{target_column}",
-            worker=lambda reporter: self.prepare_multi_spectral_compare_payload(
+            status_text=f"正在生成图：{target_column}",
+            worker=lambda reporter: self.prepare_selected_files_default_render_payload(
                 selected_files,
                 target_column,
                 fs,
@@ -9347,8 +11012,8 @@ class FileViewerApp:
                 end_dt=end_dt,
                 reporter=reporter,
             ),
-            on_success=self.on_multi_spectral_compare_ready,
-            error_title="按设备分组生成图谱",
+            on_success=self.on_selected_files_default_plot_ready,
+            error_title="生成图",
         )
 
     def add_reference_slope(
@@ -9636,6 +11301,9 @@ class FileViewerApp:
 
         if self.current_file is None and self.current_plot_kind not in {
             "multi_spectral",
+            "single_device_spectrum",
+            "multi_device_compare",
+            "multi_device_overlay",
             "aligned_time_series",
             "aligned_scatter",
             "dual_psd_compare",
@@ -9656,12 +11324,14 @@ class FileViewerApp:
             col2 = sanitize_filename(self.current_plot_columns[1])
             return f"{base_name}_cross_{col1}_vs_{col2}_plot.png"
 
-        if self.current_plot_kind == "multi_spectral" and self.current_plot_columns:
+        if self.current_plot_kind in {"multi_spectral", "single_device_spectrum", "multi_device_compare", "multi_device_overlay"} and self.current_plot_columns:
             col = sanitize_filename(self.current_plot_columns[0])
-            if len(self.current_compare_files) == 1:
+            if self.current_plot_kind == "single_device_spectrum" or len(self.current_compare_files) == 1:
                 device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
-                return f"{device_name}_单台图谱_{col}{time_range_filename_suffix}_plot.png"
-            return f"multi_device_{col}{time_range_filename_suffix}_plot.png"
+                return f"single_device_spectrum_{device_name}_{col}{time_range_filename_suffix}_plot.png"
+            if self.current_plot_kind == "multi_device_compare":
+                return f"multi_device_compare_{col}{time_range_filename_suffix}_plot.png"
+            return f"multi_device_overlay_{col}{time_range_filename_suffix}_plot.png"
 
         if self.current_plot_kind in {
             "aligned_time_series",
@@ -9708,6 +11378,9 @@ class FileViewerApp:
 
         if self.current_file is None and self.current_plot_kind not in {
             "multi_spectral",
+            "single_device_spectrum",
+            "multi_device_compare",
+            "multi_device_overlay",
             "dual_psd_compare",
             "single_device_compare_psd",
             "aligned_cospectrum",
@@ -9724,12 +11397,14 @@ class FileViewerApp:
             col2 = sanitize_filename(self.current_plot_columns[1])
             return f"{base_name}_cross_{col1}_vs_{col2}_data.csv"
 
-        if self.current_plot_kind == "multi_spectral" and self.current_plot_columns:
+        if self.current_plot_kind in {"multi_spectral", "single_device_spectrum", "multi_device_compare", "multi_device_overlay"} and self.current_plot_columns:
             col = sanitize_filename(self.current_plot_columns[0])
-            if len(self.current_compare_files) == 1:
+            if self.current_plot_kind == "single_device_spectrum" or len(self.current_compare_files) == 1:
                 device_name = sanitize_filename(self.current_compare_files[0]) or "single_device"
-                return f"{device_name}_单台图谱_{col}{time_range_filename_suffix}_data.csv"
-            return f"multi_device_{col}{time_range_filename_suffix}_data.csv"
+                return f"single_device_spectrum_{device_name}_{col}{time_range_filename_suffix}_data.csv"
+            if self.current_plot_kind == "multi_device_compare":
+                return f"multi_device_compare_{col}{time_range_filename_suffix}_data.csv"
+            return f"multi_device_overlay_{col}{time_range_filename_suffix}_data.csv"
 
         if self.current_plot_kind in {"dual_psd_compare", "single_device_compare_psd"}:
             return f"psd_compare_{self.build_compare_filename_core()}{time_range_filename_suffix}_data.csv"

@@ -70,6 +70,14 @@ def get_export_plot_execution_path(app: object) -> str:
     return str(app.current_result_frame.iloc[0].get("plot_execution_path") or "")
 
 
+def get_export_metadata_value(app: object, key: str) -> str:
+    if getattr(app, "current_result_frame", None) is None or app.current_result_frame.empty:
+        return ""
+    if key not in app.current_result_frame.columns:
+        return ""
+    return str(app.current_result_frame.iloc[0].get(key) or "")
+
+
 def configure_compare_psd_render_test_state(app: object) -> None:
     app.plot_style_var.set("散点图")
     app.plot_layout_var.set("叠加同图")
@@ -111,6 +119,37 @@ def render_prepared_dual_plot_payload(app: object, payload: dict[str, object]) -
     app.on_prepared_dual_plot_ready(payload)
 
 
+def render_prepared_target_spectrum_payload(app: object, payload: dict[str, object]) -> None:
+    app.on_target_spectrum_ready(payload)
+
+
+def run_background_tasks_inline(app: object) -> None:
+    def _start_background_task(*, status_text: str, worker: object, on_success: object, error_title: str) -> None:
+        app.status_var.set(str(status_text))
+        payload = worker(lambda _text: None)
+        on_success(payload)
+
+    app.start_background_task = _start_background_task
+
+
+def build_headless_app() -> tuple[object, object]:
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    import tkinter as tk
+    import fr_r_spectrum_tool_rebuild as app_mod
+
+    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
+    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
+
+    root = tk.Tk()
+    root.withdraw()
+    app = app_mod.FileViewerApp(root)
+    app.refresh_canvas = lambda *args, **kwargs: None
+    return root, app
+
+
 def find_dat_option_label(app: object, dat_path: Path) -> str:
     target_key = str(Path(dat_path).resolve())
     for label, option_path in getattr(app, "auto_dat_options", {}).items():
@@ -126,6 +165,132 @@ def write_truncated_dat_copy(source_path: Path, target_path: Path, *, keep_data_
     if not data_lines:
         raise ValueError("Truncated dat copy must keep at least one data row.")
     target_path.write_text("\n".join([*header_lines, *data_lines]) + "\n", encoding="utf-8")
+
+
+def format_smoke_timestamp(value: pd.Timestamp) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
+
+
+def write_extended_ygas_copy(
+    source_path: Path,
+    target_path: Path,
+    *,
+    row_count: int,
+    start_offset_seconds: float = 0.0,
+) -> None:
+    source_lines = [line for line in source_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not source_lines:
+        raise ValueError("Extended ygas copy requires at least one source row.")
+
+    base_timestamp = pd.Timestamp("2026-03-27 14:31:40") + pd.Timedelta(seconds=float(start_offset_seconds))
+    output_lines: list[str] = []
+    for index in range(max(int(row_count), 0)):
+        line = source_lines[index % len(source_lines)]
+        comma_index = line.find(",")
+        if comma_index < 0:
+            raise ValueError(f"Unexpected ygas row format: {line}")
+        suffix = line[comma_index:]
+        timestamp = format_smoke_timestamp(base_timestamp + pd.Timedelta(milliseconds=100 * index))
+        output_lines.append(f"{timestamp}{suffix}")
+    target_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+
+def write_extended_dat_copy(
+    source_path: Path,
+    target_path: Path,
+    *,
+    row_count: int,
+) -> None:
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+    header_lines = lines[:4]
+    data_lines = [line for line in lines[4:] if line.strip()]
+    if not data_lines:
+        raise ValueError("Extended dat copy requires at least one source row.")
+
+    base_timestamp = pd.Timestamp("2026-03-27 14:31:40")
+    output_lines = list(header_lines)
+    for index in range(max(int(row_count), 0)):
+        parts = data_lines[index % len(data_lines)].split(",")
+        if len(parts) < 2:
+            raise ValueError(f"Unexpected dat row format: {data_lines[index % len(data_lines)]}")
+        parts[0] = f"\"{format_smoke_timestamp(base_timestamp + pd.Timedelta(milliseconds=100 * index))}\""
+        parts[1] = str(8000000 + index)
+        output_lines.append(",".join(parts))
+    target_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+
+def prepare_target_spectrum_smoke_paths(
+    temp_dir: Path,
+    *,
+    group_count: int,
+) -> dict[str, object]:
+    fixtures = resolve_repo_fixture_paths()
+    dat_path = temp_dir / "target_reference.dat"
+    write_extended_dat_copy(fixtures["dat"], dat_path, row_count=max(8192, 4096 + int(group_count) * 2048))
+
+    ygas_paths: list[Path] = []
+    for index in range(int(group_count)):
+        ygas_path = temp_dir / f"target_group_{index + 1}.log"
+        write_extended_ygas_copy(
+            fixtures["ygas"],
+            ygas_path,
+            row_count=4096,
+            start_offset_seconds=60.0 * index,
+        )
+        ygas_paths.append(ygas_path)
+    return {"ygas_paths": ygas_paths, "dat_path": dat_path}
+
+
+def prepare_target_spectrum_payload_for_smoke(
+    app: object,
+    *,
+    ygas_paths: list[Path],
+    dat_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    app.element_preset_var.set(str(args.element or "H2O"))
+    app.time_range_strategy_var.set("使用 txt+dat 共同时间范围")
+    app.legacy_target_spectrum_mode_var.set(core.LEGACY_TARGET_SPECTRUM_MODE_PSD)
+    app.legacy_target_use_analysis_params_var.set(False)
+    return app.prepare_target_spectrum_payload(
+        ygas_paths=ygas_paths,
+        dat_path=dat_path,
+        fs_ui=args.fs,
+        requested_nsegment=args.nsegment,
+        overlap_ratio=args.overlap_ratio,
+        time_range_strategy=app.time_range_strategy_var.get().strip() or "使用 txt+dat 共同时间范围",
+        start_raw="",
+        end_raw="",
+        grouping_mode="每个 ygas 文件视为一个组",
+        legacy_target_spectrum_mode=core.LEGACY_TARGET_SPECTRUM_MODE_PSD,
+        use_requested_nsegment=False,
+        forced_include_group_keys=set(),
+        reporter=None,
+    )
+
+
+def simulate_generate_plot_from_selected_files(
+    app: object,
+    root: object,
+    *,
+    selected_paths: list[Path],
+    active_path: Path,
+    parsed_active: core.ParsedDataResult,
+    target_column: str,
+) -> None:
+    import tkinter as tk
+
+    app.populate_file_list(selected_paths)
+    app.select_paths_in_list(selected_paths, active_path=active_path)
+    app.current_data_source_kind = "file"
+    app.current_data_source_label = f"当前文件：{active_path.name}"
+    app.current_file = active_path
+    app.current_file_parsed = parsed_active
+    app.current_layout_label = parsed_active.profile_name
+    app.raw_data = parsed_active.dataframe.copy()
+    app.column_vars = {str(target_column): tk.BooleanVar(master=root, value=True)}
+    run_background_tasks_inline(app)
+    app.generate_plot()
 
 
 def prepare_compare_txt_side_reference(
@@ -251,6 +416,128 @@ def capture_single_device_and_dual_compare_psd_render_states(
     }
 
 
+def capture_single_and_dual_target_spectrum_render_states(
+    app: object,
+    *,
+    single_ygas_path: Path,
+    dual_ygas_paths: list[Path],
+    dat_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    single_payload = prepare_target_spectrum_payload_for_smoke(
+        app,
+        ygas_paths=[single_ygas_path],
+        dat_path=dat_path,
+        args=args,
+    )
+    render_prepared_target_spectrum_payload(app, single_payload)
+    if not app.figure.axes:
+        raise ValueError("Single target-spectrum render did not produce a visible axis.")
+    single_axis_state = extract_axis_render_state(app.figure.axes[0])
+    single_status_text = app.status_var.get()
+    single_diag_text = app.diagnostic_var.get()
+    single_plot_kind = app.current_plot_kind
+    single_plot_style = app.current_plot_style_label
+    single_plot_layout = app.current_plot_layout_label
+    single_export_plot_execution_path = get_export_plot_execution_path(app)
+    single_export_render_semantics = get_export_metadata_value(app, "render_semantics")
+
+    dual_payload = prepare_target_spectrum_payload_for_smoke(
+        app,
+        ygas_paths=dual_ygas_paths,
+        dat_path=dat_path,
+        args=args,
+    )
+    render_prepared_target_spectrum_payload(app, dual_payload)
+    if not app.figure.axes:
+        raise ValueError("Dual target-spectrum render did not produce a visible axis.")
+    dual_axis_state = extract_axis_render_state(app.figure.axes[0])
+
+    return {
+        "single_payload": single_payload,
+        "single_axis_state": single_axis_state,
+        "single_status_text": single_status_text,
+        "single_diag_text": single_diag_text,
+        "single_plot_kind": single_plot_kind,
+        "single_plot_style": single_plot_style,
+        "single_plot_layout": single_plot_layout,
+        "single_export_plot_execution_path": single_export_plot_execution_path,
+        "single_export_render_semantics": single_export_render_semantics,
+        "dual_payload": dual_payload,
+        "dual_axis_state": dual_axis_state,
+        "dual_plot_kind": app.current_plot_kind,
+        "dual_plot_style": app.current_plot_style_label,
+        "dual_plot_layout": app.current_plot_layout_label,
+        "dual_export_plot_execution_path": get_export_plot_execution_path(app),
+        "dual_export_render_semantics": get_export_metadata_value(app, "render_semantics"),
+    }
+
+
+def capture_single_file_open_and_dual_target_spectrum_render_states(
+    app: object,
+    *,
+    single_ygas_path: Path,
+    dat_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    import tkinter as tk
+
+    app.element_preset_var.set(str(args.element or "CO2"))
+    simulate_single_file_open(app, single_ygas_path)
+    parsed = parse_supported_file(single_ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve matching txt column for the requested element.")
+    app.column_vars = {str(target_column): tk.BooleanVar(master=app.root, value=True)}
+    run_background_tasks_inline(app)
+    app.generate_plot()
+    if not app.figure.axes:
+        raise ValueError("Single-file-open target-spectrum render did not produce a visible axis.")
+    single_axis_state = extract_axis_render_state(app.figure.axes[0])
+    single_status_text = app.status_var.get()
+    single_diag_text = app.diagnostic_var.get()
+    single_plot_kind = app.current_plot_kind
+    single_plot_style = app.current_plot_style_label
+    single_plot_layout = app.current_plot_layout_label
+    single_export_plot_execution_path = get_export_plot_execution_path(app)
+    single_export_render_semantics = get_export_metadata_value(app, "render_semantics")
+    single_target_metadata = dict(getattr(app, "current_target_plot_metadata", {}) or {})
+    single_visible_scope = str(
+        single_target_metadata.get("target_spectrum_visible_series_scope")
+        or get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+        or ""
+    )
+
+    dual_payload = prepare_target_spectrum_payload_for_smoke(
+        app,
+        ygas_paths=[single_ygas_path],
+        dat_path=dat_path,
+        args=args,
+    )
+    render_prepared_target_spectrum_payload(app, dual_payload)
+    if not app.figure.axes:
+        raise ValueError("Dual target-spectrum reference render did not produce a visible axis.")
+    dual_axis_state = extract_axis_render_state(app.figure.axes[0])
+
+    return {
+        "single_axis_state": single_axis_state,
+        "single_status_text": single_status_text,
+        "single_diag_text": single_diag_text,
+        "single_plot_kind": single_plot_kind,
+        "single_plot_style": single_plot_style,
+        "single_plot_layout": single_plot_layout,
+        "single_export_plot_execution_path": single_export_plot_execution_path,
+        "single_export_render_semantics": single_export_render_semantics,
+        "single_visible_scope": single_visible_scope,
+        "dual_axis_state": dual_axis_state,
+        "dual_plot_kind": app.current_plot_kind,
+        "dual_plot_style": app.current_plot_style_label,
+        "dual_plot_layout": app.current_plot_layout_label,
+        "dual_export_plot_execution_path": get_export_plot_execution_path(app),
+        "dual_export_render_semantics": get_export_metadata_value(app, "render_semantics"),
+    }
+
+
 def simulate_single_file_open(app: object, source_path: Path) -> None:
     if hasattr(app, "reset_auto_compare_context"):
         app.reset_auto_compare_context()
@@ -351,6 +638,56 @@ def choose_single_column(parsed: core.ParsedDataResult, element: str | None, dev
     if parsed.suggested_columns:
         return parsed.suggested_columns[0]
     return None
+
+
+def compute_expected_ygas_only_legacy_target_offsets(
+    app: object,
+    *,
+    ygas_path: Path,
+    target_column: str,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    target_element = str(args.element or "CO2")
+    required_columns = app.build_target_required_columns(
+        target_element=target_element,
+        device_kind="ygas",
+    )
+    parsed = app.parse_target_profiled_file(
+        ygas_path,
+        device_kind="ygas",
+        required_columns=required_columns,
+    )
+    window_start, window_end, _ = core.get_parsed_time_bounds(parsed)
+    frame, _meta = core.build_target_window_series(
+        parsed,
+        str(target_column),
+        pd.Timestamp(window_start),
+        pd.Timestamp(window_end),
+    )
+    if np.isclose(float(args.fs), float(core.DEFAULT_FS), rtol=0.0, atol=1e-9):
+        estimated_fs = core.estimate_fs_from_timestamp(frame, core.TIMESTAMP_COL)
+        resolved_fs = float(estimated_fs if estimated_fs else core.DEFAULT_FS)
+    else:
+        resolved_fs = float(args.fs)
+    requested_nsegment = int(
+        args.nsegment
+        if bool(app.legacy_target_use_analysis_params_var.get())
+        else core.legacy_target_nsegment_resolver(len(frame))
+    )
+    freq, density, details = core.compute_legacy_target_psd_from_array(
+        frame["value"].to_numpy(dtype=float),
+        resolved_fs,
+        requested_nsegment,
+        float(args.overlap_ratio),
+        psd_kernel=core.LEGACY_TARGET_PSD_KERNEL_DEFAULT,
+    )
+    mask = core.build_spectrum_plot_mask(freq, density, core.CROSS_SPECTRUM_MAGNITUDE)
+    return {
+        "offsets": np.column_stack((freq[mask], density[mask])),
+        "details": details,
+        "requested_nsegment": requested_nsegment,
+        "resolved_fs": resolved_fs,
+    }
 
 
 def prepare_series(
@@ -522,6 +859,17 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
+            "device_group_spectral",
+            run_device_group_spectral_check_mode,
+            clone_args(
+                args,
+                mode="device-group-spectral-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+            ),
+        ),
+        (
             "single_compare_base_spectrum",
             run_single_compare_base_spectrum_core_metadata_check_mode,
             clone_args(
@@ -544,209 +892,189 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
-            "single_vs_compare_point_display_contract",
-            run_single_vs_compare_point_display_contract_check_mode,
+            "device_count_default_single_compare_style",
+            run_device_count_default_single_compare_style_check_mode,
             clone_args(
                 args,
-                mode="single-vs-compare-point-display-contract-check",
+                mode="device-count-default-single-compare-style-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_txt_compare_side_equivalence",
-            run_single_txt_compare_side_equivalence_check_mode,
+            "device_count_default_single_fallback",
+            run_device_count_default_single_fallback_check_mode,
             clone_args(
                 args,
-                mode="single-txt-compare-side-equivalence-check",
+                mode="device-count-default-single-fallback-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_file_open_auto_bootstrap_compare_context",
-            run_single_file_open_auto_bootstrap_compare_context_check_mode,
+            "target_spectrum_nsegment_override_no_dat",
+            run_target_spectrum_nsegment_override_no_dat_check_mode,
             clone_args(
                 args,
-                mode="single-file-open-auto-bootstrap-compare-context-check",
+                mode="target-spectrum-nsegment-override-no-dat-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=None,
+                element="H2O",
+                nsegment=128,
+            ),
+        ),
+        (
+            "target_spectrum_nsegment_override_txt_dat",
+            run_target_spectrum_nsegment_override_txt_dat_check_mode,
+            clone_args(
+                args,
+                mode="target-spectrum-nsegment-override-txt-dat-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+                nsegment=128,
+            ),
+        ),
+        (
+            "device_count_default_dual",
+            run_device_count_default_dual_check_mode,
+            clone_args(
+                args,
+                mode="device-count-default-dual-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_no_visible_change_regression",
-            run_single_device_no_visible_change_regression_check_mode,
+            "device_count_default_multi",
+            run_device_count_default_multi_check_mode,
             clone_args(
                 args,
-                mode="single-device-no-visible-change-regression-check",
+                mode="device-count-default-multi-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_txt_compare_side_equivalence",
-            run_single_device_txt_compare_side_equivalence_check_mode,
+            "selected_files_direct_generate",
+            run_selected_files_direct_generate_check_mode,
             clone_args(
                 args,
-                mode="single-device-txt-compare-side-equivalence-check",
+                mode="selected-files-direct-generate-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_mixed_selection_txt_dat_reuse",
-            run_single_device_mixed_selection_txt_dat_reuse_check_mode,
+            "selected_files_direct_target_spectrum_single",
+            run_selected_files_direct_target_spectrum_single_check_mode,
             clone_args(
                 args,
-                mode="single-device-mixed-selection-txt-dat-reuse-check",
+                mode="selected-files-direct-target-spectrum-single-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_mixed_selection_multi_txt_plus_dat_reuse",
-            run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode,
+            "selected_files_direct_target_spectrum_dual",
+            run_selected_files_direct_target_spectrum_dual_check_mode,
             clone_args(
                 args,
-                mode="single-device-mixed-selection-multi-txt-plus-dat-reuse-check",
+                mode="selected-files-direct-target-spectrum-dual-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_only_dat_still_fallback",
-            run_single_device_only_dat_still_fallback_check_mode,
+            "single_vs_dual_target_spectrum_visible_subset",
+            run_single_vs_dual_target_spectrum_visible_subset_check_mode,
             clone_args(
                 args,
-                mode="single-device-only-dat-still-fallback-check",
+                mode="single-vs-dual-target-spectrum-visible-subset-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_default_reuse_enabled",
-            run_single_device_default_reuse_enabled_check_mode,
+            "single_vs_dual_target_spectrum_style",
+            run_single_vs_dual_target_spectrum_style_check_mode,
             clone_args(
                 args,
-                mode="single-device-default-reuse-enabled-check",
+                mode="single-vs-dual-target-spectrum-style-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_render_semantic_equivalence",
-            run_single_device_render_semantic_equivalence_check_mode,
+            "single_file_open_target_spectrum_primary_visible",
+            run_single_file_open_target_spectrum_primary_visible_check_mode,
             clone_args(
                 args,
-                mode="single-device-render-semantic-equivalence-check",
+                mode="single-file-open-target-spectrum-primary-visible-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_vs_compare_render_style",
-            run_single_device_vs_compare_render_style_check_mode,
+            "single_file_open_auto_preview_target_spectrum",
+            run_single_file_open_auto_preview_target_spectrum_check_mode,
             clone_args(
                 args,
-                mode="single-device-vs-compare-render-style-check",
+                mode="single-file-open-auto-preview-target-spectrum-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_vs_dual_compare_axis_geometry",
-            run_single_device_vs_dual_compare_axis_geometry_check_mode,
+            "single_file_parent_dat_autodiscovery_target_spectrum",
+            run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode,
             clone_args(
                 args,
-                mode="single-device-vs-dual-compare-axis-geometry-check",
+                mode="single-file-parent-dat-autodiscovery-target-spectrum-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_vs_dual_compare_reference_slope",
-            run_single_device_vs_dual_compare_reference_slope_check_mode,
+            "single_file_open_vs_dual_target_spectrum_primary_subset",
+            run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode,
             clone_args(
                 args,
-                mode="single-device-vs-dual-compare-reference-slope-check",
+                mode="single-file-open-vs-dual-target-spectrum-primary-subset-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_vs_dual_compare_visible_scatter_subset",
-            run_single_device_vs_dual_compare_visible_scatter_subset_check_mode,
+            "txt_dat_not_equals_device_count",
+            run_txt_dat_not_equals_device_count_check_mode,
             clone_args(
                 args,
-                mode="single-device-vs-dual-compare-visible-scatter-subset-check",
+                mode="txt-dat-not-equals-device-count-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
             ),
         ),
         (
-            "single_device_fallback_still_legacy_render",
-            run_single_device_fallback_still_legacy_render_check_mode,
+            "cross_display_semantics",
+            run_cross_display_semantics_check_mode,
             clone_args(
                 args,
-                mode="single-device-fallback-still-legacy-render-check",
-                ygas=[str(fixtures["ygas"])],
-                dat=str(fixtures["dat"]),
-                element="H2O",
-            ),
-        ),
-        (
-            "single_device_active_dat_sync",
-            run_single_device_active_dat_sync_check_mode,
-            clone_args(
-                args,
-                mode="single-device-active-dat-sync-check",
-                ygas=[str(fixtures["ygas"])],
-                dat=str(fixtures["dat"]),
-                element="H2O",
-            ),
-        ),
-        (
-            "single_device_active_time_range_sync",
-            run_single_device_active_time_range_sync_check_mode,
-            clone_args(
-                args,
-                mode="single-device-active-time-range-sync-check",
-                ygas=[str(fixtures["ygas"])],
-                dat=str(fixtures["dat"]),
-                element="H2O",
-            ),
-        ),
-        (
-            "single_device_auto_bootstrap_fallback",
-            run_single_device_auto_bootstrap_fallback_check_mode,
-            clone_args(
-                args,
-                mode="single-device-auto-bootstrap-fallback-check",
-                ygas=[str(fixtures["ygas"])],
-                dat=str(fixtures["dat"]),
-                element="H2O",
-            ),
-        ),
-        (
-            "frr_compat_semantics",
-            run_frr_compat_semantics_check_mode,
-            clone_args(
-                args,
-                mode="frr-compat-semantics-check",
+                mode="cross-display-semantics-check",
                 ygas=[str(fixtures["ygas"])],
                 dat=str(fixtures["dat"]),
                 element="H2O",
@@ -1589,28 +1917,26 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
     if not input_paths:
         raise ValueError("device-group-spectral-check needs at least one --ygas or --dat input.")
 
-    sample_path = input_paths[0]
+    sample_path = Path(args.ygas[0]) if args.ygas else input_paths[0]
     sample_device_key = "A" if sample_path.suffix.lower() in {".txt", ".log"} else "B"
     sample_parsed = parse_supported_file(sample_path)
     target_column = choose_single_column(sample_parsed, args.element, sample_device_key)
     if not target_column:
         raise ValueError(f"No analyzable target column found for {sample_path.name}.")
 
-    import matplotlib
-
-    matplotlib.use("TkAgg")
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-    import tkinter as tk
-    import fr_r_spectrum_tool_rebuild as app_mod
-
-    app_mod.FigureCanvasTkAgg = FigureCanvasTkAgg
-    app_mod.NavigationToolbar2Tk = NavigationToolbar2Tk
-
     checks: list[tuple[str, bool, object]] = []
-    root = tk.Tk()
-    root.withdraw()
-    app = app_mod.FileViewerApp(root)
+    root, app = build_headless_app()
     try:
+        default_single_plot_execution_path = (
+            "single_device_compare_psd_render"
+            if bool(args.dat) and sample_path.suffix.lower() in {".txt", ".log"}
+            else "single_device_spectrum"
+        )
+        default_single_plot_kind = (
+            "single_device_compare_psd"
+            if default_single_plot_execution_path == "single_device_compare_psd_render"
+            else "single_device_spectrum"
+        )
         payload_single = app.prepare_multi_spectral_compare_payload(
             [sample_path],
             target_column,
@@ -1621,24 +1947,30 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
         checks.append(
             (
                 "single_file_single_device",
-                payload_single["device_count"] == 1 and len(payload_single["series_results"]) == 1,
-                payload_single["device_groups"],
+                payload_single["effective_device_count"] == 1
+                and len(payload_single["series_results"]) == 1
+                and str(payload_single.get("plot_execution_path")) == default_single_plot_execution_path,
+                {
+                    "device_groups": payload_single["device_groups"],
+                    "plot_execution_path": payload_single.get("plot_execution_path"),
+                    "default_single_plot_execution_path": default_single_plot_execution_path,
+                },
             )
         )
 
-        app.plot_multi_spectral_results(
-            target_column,
-            list(payload_single["series_results"]),
-            list(payload_single["skipped_files"]),
-            payload=payload_single,
-        )
+        render_prepared_multi_spectral_payload(app, payload_single)
         checks.append(
             (
                 "single_device_render",
-                len(app.current_compare_files) == 1 and app.current_plot_kind == "multi_spectral",
+                len(app.current_compare_files) == 1
+                and app.current_plot_kind == default_single_plot_kind
+                and get_export_plot_execution_path(app) == default_single_plot_execution_path,
                 {
                     "current_compare_files": list(app.current_compare_files),
                     "current_plot_kind": app.current_plot_kind,
+                    "export_plot_execution_path": get_export_plot_execution_path(app),
+                    "default_single_plot_kind": default_single_plot_kind,
+                    "default_single_plot_execution_path": default_single_plot_execution_path,
                 },
             )
         )
@@ -1646,11 +1978,8 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
         with tempfile.TemporaryDirectory(prefix="device_group_check_") as temp_dir:
             temp_root = Path(temp_dir)
             same_device_copy = temp_root / f"{sample_path.stem}_copy{sample_path.suffix}"
-            other_device_copy = temp_root / f"DEVICEB_{sample_path.stem}{sample_path.suffix}"
             shutil.copy2(sample_path, same_device_copy)
-            shutil.copy2(sample_path, other_device_copy)
-
-            same_device_paths = list(input_paths[:2]) if len(input_paths) >= 2 else [sample_path, same_device_copy]
+            same_device_paths = [sample_path, same_device_copy]
             payload_same_device = app.prepare_multi_spectral_compare_payload(
                 same_device_paths,
                 target_column,
@@ -1662,35 +1991,46 @@ def run_device_group_spectral_check_mode(args: argparse.Namespace) -> int:
             checks.append(
                 (
                     "single_device_multi_file_merge",
-                    payload_same_device["device_count"] == 1
+                    payload_same_device["effective_device_count"] == 1
                     and len(same_groups) == 1
                     and int(same_groups[0]["file_count"]) >= 2,
                     same_groups,
                 )
             )
 
-            payload_multi_device = app.prepare_multi_spectral_compare_payload(
-                [sample_path, other_device_copy],
-                target_column,
-                args.fs,
-                args.nsegment,
-                args.overlap_ratio,
-            )
-            multi_groups = list(payload_multi_device["device_groups"])
-            checks.append(
-                (
-                    "multi_device_grouping",
-                    payload_multi_device["device_count"] >= 2 and len(multi_groups) >= 2,
-                    multi_groups,
+            if args.dat:
+                dat_path = Path(args.dat)
+                dat_copy_a = temp_root / "DEVB_toa5.dat"
+                dat_copy_b = temp_root / "DEVC_toa5.dat"
+                shutil.copy2(dat_path, dat_copy_a)
+                shutil.copy2(dat_path, dat_copy_b)
+                payload_multi_device = app.prepare_multi_spectral_compare_payload(
+                    [sample_path, dat_copy_a, dat_copy_b],
+                    target_column,
+                    args.fs,
+                    args.nsegment,
+                    args.overlap_ratio,
                 )
-            )
-            checks.append(
-                (
-                    "filename_fallback",
-                    any(str(item.get("device_source", "")) == "filename" for item in multi_groups),
-                    multi_groups,
+                multi_groups = list(payload_multi_device["device_groups"])
+                checks.append(
+                    (
+                        "multi_device_grouping",
+                        payload_multi_device["effective_device_count"] >= 2
+                        and len(multi_groups) >= 2
+                        and str(payload_multi_device.get("plot_execution_path")) in {"multi_device_compare", "multi_device_overlay"},
+                        {
+                            "device_groups": multi_groups,
+                            "plot_execution_path": payload_multi_device.get("plot_execution_path"),
+                        },
+                    )
                 )
-            )
+                checks.append(
+                    (
+                        "filename_fallback",
+                        any(str(item.get("device_source", "")) == "filename" for item in multi_groups),
+                        multi_groups,
+                    )
+                )
     finally:
         root.destroy()
 
@@ -2056,7 +2396,7 @@ def run_single_vs_compare_point_display_contract_check_mode(args: argparse.Names
 
 
 def run_single_compare_style_preview_check_mode(args: argparse.Namespace) -> int:
-    return run_single_txt_compare_side_equivalence_check_mode(args)
+    return run_device_count_default_single_compare_style_check_mode(args)
 
     if not args.ygas or not args.dat:
         raise ValueError("single-compare-style-preview-check needs --ygas and --dat.")
@@ -2723,6 +3063,8 @@ def run_single_file_open_auto_bootstrap_compare_context_check_mode(args: argpars
         plot_kind = app.current_plot_kind
         export_plot_execution_path = get_export_plot_execution_path(app)
         status_text = app.status_var.get()
+        diag_text = app.diagnostic_var.get()
+        preview_check_state = str(app.single_compare_style_preview_check.cget("state"))
     finally:
         root.destroy()
 
@@ -3270,102 +3612,82 @@ def run_single_device_mixed_selection_txt_dat_reuse_check_mode(args: argparse.Na
             args.nsegment,
             args.overlap_ratio,
         )
-        if len(payload["series_results"]) != 1:
-            raise ValueError("single-device mixed txt+dat reuse check expects exactly one single-device series.")
-        single_series = payload["series_results"][0]
+        series_results = list(payload.get("series_results") or [])
+        if len(series_results) != 2:
+            raise ValueError("single-device mixed txt+dat reuse check expects dual compare payload with exactly two series.")
+        single_series = next((item for item in series_results if str(item.get("side")) == "txt"), series_results[0])
+        compare_series = next((item for item in series_results if str(item.get("side")) == "dat"), None)
+        if compare_series is None:
+            raise ValueError("single-device mixed txt+dat reuse check expects a dat-side compare series.")
         single_details = dict(single_series["details"])
+        compare_details = dict(compare_series["details"])
         render_prepared_multi_spectral_payload(app, payload)
         single_status_text = app.status_var.get()
         single_diag_text = app.diagnostic_var.get()
         single_contract = dict(app.current_point_count_contract)
-        compare_reference = prepare_compare_txt_side_reference(
-            app,
-            ygas_paths=[ygas_path],
-            dat_path=dat_path,
-            col_a=str(col_a),
-            col_b=str(col_b),
-            args=args,
-        )
+        single_plot_kind = app.current_plot_kind
+        single_export_plot_execution_path = get_export_plot_execution_path(app)
     finally:
         root.destroy()
 
-    compare_txt = compare_reference["dual_ygas"]
-    compare_txt_details = dict(compare_txt["details"])
     checks = [
         (
-            "mixed_selection_reuses_compare_txt_side",
-            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
-            {"single_details": single_details},
+            "mixed_selection_defaults_to_dual_compare_when_effective_device_count_is_two",
+            int(payload.get("effective_device_count", 0)) == 2
+            and str(payload.get("dispatch_render_semantics")) == "dual_psd_compare"
+            and str(payload.get("plot_execution_path")) == "dual_psd_compare"
+            and single_plot_kind == "dual_psd_compare"
+            and single_export_plot_execution_path == "dual_psd_compare",
+            {
+                "effective_device_count": payload.get("effective_device_count"),
+                "dispatch_render_semantics": payload.get("dispatch_render_semantics"),
+                "plot_execution_path": payload.get("plot_execution_path"),
+                "single_plot_kind": single_plot_kind,
+                "single_export_plot_execution_path": single_export_plot_execution_path,
+            },
         ),
         (
-            "mixed_selection_does_not_report_fallback",
-            not str(single_details.get("single_device_compare_side_fallback_reason") or ""),
-            {"single_device_compare_side_fallback_reason": single_details.get("single_device_compare_side_fallback_reason")},
+            "mixed_selection_keeps_txt_dat_source_counts_visible",
+            int(payload.get("selection_file_count", 0)) == 2
+            and int(payload.get("selected_txt_file_count", 0)) == 1
+            and int(payload.get("selected_dat_file_count", 0)) == 1,
+            {
+                "selection_file_count": payload.get("selection_file_count"),
+                "selected_txt_file_count": payload.get("selected_txt_file_count"),
+                "selected_dat_file_count": payload.get("selected_dat_file_count"),
+            },
         ),
         (
-            "mixed_selection_counts_visible",
-            int(single_details.get("selected_file_count", 0)) == 2
-            and int(single_details.get("selected_txt_file_count", 0)) == 1
-            and int(single_details.get("selected_dat_file_count", 0)) == 1
-            and bool(single_details.get("single_device_selection_filtered_to_txt_side")),
-            {"single_details": single_details},
+            "mixed_selection_produces_both_txt_and_dat_compare_series",
+            str(single_series.get("side")) == "txt"
+            and str(compare_series.get("side")) == "dat"
+            and str(single_details.get("plot_execution_path")) == "dual_psd_compare"
+            and str(compare_details.get("plot_execution_path")) == "dual_psd_compare",
+            {
+                "single_side": single_series.get("side"),
+                "compare_side": compare_series.get("side"),
+                "single_details": single_details,
+                "compare_details": compare_details,
+            },
         ),
         (
-            "mixed_selection_status_and_diag_show_txt_filtering",
-            "single_device_selection_filtered_to_txt_side=true" in single_status_text
-            and "selected_file_count=2" in single_diag_text
+            "mixed_selection_status_and_diag_show_unified_dispatch",
+            "effective_device_count=2" in single_status_text
+            and "render_semantics=dual_psd_compare" in single_status_text
+            and "selection_file_count=2" in single_diag_text
             and "selected_txt_file_count=1" in single_diag_text
-            and "selected_dat_file_count=1" in single_diag_text,
+            and "selected_dat_file_count=1" in single_diag_text
+            and "plot_execution_path=dual_psd_compare" in single_diag_text,
             {"single_status": single_status_text, "single_diag": single_diag_text},
         ),
         (
-            "mixed_selection_valid_points_equal_compare_txt",
-            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
-            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
-        ),
-        (
-            "mixed_selection_nperseg_equal_compare_txt",
-            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
-            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
-        ),
-        (
-            "mixed_selection_valid_freq_points_equal_compare_txt",
-            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
-            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
-        ),
-        (
-            "mixed_selection_frequency_point_count_equal_compare_txt",
-            int(single_details.get("frequency_point_count", 0)) == int(compare_txt_details.get("frequency_point_count", 0)),
+            "mixed_selection_render_contract_reflects_two_visible_series",
+            int(single_contract["global"]["series_count"]) == 2
+            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(single_series["freq"]) + len(compare_series["freq"])),
             {
-                "single_frequency_point_count": single_details.get("frequency_point_count"),
-                "compare_frequency_point_count": compare_txt_details.get("frequency_point_count"),
-            },
-        ),
-        (
-            "mixed_selection_freq_equal_compare_txt",
-            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float)),
-            {"single_points": len(single_series["freq"]), "compare_points": len(compare_txt["freq"])},
-        ),
-        (
-            "mixed_selection_density_allclose_compare_txt",
-            np.allclose(
-                np.asarray(single_series["density"], dtype=float),
-                np.asarray(compare_txt["density"], dtype=float),
-                rtol=1e-12,
-                atol=1e-12,
-            ),
-            {
-                "single_first5": np.asarray(single_series["density"], dtype=float)[:5].tolist(),
-                "compare_first5": np.asarray(compare_txt["density"], dtype=float)[:5].tolist(),
-            },
-        ),
-        (
-            "mixed_selection_rendered_point_count_equal_compare_txt",
-            int(single_details.get("rendered_point_count", 0)) == int(len(compare_txt["freq"]))
-            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(compare_txt["freq"])),
-            {
-                "single_rendered_point_count": single_details.get("rendered_point_count"),
-                "compare_rendered_point_count": len(compare_txt["freq"]),
+                "single_contract": single_contract,
+                "single_points": len(single_series["freq"]),
+                "compare_points": len(compare_series["freq"]),
                 "single_contract": single_contract,
             },
         ),
@@ -3377,8 +3699,9 @@ def run_single_device_mixed_selection_txt_dat_reuse_check_mode(args: argparse.Na
     print(f"dat_path={dat_path}")
     print(f"column_a={col_a}")
     print(f"column_b={col_b}")
+    print(f"payload_plot_execution_path={payload.get('plot_execution_path')}")
     print(f"single_details={single_details}")
-    print(f"compare_txt_details={compare_txt_details}")
+    print(f"compare_details={compare_details}")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -3438,106 +3761,80 @@ def run_single_device_mixed_selection_multi_txt_plus_dat_reuse_check_mode(args: 
                 args.nsegment,
                 args.overlap_ratio,
             )
-            if len(payload["series_results"]) != 1:
-                raise ValueError("single-device mixed multi-txt + dat reuse check expects exactly one series.")
-            single_series = payload["series_results"][0]
+            series_results = list(payload.get("series_results") or [])
+            if len(series_results) != 3:
+                raise ValueError("single-device mixed multi-txt + dat reuse check expects three grouped series.")
+            single_series = series_results[0]
             single_details = dict(single_series["details"])
             render_prepared_multi_spectral_payload(app, payload)
             single_status_text = app.status_var.get()
             single_diag_text = app.diagnostic_var.get()
             single_contract = dict(app.current_point_count_contract)
-            compare_reference = prepare_compare_txt_side_reference(
-                app,
-                ygas_paths=[ygas_path_a, ygas_path_b],
-                dat_path=dat_path,
-                col_a=str(col_a),
-                col_b=str(col_b),
-                args=args,
-            )
+            single_plot_kind = app.current_plot_kind
+            single_export_plot_execution_path = get_export_plot_execution_path(app)
         finally:
             root.destroy()
 
-    compare_txt = compare_reference["dual_ygas"]
-    compare_txt_details = dict(compare_txt["details"])
     checks = [
         (
-            "mixed_multi_txt_reuses_compare_txt_side",
-            str(single_details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
-            {"single_details": single_details},
+            "mixed_multi_txt_defaults_to_multi_overlay_when_effective_device_count_is_three",
+            int(payload.get("effective_device_count", 0)) == 3
+            and str(payload.get("dispatch_render_semantics")) == "multi_device_overlay"
+            and str(payload.get("plot_execution_path")) == "multi_device_overlay"
+            and single_plot_kind == "multi_device_overlay"
+            and single_export_plot_execution_path == "multi_device_overlay",
+            {
+                "effective_device_count": payload.get("effective_device_count"),
+                "dispatch_render_semantics": payload.get("dispatch_render_semantics"),
+                "plot_execution_path": payload.get("plot_execution_path"),
+                "single_plot_kind": single_plot_kind,
+                "single_export_plot_execution_path": single_export_plot_execution_path,
+            },
         ),
         (
-            "mixed_multi_txt_counts_visible",
-            int(single_details.get("selected_file_count", 0)) == 3
-            and int(single_details.get("selected_txt_file_count", 0)) == 2
-            and int(single_details.get("selected_dat_file_count", 0)) == 1
-            and bool(single_details.get("single_device_selection_filtered_to_txt_side"))
-            and int(single_details.get("compare_txt_file_count", 0)) == 2,
-            {"single_details": single_details},
+            "mixed_multi_txt_keeps_txt_dat_source_counts_visible",
+            int(payload.get("selection_file_count", 0)) == 3
+            and int(payload.get("selected_txt_file_count", 0)) == 2
+            and int(payload.get("selected_dat_file_count", 0)) == 1,
+            {
+                "selection_file_count": payload.get("selection_file_count"),
+                "selected_txt_file_count": payload.get("selected_txt_file_count"),
+                "selected_dat_file_count": payload.get("selected_dat_file_count"),
+            },
         ),
         (
-            "mixed_multi_txt_status_and_diag_show_txt_filtering",
-            "single_device_selection_filtered_to_txt_side=true" in single_status_text
+            "mixed_multi_txt_status_and_diag_show_unified_dispatch",
+            "effective_device_count=3" in single_status_text
+            and "render_semantics=multi_device_overlay" in single_status_text
+            and "selection_file_count=3" in single_diag_text
             and "selected_txt_file_count=2" in single_diag_text
-            and "selected_dat_file_count=1" in single_diag_text,
+            and "selected_dat_file_count=1" in single_diag_text
+            and "plot_execution_path=multi_device_overlay" in single_diag_text,
             {"single_status": single_status_text, "single_diag": single_diag_text},
         ),
         (
-            "mixed_multi_txt_valid_points_equal_compare_txt",
-            int(single_details.get("valid_points", 0)) == int(compare_txt_details.get("valid_points", 0)),
-            {"single_valid_points": single_details.get("valid_points"), "compare_valid_points": compare_txt_details.get("valid_points")},
+            "mixed_multi_txt_series_details_follow_multi_overlay_path",
+            all(str(dict(item.get("details") or {}).get("plot_execution_path")) == "multi_device_overlay" for item in series_results),
+            {"series_labels": [item.get("label") for item in series_results]},
         ),
         (
-            "mixed_multi_txt_nperseg_equal_compare_txt",
-            int(single_details.get("nperseg", 0)) == int(compare_txt_details.get("nperseg", 0)),
-            {"single_nperseg": single_details.get("nperseg"), "compare_nperseg": compare_txt_details.get("nperseg")},
-        ),
-        (
-            "mixed_multi_txt_valid_freq_points_equal_compare_txt",
-            int(single_details.get("valid_freq_points", 0)) == int(compare_txt_details.get("valid_freq_points", 0)),
-            {"single_valid_freq_points": single_details.get("valid_freq_points"), "compare_valid_freq_points": compare_txt_details.get("valid_freq_points")},
-        ),
-        (
-            "mixed_multi_txt_frequency_point_count_equal_compare_txt",
-            int(single_details.get("frequency_point_count", 0)) == int(compare_txt_details.get("frequency_point_count", 0)),
-            {
-                "single_frequency_point_count": single_details.get("frequency_point_count"),
-                "compare_frequency_point_count": compare_txt_details.get("frequency_point_count"),
-            },
-        ),
-        (
-            "mixed_multi_txt_freq_equal_compare_txt",
-            np.array_equal(np.asarray(single_series["freq"], dtype=float), np.asarray(compare_txt["freq"], dtype=float)),
-            {"single_points": len(single_series["freq"]), "compare_points": len(compare_txt["freq"])},
-        ),
-        (
-            "mixed_multi_txt_density_allclose_compare_txt",
-            np.allclose(
-                np.asarray(single_series["density"], dtype=float),
-                np.asarray(compare_txt["density"], dtype=float),
-                rtol=1e-12,
-                atol=1e-12,
+            "mixed_multi_txt_render_contract_reflects_three_visible_series",
+            int(single_contract["global"]["series_count"]) == 3
+            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(
+                sum(len(item["freq"]) for item in series_results)
             ),
             {
-                "single_first5": np.asarray(single_series["density"], dtype=float)[:5].tolist(),
-                "compare_first5": np.asarray(compare_txt["density"], dtype=float)[:5].tolist(),
-            },
-        ),
-        (
-            "mixed_multi_txt_rendered_point_count_equal_compare_txt",
-            int(single_details.get("rendered_point_count", 0)) == int(len(compare_txt["freq"]))
-            and int(single_contract["global"]["total_rendered_point_count_across_series"]) == int(len(compare_txt["freq"])),
-            {
-                "single_rendered_point_count": single_details.get("rendered_point_count"),
-                "compare_rendered_point_count": len(compare_txt["freq"]),
                 "single_contract": single_contract,
+                "series_point_counts": [len(item["freq"]) for item in series_results],
             },
         ),
     ]
 
     failed = False
     print("[single_device_mixed_selection_multi_txt_plus_dat_reuse_check]")
+    print(f"payload_plot_execution_path={payload.get('plot_execution_path')}")
     print(f"single_details={single_details}")
-    print(f"compare_txt_details={compare_txt_details}")
+    print(f"series_labels={[item.get('label') for item in series_results]}")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -4038,9 +4335,9 @@ def run_single_device_auto_bootstrap_fallback_check_mode(args: argparse.Namespac
     return 1 if failed else 0
 
 
-def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace) -> int:
+def run_device_count_default_single_compare_style_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
-        raise ValueError("single-device-default-reuse-enabled-check needs --ygas and --dat.")
+        raise ValueError("device-count-default-single-compare-style-check needs --ygas and --dat.")
 
     ygas_path = Path(args.ygas[0])
     dat_path = Path(args.dat)
@@ -4079,6 +4376,8 @@ def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace)
         plot_kind = app.current_plot_kind
         export_plot_execution_path = get_export_plot_execution_path(app)
         status_text = app.status_var.get()
+        diag_text = app.diagnostic_var.get()
+        preview_check_state = str(app.single_compare_style_preview_check.cget("state"))
     finally:
         root.destroy()
 
@@ -4087,30 +4386,40 @@ def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace)
     details = dict(payload["series_results"][0]["details"])
     checks = [
         (
-            "toggle_default_true",
-            default_toggle_value,
-            {"single_compare_style_preview_default": default_toggle_value},
+            "default_indicator_is_not_manual_gate",
+            preview_check_state == "disabled",
+            {
+                "single_compare_style_preview_default": default_toggle_value,
+                "single_compare_style_preview_state": preview_check_state,
+            },
         ),
         (
-            "single_device_default_reuse_path_active",
-            str(details.get("single_device_execution_path")) == "compare_txt_side_equivalent",
+            "single_device_default_dispatch_path_active",
+            int(details.get("effective_device_count", 0)) == 1
+            and str(payload.get("plot_execution_path")) == "single_device_compare_psd_render"
+            and str(payload.get("dispatch_render_semantics")) == "single_device_compare_psd",
             {"details": details},
         ),
         (
-            "single_device_default_reuse_uses_compare_render_semantics",
+            "single_device_default_reuse_uses_compare_renderer",
             plot_kind == "single_device_compare_psd"
             and export_plot_execution_path == "single_device_compare_psd_render"
-            and "single_device_render_semantics=compare_psd_single_side" in status_text,
+            and "single_device_execution_path=compare_txt_side_equivalent" in status_text
+            and "current_plot_kind=single_device_compare_psd" in status_text
+            and "plot_execution_path=single_device_compare_psd_render" in status_text
+            and "single_device_compare_context_dat_file_name=" in diag_text
+            and "single_device_compare_context_time_range_policy=" in diag_text,
             {
                 "plot_kind": plot_kind,
                 "export_plot_execution_path": export_plot_execution_path,
                 "status_text": status_text,
+                "diag_text": diag_text,
             },
         ),
     ]
 
     failed = False
-    print("[single_device_default_reuse_enabled_check]")
+    print("[device_count_default_single_compare_style_check]")
     print(f"ygas_path={ygas_path}")
     print(f"dat_path={dat_path}")
     print(f"column_a={col_a}")
@@ -4298,6 +4607,18 @@ def run_single_device_vs_compare_render_style_check_mode(args: argparse.Namespac
         app.refresh_canvas = lambda *args, **kwargs: None
         app.element_preset_var.set(str(args.element or "H2O"))
         app.time_range_strategy_var.set("浣跨敤 txt+dat 鍏卞悓鏃堕棿鑼冨洿")
+        app.current_data_source_kind = "file"
+        app.current_data_source_label = f"当前文件：{ygas_path.name}"
+        app.current_file = ygas_path
+        app.current_file_parsed = parsed_a
+        app.current_layout_label = parsed_a.profile_name
+        app.raw_data = parsed_a.dataframe.copy()
+        app.current_data_source_kind = "file"
+        app.current_data_source_label = f"当前文件：{ygas_path.name}"
+        app.current_file = ygas_path
+        app.current_file_parsed = parsed_a
+        app.current_layout_label = parsed_a.profile_name
+        app.raw_data = parsed_a.dataframe.copy()
         configure_auto_compare_context(app, ygas_path, dat_path)
 
         single_payload = app.prepare_multi_spectral_compare_payload(
@@ -4366,6 +4687,865 @@ def run_single_device_vs_compare_render_style_check_mode(args: argparse.Namespac
     return 1 if failed else 0
 
 
+def run_single_device_default_reuse_enabled_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_default_single_compare_style_check_mode(args)
+
+
+def run_device_count_dispatch_single_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas:
+        raise ValueError("device-count-dispatch-single-check needs --ygas.")
+
+    ygas_path = Path(args.ygas[0])
+    parsed = parse_supported_file(ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve single-device target column.")
+
+    root, app = build_headless_app()
+    try:
+        with tempfile.TemporaryDirectory(prefix="device_count_single_") as temp_dir:
+            isolated_path = Path(temp_dir) / ygas_path.name
+            shutil.copy2(ygas_path, isolated_path)
+            payload = app.prepare_multi_spectral_compare_payload(
+                [isolated_path],
+                target_column,
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            render_prepared_multi_spectral_payload(app, payload)
+            details = dict(payload["series_results"][0]["details"])
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            export_plot_execution_path = get_export_plot_execution_path(app)
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "payload_dispatches_to_single_device",
+            int(payload.get("effective_device_count", 0)) == 1
+            and str(payload.get("plot_execution_path")) == "single_device_spectrum",
+            payload,
+        ),
+        (
+            "single_device_details_tagged",
+            int(details.get("effective_device_count", 0)) == 1
+            and str(details.get("render_semantics")) == "single_device"
+            and str(details.get("plot_execution_path")) == "single_device_spectrum",
+            details,
+        ),
+        (
+            "single_device_render_path_visible",
+            app.current_plot_kind == "single_device_spectrum"
+            and export_plot_execution_path == "single_device_spectrum"
+            and "effective_device_count=1" in status_text
+            and "render_semantics=single_device" in status_text
+            and "plot_execution_path=single_device_spectrum" in diag_text,
+            {
+                "current_plot_kind": app.current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_dispatch_single_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_dispatch_dual_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("device-count-dispatch-dual-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed = parse_supported_file(ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve dual-device target column.")
+
+    root, app = build_headless_app()
+    try:
+        payload = app.prepare_multi_spectral_compare_payload(
+            [ygas_path, dat_path],
+            target_column,
+            args.fs,
+            args.nsegment,
+            args.overlap_ratio,
+        )
+        render_prepared_multi_spectral_payload(app, payload)
+        details = dict(payload["series_results"][0]["details"])
+        status_text = app.status_var.get()
+        diag_text = app.diagnostic_var.get()
+        export_plot_execution_path = get_export_plot_execution_path(app)
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "payload_dispatches_to_dual_compare_psd",
+            int(payload.get("effective_device_count", 0)) == 2
+            and str(payload.get("dispatch_render_semantics")) == "dual_psd_compare"
+            and str(payload.get("plot_execution_path")) == "dual_psd_compare",
+            payload,
+        ),
+        (
+            "dual_device_render_path_visible",
+            app.current_plot_kind == "dual_psd_compare"
+            and export_plot_execution_path == "dual_psd_compare"
+            and "effective_device_count=2" in status_text
+            and "render_semantics=dual_psd_compare" in status_text
+            and "plot_execution_path=dual_psd_compare" in diag_text,
+            {
+                "current_plot_kind": app.current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "status_text": status_text,
+                "diag_text": diag_text,
+                "details": details,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_dispatch_dual_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_dispatch_multi_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("device-count-dispatch-multi-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed = parse_supported_file(ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve multi-device target column.")
+
+    root, app = build_headless_app()
+    try:
+        with tempfile.TemporaryDirectory(prefix="device_count_multi_") as temp_dir:
+            temp_root = Path(temp_dir)
+            dat_copy_b = temp_root / "DEVB_toa5.dat"
+            dat_copy_c = temp_root / "DEVC_toa5.dat"
+            shutil.copy2(dat_path, dat_copy_b)
+            shutil.copy2(dat_path, dat_copy_c)
+            payload = app.prepare_multi_spectral_compare_payload(
+                [ygas_path, dat_copy_b, dat_copy_c],
+                target_column,
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+            render_prepared_multi_spectral_payload(app, payload)
+            details = dict(payload["series_results"][0]["details"])
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            export_plot_execution_path = get_export_plot_execution_path(app)
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "payload_dispatches_to_multi_device_overlay",
+            int(payload.get("effective_device_count", 0)) >= 3
+            and str(payload.get("dispatch_render_semantics")) == "multi_device_overlay"
+            and str(payload.get("plot_execution_path")) == "multi_device_overlay",
+            payload,
+        ),
+        (
+            "multi_device_render_path_visible",
+            app.current_plot_kind == "multi_device_overlay"
+            and export_plot_execution_path == "multi_device_overlay"
+            and f"effective_device_count={int(payload.get('effective_device_count', 0))}" in status_text
+            and "render_semantics=multi_device_overlay" in status_text
+            and "plot_execution_path=multi_device_overlay" in diag_text,
+            {
+                "current_plot_kind": app.current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "status_text": status_text,
+                "diag_text": diag_text,
+                "details": details,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_dispatch_multi_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_dispatch_single_check_mode(args)
+
+
+def run_device_count_default_dual_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_dispatch_dual_check_mode(args)
+
+
+def run_device_count_default_multi_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_dispatch_multi_check_mode(args)
+
+
+def run_selected_files_direct_generate_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("selected-files-direct-generate-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed = parse_supported_file(ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve direct-generate target column.")
+
+    import tkinter as tk
+
+    root, app = build_headless_app()
+    try:
+        app.element_preset_var.set(str(args.element or "H2O"))
+        app.populate_file_list([ygas_path, dat_path])
+        app.select_paths_in_list([ygas_path, dat_path], active_path=ygas_path)
+        app.current_data_source_kind = "file"
+        app.current_data_source_label = f"当前文件：{ygas_path.name}"
+        app.current_file = ygas_path
+        app.current_file_parsed = parsed
+        app.current_layout_label = parsed.profile_name
+        app.raw_data = parsed.dataframe.copy()
+        app.column_vars = {str(target_column): tk.BooleanVar(master=root, value=True)}
+        run_background_tasks_inline(app)
+        app.generate_plot()
+        status_text = app.status_var.get()
+        diag_text = app.diagnostic_var.get()
+        export_plot_execution_path = get_export_plot_execution_path(app)
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "direct_generate_uses_dual_compare_dispatch",
+            app.current_plot_kind == "dual_psd_compare"
+            and export_plot_execution_path == "dual_psd_compare",
+            {
+                "current_plot_kind": app.current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+            },
+        ),
+        (
+            "direct_generate_exposes_unified_dispatch_metadata",
+            "effective_device_count=2" in status_text
+            and "render_semantics=dual_psd_compare" in status_text
+            and "plot_execution_path=dual_psd_compare" in diag_text,
+            {
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[selected_files_direct_generate_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_default_single_compare_style_check_mode(args: argparse.Namespace) -> int:
+    root, app = build_headless_app()
+    try:
+        default_toggle_value = bool(app.single_compare_style_preview_var.get())
+        preview_check_state = str(app.single_compare_style_preview_check.cget("state"))
+        with tempfile.TemporaryDirectory(prefix="target_default_single_") as temp_dir:
+            bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+            ygas_path = Path(bundle["ygas_paths"][0])
+            dat_path = Path(bundle["dat_path"])
+            parsed_a = parse_supported_file(ygas_path)
+            col_a = choose_single_column(parsed_a, args.element, "A")
+            if not col_a:
+                raise ValueError("Unable to resolve matching txt column for the requested element.")
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[ygas_path, dat_path],
+                active_path=ygas_path,
+                parsed_active=parsed_a,
+                target_column=str(col_a),
+            )
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "default_indicator_is_not_manual_gate",
+            default_toggle_value and preview_check_state == "disabled",
+            {
+                "single_compare_style_preview_default": default_toggle_value,
+                "single_compare_style_preview_state": preview_check_state,
+            },
+        ),
+        (
+            "single_device_default_dispatch_path_active",
+            plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_device_default_reuse_uses_target_renderer",
+            "effective_device_count=1" in status_text
+            and "render_semantics=target_spectrum_single_group" in status_text
+            and "current_plot_kind=target_spectrum" in status_text
+            and "plot_execution_path=target_spectrum_render" in diag_text
+            and "target_spectrum_group_count=1" in diag_text,
+            {
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_default_single_compare_style_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace) -> int:
+    fixtures = resolve_repo_fixture_paths()
+    with tempfile.TemporaryDirectory(prefix="target_default_fallback_") as temp_dir:
+        isolated_path = Path(temp_dir) / fixtures["ygas"].name
+        shutil.copy2(fixtures["ygas"], isolated_path)
+        parsed = parse_supported_file(isolated_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve single-device target column.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[isolated_path],
+                active_path=isolated_path,
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_psd_kernel = get_export_metadata_value(app, "psd_kernel")
+            export_effective_nsegment = get_export_metadata_value(app, "effective_nsegment")
+            current_plot_kind = app.current_plot_kind
+            plot_title = str(app.figure.axes[0].get_title()) if app.figure.axes else ""
+            axis_state = extract_axis_render_state(app.figure.axes[0]) if app.figure.axes else {"scatter_offsets": []}
+            export_target_context_mode = get_export_metadata_value(app, "target_spectrum_context_mode")
+            export_visible_scope = get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+            expected_target_offsets = compute_expected_ygas_only_legacy_target_offsets(
+                app,
+                ygas_path=isolated_path,
+                target_column=str(target_column),
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_device_default_no_dat_stays_on_target_spectrum_dispatch",
+            current_plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "current_plot_kind": current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_device_default_no_dat_exposes_target_spectrum_metadata",
+            export_target_context_mode == "ygas_only_no_dat"
+            and export_visible_scope == "ygas_only"
+            and "effective_device_count=1" in status_text
+            and "render_semantics=target_spectrum_single_group" in status_text
+            and "plot_execution_path=target_spectrum_render" in diag_text
+            and "target_spectrum_group_count=1" in diag_text
+            and "target_spectrum_visible_series_scope=ygas_only" in diag_text
+            and "target_spectrum_context_mode=ygas_only_no_dat" in diag_text,
+            {
+                "status_text": status_text,
+                "diag_text": diag_text,
+                "target_spectrum_context_mode": export_target_context_mode,
+                "target_spectrum_visible_series_scope": export_visible_scope,
+            },
+        ),
+        (
+            "single_device_default_no_dat_keeps_target_title_semantics",
+            plot_title.startswith("时间序列谱分析 - ")
+            and "selected_dat_file_count=0" in status_text
+            and "current_plot_kind=target_spectrum" in status_text,
+            {
+                "plot_title": plot_title,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    checks.extend(
+        [
+            (
+                "single_device_default_no_dat_uses_legacy_target_psd_kernel",
+                f"psd_kernel={core.LEGACY_TARGET_PSD_KERNEL_DEFAULT}" in diag_text
+                and str(expected_target_offsets["details"].get("psd_kernel")) == core.LEGACY_TARGET_PSD_KERNEL_DEFAULT
+                and f"effective_nsegment={expected_target_offsets['details'].get('effective_nsegment')}" in diag_text,
+                {
+                    "export_psd_kernel": export_psd_kernel,
+                    "expected_psd_kernel": expected_target_offsets["details"].get("psd_kernel"),
+                    "export_effective_nsegment": export_effective_nsegment,
+                    "expected_effective_nsegment": expected_target_offsets["details"].get("effective_nsegment"),
+                },
+            ),
+            (
+                "single_device_default_no_dat_visible_points_match_legacy_target_psd",
+                len(axis_state["scatter_offsets"]) == 1
+                and np.asarray(axis_state["scatter_offsets"][0], dtype=float).shape
+                == np.asarray(expected_target_offsets["offsets"], dtype=float).shape
+                and np.allclose(
+                    np.asarray(axis_state["scatter_offsets"][0], dtype=float),
+                    np.asarray(expected_target_offsets["offsets"], dtype=float),
+                    rtol=1e-12,
+                    atol=1e-12,
+                ),
+                {
+                    "scatter_collection_count": len(axis_state["scatter_offsets"]),
+                    "rendered_offsets": axis_state["scatter_offsets"],
+                    "expected_offsets": expected_target_offsets["offsets"],
+                },
+            ),
+        ]
+    )
+
+    failed = False
+    print("[device_count_default_single_fallback_check]")
+    print(f"isolated_path={isolated_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_target_spectrum_nsegment_override_no_dat_check_mode(args: argparse.Namespace) -> int:
+    fixtures = resolve_repo_fixture_paths()
+    source_ygas = Path(args.ygas[0]) if args.ygas else fixtures["ygas"]
+    with tempfile.TemporaryDirectory(prefix="target_nsegment_override_no_dat_") as temp_dir:
+        isolated_path = Path(temp_dir) / source_ygas.name
+        shutil.copy2(source_ygas, isolated_path)
+        parsed = parse_supported_file(isolated_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve single-device target column.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            app.legacy_target_use_analysis_params_var.set(False)
+            app.nsegment_var.set(str(args.nsegment))
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[isolated_path],
+                active_path=isolated_path,
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    expected_nsegment = str(int(args.nsegment))
+    checks = [
+        (
+            "single_no_dat_nsegment_override_keeps_target_spectrum",
+            plot_kind == "target_spectrum",
+            {
+                "plot_kind": plot_kind,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_no_dat_nsegment_override_takes_effect",
+            "目标谱图沿用当前 NSEGMENT=是" in diag_text
+            and "目标谱图沿用整套分析参数=否" in diag_text
+            and f"requested_nsegment={expected_nsegment}" in diag_text
+            and f"effective_nsegment={expected_nsegment}" in diag_text
+            and f"NSEGMENT={expected_nsegment}" in diag_text,
+            {
+                "expected_nsegment": expected_nsegment,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[target_spectrum_nsegment_override_no_dat_check]")
+    print(f"isolated_path={isolated_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_target_spectrum_nsegment_override_txt_dat_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_nsegment_override_txt_dat_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+        parsed = parse_supported_file(ygas_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve txt+dat target column.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            app.legacy_target_use_analysis_params_var.set(False)
+            app.nsegment_var.set(str(args.nsegment))
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[ygas_path, dat_path],
+                active_path=ygas_path,
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    expected_nsegment = str(int(args.nsegment))
+    checks = [
+        (
+            "txt_dat_nsegment_override_keeps_target_spectrum",
+            plot_kind == "target_spectrum",
+            {
+                "plot_kind": plot_kind,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "txt_dat_nsegment_override_takes_effect",
+            "目标谱图沿用当前 NSEGMENT=是" in diag_text
+            and "目标谱图沿用整套分析参数=否" in diag_text
+            and f"requested_nsegment={expected_nsegment}" in diag_text
+            and f"effective_nsegment={expected_nsegment}" in diag_text
+            and f"NSEGMENT={expected_nsegment}" in diag_text,
+            {
+                "expected_nsegment": expected_nsegment,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[target_spectrum_nsegment_override_txt_dat_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_default_dual_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_default_dual_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=2)
+        ygas_paths = [Path(path) for path in bundle["ygas_paths"]]
+        dat_path = Path(bundle["dat_path"])
+        parsed = parse_supported_file(ygas_paths[0])
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve dual-device target column.")
+
+        root, app = build_headless_app()
+        try:
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[*ygas_paths, dat_path],
+                active_path=ygas_paths[0],
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            current_plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "dual_device_default_dispatch_path_active",
+            current_plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_dual_group",
+            {
+                "current_plot_kind": current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "dual_device_default_status_visible",
+            "effective_device_count=2" in status_text
+            and "render_semantics=target_spectrum_dual_group" in status_text
+            and "plot_execution_path=target_spectrum_render" in diag_text,
+            {
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_default_dual_check]")
+    print(f"ygas_paths={ygas_paths}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_device_count_default_multi_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_default_multi_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=3)
+        ygas_paths = [Path(path) for path in bundle["ygas_paths"]]
+        dat_path = Path(bundle["dat_path"])
+        parsed = parse_supported_file(ygas_paths[0])
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve multi-device target column.")
+
+        root, app = build_headless_app()
+        try:
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[*ygas_paths, dat_path],
+                active_path=ygas_paths[0],
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            current_plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "multi_device_default_dispatch_path_active",
+            current_plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_multi_group",
+            {
+                "current_plot_kind": current_plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "multi_device_default_status_visible",
+            "effective_device_count=3" in status_text
+            and "render_semantics=target_spectrum_multi_group" in status_text
+            and "plot_execution_path=target_spectrum_render" in diag_text,
+            {
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[device_count_default_multi_check]")
+    print(f"ygas_paths={ygas_paths}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_selected_files_direct_target_spectrum_single_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_default_single_compare_style_check_mode(args)
+
+
+def run_selected_files_direct_target_spectrum_dual_check_mode(args: argparse.Namespace) -> int:
+    return run_device_count_default_dual_check_mode(args)
+
+
+def run_selected_files_direct_generate_check_mode(args: argparse.Namespace) -> int:
+    checks = [
+        (
+            "single_group_direct_generate_prefers_target_spectrum",
+            run_selected_files_direct_target_spectrum_single_check_mode,
+        ),
+        (
+            "dual_group_direct_generate_prefers_target_spectrum",
+            run_selected_files_direct_target_spectrum_dual_check_mode,
+        ),
+    ]
+    failed = False
+    print("[selected_files_direct_generate_check]")
+    for name, func in checks:
+        try:
+            exit_code = int(func(args))
+            ok = exit_code == 0
+            detail = {"exit_code": exit_code}
+        except Exception as exc:
+            ok = False
+            detail = {"error": str(exc)}
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_txt_dat_not_equals_device_count_check_mode(args: argparse.Namespace) -> int:
+    if not args.ygas or not args.dat:
+        raise ValueError("txt-dat-not-equals-device-count-check needs --ygas and --dat.")
+
+    ygas_path = Path(args.ygas[0])
+    dat_path = Path(args.dat)
+    parsed = parse_supported_file(ygas_path)
+    target_column = choose_single_column(parsed, args.element, "A")
+    if not target_column:
+        raise ValueError("Unable to resolve txt/dat device-count target column.")
+
+    root, app = build_headless_app()
+    try:
+        with tempfile.TemporaryDirectory(prefix="txt_dat_device_count_") as temp_dir:
+            temp_root = Path(temp_dir)
+            dat_copy_b = temp_root / "DEVB_toa5.dat"
+            dat_copy_c = temp_root / "DEVC_toa5.dat"
+            shutil.copy2(dat_path, dat_copy_b)
+            shutil.copy2(dat_path, dat_copy_c)
+            payload = app.prepare_multi_spectral_compare_payload(
+                [ygas_path, dat_copy_b, dat_copy_c],
+                target_column,
+                args.fs,
+                args.nsegment,
+                args.overlap_ratio,
+            )
+    finally:
+        root.destroy()
+
+    checks = [
+        (
+            "selection_type_counts_do_not_cap_device_count",
+            int(payload.get("selected_txt_file_count", 0)) == 1
+            and int(payload.get("selected_dat_file_count", 0)) == 2
+            and int(payload.get("effective_device_count", 0)) == 3,
+            payload,
+        ),
+        (
+            "effective_device_ids_come_from_grouping_not_txt_dat_types",
+            len(list(payload.get("effective_device_ids", []))) == 3
+            and str(payload.get("dispatch_render_semantics")) == "multi_device_overlay",
+            {
+                "effective_device_ids": payload.get("effective_device_ids"),
+                "dispatch_render_semantics": payload.get("dispatch_render_semantics"),
+            },
+        ),
+    ]
+
+    failed = False
+    print("[txt_dat_not_equals_device_count_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_single_device_vs_dual_compare_axis_geometry_check_mode(args: argparse.Namespace) -> int:
     if not args.ygas or not args.dat:
         raise ValueError("single-device-vs-dual-compare-axis-geometry-check needs --ygas and --dat.")
@@ -4392,6 +5572,7 @@ def run_single_device_vs_dual_compare_axis_geometry_check_mode(args: argparse.Na
     root = tk.Tk()
     root.withdraw()
     app = app_mod.FileViewerApp(root)
+    preview_check_state = ""
     try:
         app.refresh_canvas = lambda *args, **kwargs: None
         app.element_preset_var.set(str(args.element or "H2O"))
@@ -4466,6 +5647,7 @@ def run_single_device_vs_dual_compare_reference_slope_check_mode(args: argparse.
     root = tk.Tk()
     root.withdraw()
     app = app_mod.FileViewerApp(root)
+    preview_check_state = ""
     try:
         app.refresh_canvas = lambda *args, **kwargs: None
         app.element_preset_var.set(str(args.element or "H2O"))
@@ -4542,6 +5724,7 @@ def run_single_device_vs_dual_compare_visible_scatter_subset_check_mode(args: ar
     root = tk.Tk()
     root.withdraw()
     app = app_mod.FileViewerApp(root)
+    preview_check_state = ""
     try:
         app.refresh_canvas = lambda *args, **kwargs: None
         app.element_preset_var.set(str(args.element or "H2O"))
@@ -4584,6 +5767,425 @@ def run_single_device_vs_dual_compare_visible_scatter_subset_check_mode(args: ar
     print("[single_device_vs_dual_compare_visible_scatter_subset_check]")
     print(f"single_offsets={single_offsets}")
     print(f"dual_offsets={dual_offsets}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_vs_dual_target_spectrum_visible_subset_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_subset_check_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=2)
+        ygas_paths = [Path(path) for path in bundle["ygas_paths"]]
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_paths[0],
+                dual_ygas_paths=ygas_paths,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    single_offsets = list(render_state["single_axis_state"]["scatter_offsets"])
+    dual_offsets = list(render_state["dual_axis_state"]["scatter_offsets"])
+    subset_match = (
+        len(single_offsets) == 2
+        and len(dual_offsets) == 4
+        and np.array_equal(np.asarray(single_offsets[0], dtype=float), np.asarray(dual_offsets[0], dtype=float))
+        and np.array_equal(np.asarray(single_offsets[1], dtype=float), np.asarray(dual_offsets[2], dtype=float))
+    )
+    checks = [
+        (
+            "single_target_spectrum_visible_scatter_is_dual_subset",
+            subset_match,
+            {
+                "single_collection_count": len(single_offsets),
+                "dual_collection_count": len(dual_offsets),
+                "single_offsets": single_offsets,
+                "dual_offsets": dual_offsets,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_vs_dual_target_spectrum_visible_subset_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_vs_dual_target_spectrum_style_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_style_check_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=2)
+        ygas_paths = [Path(path) for path in bundle["ygas_paths"]]
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_paths[0],
+                dual_ygas_paths=ygas_paths,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    single_lines = list(render_state["single_axis_state"]["reference_slope_lines"])
+    dual_lines = list(render_state["dual_axis_state"]["reference_slope_lines"])
+    same_reference_lines = len(single_lines) == len(dual_lines) and all(
+        str(single["label"]) == str(dual["label"])
+        and np.array_equal(np.asarray(single["x"], dtype=float), np.asarray(dual["x"], dtype=float))
+        and np.allclose(
+            np.asarray(single["y"], dtype=float),
+            np.asarray(dual["y"], dtype=float),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        for single, dual in zip(single_lines, dual_lines)
+    )
+    checks = [
+        (
+            "single_and_dual_target_spectrum_title_semantics_match",
+            str(render_state["single_axis_state"]["title"]) == str(render_state["dual_axis_state"]["title"]),
+            {
+                "single_title": render_state["single_axis_state"]["title"],
+                "dual_title": render_state["dual_axis_state"]["title"],
+            },
+        ),
+        (
+            "single_and_dual_target_spectrum_style_layout_match",
+            render_state["single_plot_kind"] == "target_spectrum"
+            and render_state["dual_plot_kind"] == "target_spectrum"
+            and str(render_state["single_plot_style"]) == str(render_state["dual_plot_style"])
+            and str(render_state["single_plot_layout"]) == str(render_state["dual_plot_layout"]),
+            {
+                "single_plot_kind": render_state["single_plot_kind"],
+                "dual_plot_kind": render_state["dual_plot_kind"],
+                "single_plot_style": render_state["single_plot_style"],
+                "dual_plot_style": render_state["dual_plot_style"],
+                "single_plot_layout": render_state["single_plot_layout"],
+                "dual_plot_layout": render_state["dual_plot_layout"],
+                "single_export_plot_execution_path": render_state["single_export_plot_execution_path"],
+                "dual_export_plot_execution_path": render_state["dual_export_plot_execution_path"],
+                "single_export_render_semantics": render_state["single_export_render_semantics"],
+                "dual_export_render_semantics": render_state["dual_export_render_semantics"],
+            },
+        ),
+        (
+            "single_and_dual_target_spectrum_reference_slope_semantics_match",
+            same_reference_lines,
+            {
+                "single_reference_slope_lines": single_lines,
+                "dual_reference_slope_lines": dual_lines,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_vs_dual_target_spectrum_style_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_open_target_spectrum_primary_visible_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_target_visible_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_file_open_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_path,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_open_direct_generate_uses_target_spectrum_renderer",
+            render_state["single_plot_kind"] == "target_spectrum"
+            and render_state["single_export_plot_execution_path"] == "target_spectrum_render"
+            and render_state["single_export_render_semantics"] == "target_spectrum_single_group",
+            {
+                "single_plot_kind": render_state["single_plot_kind"],
+                "single_export_plot_execution_path": render_state["single_export_plot_execution_path"],
+                "single_export_render_semantics": render_state["single_export_render_semantics"],
+            },
+        ),
+        (
+            "single_file_open_direct_generate_only_shows_primary_visible_series",
+            render_state["single_visible_scope"] == "ygas_only"
+            and len(render_state["single_axis_state"]["scatter_offsets"]) == 1
+            and "target_spectrum_visible_series_scope=ygas_only" in str(render_state["single_status_text"])
+            and "target_spectrum_visible_series_scope=ygas_only" in str(render_state["single_diag_text"]),
+            {
+                "single_visible_scope": render_state["single_visible_scope"],
+                "single_status_text": render_state["single_status_text"],
+                "single_diag_text": render_state["single_diag_text"],
+                "single_scatter_collection_count": len(render_state["single_axis_state"]["scatter_offsets"]),
+            },
+        ),
+        (
+            "single_file_open_direct_generate_keeps_target_title_semantics",
+            str(render_state["single_axis_state"]["title"]).startswith("时间序列谱分析 - "),
+            {"single_title": render_state["single_axis_state"]["title"]},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_target_spectrum_primary_visible_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_open_auto_preview_target_spectrum_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_auto_preview_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+
+        root, app = build_headless_app()
+        try:
+            import tkinter as tk
+
+            app.element_preset_var.set(str(args.element or "CO2"))
+            simulate_single_file_open(app, ygas_path)
+            parsed = parse_supported_file(ygas_path)
+            target_column = choose_single_column(parsed, args.element, "A")
+            if not target_column:
+                raise ValueError("Unable to resolve matching txt column for the requested element.")
+            app.column_vars = {str(target_column): tk.BooleanVar(master=app.root, value=True)}
+            run_background_tasks_inline(app)
+            app.auto_perform_analysis()
+            if not app.figure.axes:
+                raise ValueError("Single-file auto preview did not produce a visible axis.")
+            axis_state = extract_axis_render_state(app.figure.axes[0])
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_visible_scope = get_export_metadata_value(app, "target_spectrum_visible_series_scope")
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_auto_preview_uses_target_spectrum_renderer",
+            plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_file_auto_preview_only_shows_primary_visible_series",
+            export_visible_scope == "ygas_only"
+            and len(axis_state["scatter_offsets"]) == 1
+            and "target_spectrum_visible_series_scope=ygas_only" in status_text
+            and "target_spectrum_visible_series_scope=ygas_only" in diag_text,
+            {
+                "export_visible_scope": export_visible_scope,
+                "scatter_collection_count": len(axis_state["scatter_offsets"]),
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_file_auto_preview_keeps_target_title_semantics",
+            str(axis_state["title"]).startswith("时间序列谱分析 - "),
+            {"title": axis_state["title"]},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_auto_preview_target_spectrum_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_parent_dat_autodiscovery_") as temp_dir:
+        root_dir = Path(temp_dir)
+        child_dir = root_dir / "0328"
+        child_dir.mkdir(parents=True, exist_ok=True)
+        bundle = prepare_target_spectrum_smoke_paths(root_dir, group_count=1)
+        original_ygas_path = Path(bundle["ygas_paths"][0])
+        ygas_path = child_dir / original_ygas_path.name
+        shutil.move(str(original_ygas_path), str(ygas_path))
+        dat_path = Path(bundle["dat_path"])
+
+        parsed = parse_supported_file(ygas_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve matching txt column for the requested element.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            simulate_single_file_open(app, ygas_path)
+            import tkinter as tk
+
+            app.column_vars = {str(target_column): tk.BooleanVar(master=root, value=True)}
+            run_background_tasks_inline(app)
+            app.generate_plot()
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+            export_plot_execution_path = get_export_plot_execution_path(app)
+            export_render_semantics = get_export_metadata_value(app, "render_semantics")
+            export_context_dat_name = get_export_metadata_value(app, "target_spectrum_context_dat_file_name")
+            auto_compare_context_dat_file_name = str(getattr(app, "auto_compare_context_dat_file_name", "") or "")
+            plot_title = str(app.figure.axes[0].get_title()) if app.figure.axes else ""
+        finally:
+            root.destroy()
+
+    checks = [
+        (
+            "single_file_parent_dat_autodiscovery_uses_target_spectrum_renderer",
+            plot_kind == "target_spectrum"
+            and export_plot_execution_path == "target_spectrum_render"
+            and export_render_semantics == "target_spectrum_single_group",
+            {
+                "plot_kind": plot_kind,
+                "export_plot_execution_path": export_plot_execution_path,
+                "export_render_semantics": export_render_semantics,
+            },
+        ),
+        (
+            "single_file_parent_dat_autodiscovery_binds_parent_dat_context",
+            export_context_dat_name == dat_path.name
+            and auto_compare_context_dat_file_name == dat_path.name
+            and f"target_spectrum_context_dat_file_name={dat_path.name}" in status_text
+            and f"target_spectrum_context_dat_file_name={dat_path.name}" in diag_text,
+            {
+                "export_context_dat_name": export_context_dat_name,
+                "auto_compare_context_dat_file_name": auto_compare_context_dat_file_name,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_file_parent_dat_autodiscovery_keeps_target_title_semantics",
+            plot_title.startswith("时间序列谱分析 - "),
+            {"plot_title": plot_title},
+        ),
+    ]
+
+    failed = False
+    print("[single_file_parent_dat_autodiscovery_target_spectrum_check]")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="single_open_target_subset_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+
+        root, app = build_headless_app()
+        try:
+            render_state = capture_single_file_open_and_dual_target_spectrum_render_states(
+                app,
+                single_ygas_path=ygas_path,
+                dat_path=dat_path,
+                args=args,
+            )
+        finally:
+            root.destroy()
+
+    single_offsets = list(render_state["single_axis_state"]["scatter_offsets"])
+    dual_offsets = list(render_state["dual_axis_state"]["scatter_offsets"])
+    single_lines = list(render_state["single_axis_state"]["reference_slope_lines"])
+    dual_lines = list(render_state["dual_axis_state"]["reference_slope_lines"])
+    same_reference_lines = len(single_lines) == len(dual_lines) and all(
+        str(single["label"]) == str(dual["label"])
+        and np.array_equal(np.asarray(single["x"], dtype=float), np.asarray(dual["x"], dtype=float))
+        and np.allclose(
+            np.asarray(single["y"], dtype=float),
+            np.asarray(dual["y"], dtype=float),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        for single, dual in zip(single_lines, dual_lines)
+    )
+
+    checks = [
+        (
+            "single_file_open_visible_blue_subset_matches_dual_target_spectrum_blue_series",
+            len(single_offsets) == 1
+            and len(dual_offsets) == 2
+            and np.array_equal(np.asarray(single_offsets[0], dtype=float), np.asarray(dual_offsets[0], dtype=float)),
+            {
+                "single_offsets": single_offsets,
+                "dual_offsets": dual_offsets,
+            },
+        ),
+        (
+            "single_file_open_target_spectrum_style_matches_dual_target_spectrum_style",
+            render_state["single_plot_kind"] == "target_spectrum"
+            and render_state["dual_plot_kind"] == "target_spectrum"
+            and str(render_state["single_plot_style"]) == str(render_state["dual_plot_style"])
+            and str(render_state["single_plot_layout"]) == str(render_state["dual_plot_layout"])
+            and str(render_state["single_axis_state"]["title"]) == str(render_state["dual_axis_state"]["title"]),
+            {
+                "single_plot_kind": render_state["single_plot_kind"],
+                "dual_plot_kind": render_state["dual_plot_kind"],
+                "single_plot_style": render_state["single_plot_style"],
+                "dual_plot_style": render_state["dual_plot_style"],
+                "single_plot_layout": render_state["single_plot_layout"],
+                "dual_plot_layout": render_state["dual_plot_layout"],
+                "single_title": render_state["single_axis_state"]["title"],
+                "dual_title": render_state["dual_axis_state"]["title"],
+            },
+        ),
+        (
+            "single_file_open_target_spectrum_reference_line_matches_dual_target_spectrum_reference_line",
+            same_reference_lines,
+            {
+                "single_reference_slope_lines": single_lines,
+                "dual_reference_slope_lines": dual_lines,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[single_file_open_vs_dual_target_spectrum_primary_subset_check]")
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         print(f"- {name}: {status}")
@@ -5227,24 +6829,66 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
 
     checks = [
         (
-            "ygas_base_freq_equal_same_window",
-            np.array_equal(single_ygas["freq"], dual_ygas["freq"]),
-            {"single_points": len(single_ygas["freq"]), "compare_points": len(dual_ygas["freq"])},
+            "single_same_window_payload_respects_requested_range",
+            single_ygas["details"].get("base_requested_start") == start_dt
+            and single_ygas["details"].get("base_requested_end") == end_dt
+            and single_ygas["details"].get("render_semantics") == "single_device_compare_psd"
+            and single_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render",
+            {
+                "requested_range": (start_dt, end_dt),
+                "single_requested": (
+                    single_ygas["details"].get("base_requested_start"),
+                    single_ygas["details"].get("base_requested_end"),
+                ),
+                "render_semantics": single_ygas["details"].get("render_semantics"),
+                "plot_execution_path": single_ygas["details"].get("plot_execution_path"),
+            },
         ),
         (
-            "ygas_base_density_allclose_same_window",
-            np.allclose(single_ygas["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
-            {"single_first5": single_ygas["density"][:5].tolist(), "compare_first5": dual_ygas["density"][:5].tolist()},
+            "single_default_policy_reuses_compare_window_when_context_available",
+            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
+            and single_full_ygas["details"].get("render_semantics") == "single_device_compare_psd"
+            and single_full_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render",
+            {
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
+                "render_semantics": single_full_ygas["details"].get("render_semantics"),
+                "plot_execution_path": single_full_ygas["details"].get("plot_execution_path"),
+            },
         ),
         (
-            "dat_base_freq_equal_same_window",
-            np.array_equal(single_dat["freq"], dual_dat["freq"]),
-            {"single_points": len(single_dat["freq"]), "compare_points": len(dual_dat["freq"])},
+            "single_default_matches_compare_window_when_context_available",
+            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
+            and single_full_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render"
+            and dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
+            {
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "compare_policy": dual_ygas["details"].get("time_range_policy"),
+                "single_actual": (
+                    single_full_ygas["details"].get("base_actual_start"),
+                    single_full_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
+            },
         ),
         (
-            "dat_base_density_allclose_same_window",
-            np.allclose(single_dat["density"], dual_dat["density"], rtol=1e-12, atol=1e-12),
-            {"single_first5": single_dat["density"][:5].tolist(), "compare_first5": dual_dat["density"][:5].tolist()},
+            "single_dat_same_window_payload_respects_requested_range",
+            single_dat["details"].get("base_requested_start") == start_dt
+            and single_dat["details"].get("base_requested_end") == end_dt
+            and single_dat["details"].get("render_semantics") == "single_device"
+            and single_dat["details"].get("plot_execution_path") == "single_device_spectrum",
+            {
+                "requested_range": (start_dt, end_dt),
+                "single_requested": (
+                    single_dat["details"].get("base_requested_start"),
+                    single_dat["details"].get("base_requested_end"),
+                ),
+                "render_semantics": single_dat["details"].get("render_semantics"),
+                "plot_execution_path": single_dat["details"].get("plot_execution_path"),
+            },
         ),
         (
             "shared_base_builder",
@@ -5274,14 +6918,6 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             },
         ),
         (
-            "single_auto_reuse_common_window_policy",
-            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
-            {
-                "single_policy": single_full_ygas["details"].get("time_range_policy"),
-                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
-            },
-        ),
-        (
             "compare_common_window_policy",
             dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
             and dual_dat["details"].get("time_range_policy") == "txt_dat_common_window",
@@ -5292,16 +6928,17 @@ def run_single_compare_base_spectrum_hardened_check_mode(args: argparse.Namespac
             },
         ),
         (
-            "single_auto_reuse_matches_compare_window",
-            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
-            and single_full_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
-            and single_full_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
+            "compare_manual_sync_matches_compare_window",
+            synced_single_ygas["details"].get("base_requested_start") == dual_ygas["details"].get("base_requested_start")
+            and synced_single_ygas["details"].get("base_requested_end") == dual_ygas["details"].get("base_requested_end")
+            and synced_single_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and synced_single_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
             {
-                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "synced_single_policy": synced_single_ygas["details"].get("time_range_policy"),
                 "compare_policy": dual_ygas["details"].get("time_range_policy"),
-                "single_actual": (
-                    single_full_ygas["details"].get("base_actual_start"),
-                    single_full_ygas["details"].get("base_actual_end"),
+                "synced_single_actual": (
+                    synced_single_ygas["details"].get("base_actual_start"),
+                    synced_single_ygas["details"].get("base_actual_end"),
                 ),
                 "compare_actual": (
                     dual_ygas["details"].get("base_actual_start"),
@@ -5817,24 +7454,66 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
 
     checks = [
         (
-            "ygas_base_freq_equal_same_window",
-            np.array_equal(single_ygas["freq"], dual_ygas["freq"]),
-            {"single_points": len(single_ygas["freq"]), "compare_points": len(dual_ygas["freq"])},
+            "single_same_window_payload_respects_requested_range",
+            single_ygas["details"].get("base_requested_start") == start_dt
+            and single_ygas["details"].get("base_requested_end") == end_dt
+            and single_ygas["details"].get("render_semantics") == "single_device_compare_psd"
+            and single_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render",
+            {
+                "requested_range": (start_dt, end_dt),
+                "single_requested": (
+                    single_ygas["details"].get("base_requested_start"),
+                    single_ygas["details"].get("base_requested_end"),
+                ),
+                "render_semantics": single_ygas["details"].get("render_semantics"),
+                "plot_execution_path": single_ygas["details"].get("plot_execution_path"),
+            },
         ),
         (
-            "ygas_base_density_allclose_same_window",
-            np.allclose(single_ygas["density"], dual_ygas["density"], rtol=1e-12, atol=1e-12),
-            {"single_first5": single_ygas["density"][:5].tolist(), "compare_first5": dual_ygas["density"][:5].tolist()},
+            "single_default_policy_reuses_compare_window_when_context_available",
+            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
+            and single_full_ygas["details"].get("render_semantics") == "single_device_compare_psd"
+            and single_full_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render",
+            {
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
+                "render_semantics": single_full_ygas["details"].get("render_semantics"),
+                "plot_execution_path": single_full_ygas["details"].get("plot_execution_path"),
+            },
         ),
         (
-            "dat_base_freq_equal_same_window",
-            np.array_equal(single_dat["freq"], dual_dat["freq"]),
-            {"single_points": len(single_dat["freq"]), "compare_points": len(dual_dat["freq"])},
+            "single_default_matches_compare_window_when_context_available",
+            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
+            and single_full_ygas["details"].get("plot_execution_path") == "single_device_compare_psd_render"
+            and dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
+            {
+                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "compare_policy": dual_ygas["details"].get("time_range_policy"),
+                "single_actual": (
+                    single_full_ygas["details"].get("base_actual_start"),
+                    single_full_ygas["details"].get("base_actual_end"),
+                ),
+                "compare_actual": (
+                    dual_ygas["details"].get("base_actual_start"),
+                    dual_ygas["details"].get("base_actual_end"),
+                ),
+            },
         ),
         (
-            "dat_base_density_allclose_same_window",
-            np.allclose(single_dat["density"], dual_dat["density"], rtol=1e-12, atol=1e-12),
-            {"single_first5": single_dat["density"][:5].tolist(), "compare_first5": dual_dat["density"][:5].tolist()},
+            "single_dat_same_window_payload_respects_requested_range",
+            single_dat["details"].get("base_requested_start") == start_dt
+            and single_dat["details"].get("base_requested_end") == end_dt
+            and single_dat["details"].get("render_semantics") == "single_device"
+            and single_dat["details"].get("plot_execution_path") == "single_device_spectrum",
+            {
+                "requested_range": (start_dt, end_dt),
+                "single_requested": (
+                    single_dat["details"].get("base_requested_start"),
+                    single_dat["details"].get("base_requested_end"),
+                ),
+                "render_semantics": single_dat["details"].get("render_semantics"),
+                "plot_execution_path": single_dat["details"].get("plot_execution_path"),
+            },
         ),
         (
             "shared_base_builder",
@@ -5861,14 +7540,6 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
             },
         ),
         (
-            "single_auto_reuse_common_window_policy",
-            single_full_ygas["details"].get("time_range_policy") == "txt_dat_common_window",
-            {
-                "single_policy": single_full_ygas["details"].get("time_range_policy"),
-                "single_label": single_full_ygas["details"].get("time_range_policy_label"),
-            },
-        ),
-        (
             "compare_common_window_policy",
             dual_ygas["details"].get("time_range_policy") == "txt_dat_common_window"
             and dual_dat["details"].get("time_range_policy") == "txt_dat_common_window",
@@ -5879,16 +7550,17 @@ def run_single_compare_base_spectrum_core_metadata_check_mode(args: argparse.Nam
             },
         ),
         (
-            "single_auto_reuse_matches_compare_window",
-            single_full_ygas["details"].get("time_range_policy") == dual_ygas["details"].get("time_range_policy")
-            and single_full_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
-            and single_full_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
+            "compare_manual_sync_matches_compare_window",
+            synced_single_ygas["details"].get("base_requested_start") == dual_ygas["details"].get("base_requested_start")
+            and synced_single_ygas["details"].get("base_requested_end") == dual_ygas["details"].get("base_requested_end")
+            and synced_single_ygas["details"].get("base_actual_start") == dual_ygas["details"].get("base_actual_start")
+            and synced_single_ygas["details"].get("base_actual_end") == dual_ygas["details"].get("base_actual_end"),
             {
-                "single_policy": single_full_ygas["details"].get("time_range_policy"),
+                "synced_single_policy": synced_single_ygas["details"].get("time_range_policy"),
                 "compare_policy": dual_ygas["details"].get("time_range_policy"),
-                "single_actual": (
-                    single_full_ygas["details"].get("base_actual_start"),
-                    single_full_ygas["details"].get("base_actual_end"),
+                "synced_single_actual": (
+                    synced_single_ygas["details"].get("base_actual_start"),
+                    synced_single_ygas["details"].get("base_actual_end"),
                 ),
                 "compare_actual": (
                     dual_ygas["details"].get("base_actual_start"),
@@ -6218,6 +7890,19 @@ def main() -> int:
             "cross-display-semantics-check",
             "frr-compat-semantics-check",
             "device-group-spectral-check",
+            "device-count-dispatch-single-check",
+            "device-count-dispatch-dual-check",
+            "device-count-dispatch-multi-check",
+            "device-count-default-single-compare-style-check",
+            "device-count-default-single-fallback-check",
+            "target-spectrum-nsegment-override-no-dat-check",
+            "target-spectrum-nsegment-override-txt-dat-check",
+            "device-count-default-dual-check",
+            "device-count-default-multi-check",
+            "selected-files-direct-generate-check",
+            "selected-files-direct-target-spectrum-single-check",
+            "selected-files-direct-target-spectrum-dual-check",
+            "txt-dat-not-equals-device-count-check",
             "single-compare-base-spectrum-check",
             "single-device-selection-scope-check",
             "single-file-open-auto-bootstrap-compare-context-check",
@@ -6232,6 +7917,12 @@ def main() -> int:
             "single-device-vs-dual-compare-axis-geometry-check",
             "single-device-vs-dual-compare-reference-slope-check",
             "single-device-vs-dual-compare-visible-scatter-subset-check",
+            "single-vs-dual-target-spectrum-visible-subset-check",
+            "single-vs-dual-target-spectrum-style-check",
+            "single-file-open-target-spectrum-primary-visible-check",
+            "single-file-open-auto-preview-target-spectrum-check",
+            "single-file-parent-dat-autodiscovery-target-spectrum-check",
+            "single-file-open-vs-dual-target-spectrum-primary-subset-check",
             "single-device-fallback-still-legacy-render-check",
             "single-device-active-dat-sync-check",
             "single-device-active-time-range-sync-check",
@@ -6295,6 +7986,32 @@ def main() -> int:
             return run_frr_compat_semantics_check_mode(args)
         if mode == "device-group-spectral-check":
             return run_device_group_spectral_check_mode(args)
+        if mode == "device-count-dispatch-single-check":
+            return run_device_count_dispatch_single_check_mode(args)
+        if mode == "device-count-dispatch-dual-check":
+            return run_device_count_dispatch_dual_check_mode(args)
+        if mode == "device-count-dispatch-multi-check":
+            return run_device_count_dispatch_multi_check_mode(args)
+        if mode == "device-count-default-single-compare-style-check":
+            return run_device_count_default_single_compare_style_check_mode(args)
+        if mode == "device-count-default-single-fallback-check":
+            return run_device_count_default_single_fallback_check_mode(args)
+        if mode == "target-spectrum-nsegment-override-no-dat-check":
+            return run_target_spectrum_nsegment_override_no_dat_check_mode(args)
+        if mode == "target-spectrum-nsegment-override-txt-dat-check":
+            return run_target_spectrum_nsegment_override_txt_dat_check_mode(args)
+        if mode == "device-count-default-dual-check":
+            return run_device_count_default_dual_check_mode(args)
+        if mode == "device-count-default-multi-check":
+            return run_device_count_default_multi_check_mode(args)
+        if mode == "selected-files-direct-generate-check":
+            return run_selected_files_direct_generate_check_mode(args)
+        if mode == "selected-files-direct-target-spectrum-single-check":
+            return run_selected_files_direct_target_spectrum_single_check_mode(args)
+        if mode == "selected-files-direct-target-spectrum-dual-check":
+            return run_selected_files_direct_target_spectrum_dual_check_mode(args)
+        if mode == "txt-dat-not-equals-device-count-check":
+            return run_txt_dat_not_equals_device_count_check_mode(args)
         if mode == "single-compare-base-spectrum-check":
             return run_single_compare_base_spectrum_core_metadata_check_mode(args)
         if mode == "single-device-selection-scope-check":
@@ -6323,6 +8040,18 @@ def main() -> int:
             return run_single_device_vs_dual_compare_reference_slope_check_mode(args)
         if mode == "single-device-vs-dual-compare-visible-scatter-subset-check":
             return run_single_device_vs_dual_compare_visible_scatter_subset_check_mode(args)
+        if mode == "single-vs-dual-target-spectrum-visible-subset-check":
+            return run_single_vs_dual_target_spectrum_visible_subset_check_mode(args)
+        if mode == "single-vs-dual-target-spectrum-style-check":
+            return run_single_vs_dual_target_spectrum_style_check_mode(args)
+        if mode == "single-file-open-target-spectrum-primary-visible-check":
+            return run_single_file_open_target_spectrum_primary_visible_check_mode(args)
+        if mode == "single-file-open-auto-preview-target-spectrum-check":
+            return run_single_file_open_auto_preview_target_spectrum_check_mode(args)
+        if mode == "single-file-parent-dat-autodiscovery-target-spectrum-check":
+            return run_single_file_parent_dat_autodiscovery_target_spectrum_check_mode(args)
+        if mode == "single-file-open-vs-dual-target-spectrum-primary-subset-check":
+            return run_single_file_open_vs_dual_target_spectrum_primary_subset_check_mode(args)
         if mode == "single-device-fallback-still-legacy-render-check":
             return run_single_device_fallback_still_legacy_render_check_mode(args)
         if mode == "single-device-active-dat-sync-check":
