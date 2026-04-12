@@ -914,6 +914,30 @@ def run_repo_fixture_smoke_mode(args: argparse.Namespace) -> int:
             ),
         ),
         (
+            "target_spectrum_nsegment_override_no_dat",
+            run_target_spectrum_nsegment_override_no_dat_check_mode,
+            clone_args(
+                args,
+                mode="target-spectrum-nsegment-override-no-dat-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=None,
+                element="H2O",
+                nsegment=128,
+            ),
+        ),
+        (
+            "target_spectrum_nsegment_override_txt_dat",
+            run_target_spectrum_nsegment_override_txt_dat_check_mode,
+            clone_args(
+                args,
+                mode="target-spectrum-nsegment-override-txt-dat-check",
+                ygas=[str(fixtures["ygas"])],
+                dat=str(fixtures["dat"]),
+                element="H2O",
+                nsegment=128,
+            ),
+        ),
+        (
             "device_count_default_dual",
             run_device_count_default_dual_check_mode,
             clone_args(
@@ -5159,6 +5183,142 @@ def run_device_count_default_single_fallback_check_mode(args: argparse.Namespace
     return 1 if failed else 0
 
 
+def run_target_spectrum_nsegment_override_no_dat_check_mode(args: argparse.Namespace) -> int:
+    fixtures = resolve_repo_fixture_paths()
+    source_ygas = Path(args.ygas[0]) if args.ygas else fixtures["ygas"]
+    with tempfile.TemporaryDirectory(prefix="target_nsegment_override_no_dat_") as temp_dir:
+        isolated_path = Path(temp_dir) / source_ygas.name
+        shutil.copy2(source_ygas, isolated_path)
+        parsed = parse_supported_file(isolated_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve single-device target column.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            app.legacy_target_use_analysis_params_var.set(False)
+            app.nsegment_var.set(str(args.nsegment))
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[isolated_path],
+                active_path=isolated_path,
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    expected_nsegment = str(int(args.nsegment))
+    checks = [
+        (
+            "single_no_dat_nsegment_override_keeps_target_spectrum",
+            plot_kind == "target_spectrum",
+            {
+                "plot_kind": plot_kind,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "single_no_dat_nsegment_override_takes_effect",
+            "目标谱图沿用当前 NSEGMENT=是" in diag_text
+            and "目标谱图沿用整套分析参数=否" in diag_text
+            and f"requested_nsegment={expected_nsegment}" in diag_text
+            and f"effective_nsegment={expected_nsegment}" in diag_text
+            and f"NSEGMENT={expected_nsegment}" in diag_text,
+            {
+                "expected_nsegment": expected_nsegment,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[target_spectrum_nsegment_override_no_dat_check]")
+    print(f"isolated_path={isolated_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
+def run_target_spectrum_nsegment_override_txt_dat_check_mode(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="target_nsegment_override_txt_dat_") as temp_dir:
+        bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=1)
+        ygas_path = Path(bundle["ygas_paths"][0])
+        dat_path = Path(bundle["dat_path"])
+        parsed = parse_supported_file(ygas_path)
+        target_column = choose_single_column(parsed, args.element, "A")
+        if not target_column:
+            raise ValueError("Unable to resolve txt+dat target column.")
+
+        root, app = build_headless_app()
+        try:
+            app.element_preset_var.set(str(args.element or "CO2"))
+            app.legacy_target_use_analysis_params_var.set(False)
+            app.nsegment_var.set(str(args.nsegment))
+            simulate_generate_plot_from_selected_files(
+                app,
+                root,
+                selected_paths=[ygas_path, dat_path],
+                active_path=ygas_path,
+                parsed_active=parsed,
+                target_column=target_column,
+            )
+            status_text = app.status_var.get()
+            diag_text = app.diagnostic_var.get()
+            plot_kind = app.current_plot_kind
+        finally:
+            root.destroy()
+
+    expected_nsegment = str(int(args.nsegment))
+    checks = [
+        (
+            "txt_dat_nsegment_override_keeps_target_spectrum",
+            plot_kind == "target_spectrum",
+            {
+                "plot_kind": plot_kind,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+        (
+            "txt_dat_nsegment_override_takes_effect",
+            "目标谱图沿用当前 NSEGMENT=是" in diag_text
+            and "目标谱图沿用整套分析参数=否" in diag_text
+            and f"requested_nsegment={expected_nsegment}" in diag_text
+            and f"effective_nsegment={expected_nsegment}" in diag_text
+            and f"NSEGMENT={expected_nsegment}" in diag_text,
+            {
+                "expected_nsegment": expected_nsegment,
+                "status_text": status_text,
+                "diag_text": diag_text,
+            },
+        ),
+    ]
+
+    failed = False
+    print("[target_spectrum_nsegment_override_txt_dat_check]")
+    print(f"ygas_path={ygas_path}")
+    print(f"dat_path={dat_path}")
+    print(f"target_column={target_column}")
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"- {name}: {status}")
+        print(f"  detail={detail}")
+        failed = failed or (not ok)
+    return 1 if failed else 0
+
+
 def run_device_count_default_dual_check_mode(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="target_default_dual_") as temp_dir:
         bundle = prepare_target_spectrum_smoke_paths(Path(temp_dir), group_count=2)
@@ -7735,6 +7895,8 @@ def main() -> int:
             "device-count-dispatch-multi-check",
             "device-count-default-single-compare-style-check",
             "device-count-default-single-fallback-check",
+            "target-spectrum-nsegment-override-no-dat-check",
+            "target-spectrum-nsegment-override-txt-dat-check",
             "device-count-default-dual-check",
             "device-count-default-multi-check",
             "selected-files-direct-generate-check",
@@ -7834,6 +7996,10 @@ def main() -> int:
             return run_device_count_default_single_compare_style_check_mode(args)
         if mode == "device-count-default-single-fallback-check":
             return run_device_count_default_single_fallback_check_mode(args)
+        if mode == "target-spectrum-nsegment-override-no-dat-check":
+            return run_target_spectrum_nsegment_override_no_dat_check_mode(args)
+        if mode == "target-spectrum-nsegment-override-txt-dat-check":
+            return run_target_spectrum_nsegment_override_txt_dat_check_mode(args)
         if mode == "device-count-default-dual-check":
             return run_device_count_default_dual_check_mode(args)
         if mode == "device-count-default-multi-check":

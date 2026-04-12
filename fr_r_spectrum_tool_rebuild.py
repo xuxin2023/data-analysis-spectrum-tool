@@ -1048,12 +1048,12 @@ class FileViewerApp:
 
         ttk.Checkbutton(
             quick_start_frame,
-            text="沿用当前分析参数（默认关闭）",
+            text="沿用当前分析参数（勾选后始终生效）",
             variable=self.legacy_target_use_analysis_params_var,
         ).grid(row=10, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
         ttk.Label(
             quick_start_frame,
-            text="默认按目标谱图预设自动解析 NSEGMENT，避免历史方案里的 256 覆盖当前链路。",
+            text="默认按目标谱图预设自动解析 NSEGMENT；如果你手动把 NSEGMENT 改离 256，当前值也会自动生效。",
             foreground="#666666",
             wraplength=300,
             justify="left",
@@ -4053,7 +4053,7 @@ class FileViewerApp:
             target_element=target_element,
             device_kind="ygas",
         )
-        use_requested_nsegment = bool(self.legacy_target_use_analysis_params_var.get())
+        use_requested_nsegment = self.should_target_spectrum_use_requested_nsegment(requested_nsegment)
         selected_psd_kernel = core.LEGACY_TARGET_PSD_KERNEL_DEFAULT
         skipped_windows: list[str] = []
         group_records: list[dict[str, Any]] = []
@@ -4446,6 +4446,7 @@ class FileViewerApp:
             "actual_series_count": group_count,
             "requested_nsegment": requested_nsegment_summary,
             "legacy_target_uses_requested_nsegment": bool(use_requested_nsegment),
+            "legacy_target_use_analysis_params_enabled": bool(self.legacy_target_use_analysis_params_var.get()),
             "legacy_psd_kernel_requested": selected_psd_kernel,
             "legacy_psd_kernel": selected_psd_kernel,
             "legacy_psd_kernel_selection_basis": "未提供 dat，沿用目标谱图默认 PSD 核。",
@@ -4547,7 +4548,7 @@ class FileViewerApp:
                 self.legacy_target_spectrum_mode_var.get().strip()
                 or core.LEGACY_TARGET_SPECTRUM_MODE_PSD
             ),
-            use_requested_nsegment=bool(self.legacy_target_use_analysis_params_var.get()),
+            use_requested_nsegment=self.should_target_spectrum_use_requested_nsegment(requested_nsegment),
             forced_include_group_keys=self.get_selected_target_group_overrides(),
             reporter=reporter,
         )
@@ -7848,6 +7849,15 @@ class FileViewerApp:
 
         return fs, nsegment, overlap_ratio
 
+    def should_target_spectrum_use_requested_nsegment(self, requested_nsegment: int) -> bool:
+        if bool(self.legacy_target_use_analysis_params_var.get()):
+            return True
+        try:
+            normalized_requested_nsegment = int(requested_nsegment)
+        except (TypeError, ValueError):
+            return False
+        return normalized_requested_nsegment != int(DEFAULT_NSEGMENT)
+
     def get_selected_cross_spectrum_type(self, compare_mode: str | None = None) -> str:
         if compare_mode == "互谱幅值":
             return CROSS_SPECTRUM_MAGNITUDE
@@ -9293,7 +9303,7 @@ class FileViewerApp:
             self.ensure_legacy_target_selection_valid(ygas_paths, dat_path, other_paths)
 
             fs_ui, requested_nsegment, overlap_ratio = self.get_analysis_params()
-            use_requested_nsegment = bool(self.legacy_target_use_analysis_params_var.get())
+            use_requested_nsegment = self.should_target_spectrum_use_requested_nsegment(requested_nsegment)
             legacy_target_spectrum_mode = (
                 self.legacy_target_spectrum_mode_var.get().strip() or core.LEGACY_TARGET_SPECTRUM_MODE_PSD
             )
@@ -9686,7 +9696,8 @@ class FileViewerApp:
             f"预期系列数={expected_series_count}",
             f"实际系列数={actual_series_count}",
             f"可见系列数={visible_series_count}",
-            f"目标谱图沿用当前分析参数={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
+            f"目标谱图沿用当前 NSEGMENT={'是' if target_metadata.get('legacy_target_uses_requested_nsegment') else '否'}",
+            f"目标谱图沿用整套分析参数={'是' if target_metadata.get('legacy_target_use_analysis_params_enabled') else '否'}",
             f"requested_nsegment={requested_nsegment_ui}",
             f"系列有效点数={'；'.join(point_summaries)}",
         ]
